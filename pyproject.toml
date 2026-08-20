@@ -1,0 +1,28 @@
+[project]
+name = "jtech-cli"
+version = "0.1.0"
+description = "Full-screen terminal chat client for llama-server (OpenAI-compatible)"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "openai>=1.30.0",
+    "rich>=13.7.0",
+    "textual>=0.80",
+]
+
+[tool.uv]
+package = false
+
+[project.scripts]
+jtech-cli = "jtech_cli.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+asyncio_mode = "auto"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "pytest-asyncio>=0.24",
+]

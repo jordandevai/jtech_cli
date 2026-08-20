@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+
+# uv — uv.lock is intentionally NOT ignored: this is an application,
+# and committing the lockfile keeps installs reproducible.
+
+# Test / lint / type-check caches
+.pytest_cache/
+.pytest_tmp/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Environments / secrets
+.env
+.env.*
+*.local
+.kilo/
+
+# Editor & OS noise
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Local scratch notes (not for version control)
+.ignore/
