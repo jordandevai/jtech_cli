@@ -38,12 +38,22 @@ def stream_reply(settings: Settings, messages: list[dict]) -> Iterator[StreamIte
     stats (``prompt_n``, ``prompt_ms``, ``prompt_per_second``, ...).
     """
     client = make_client(settings)
-    stream = client.chat.completions.create(
+    kwargs = dict(
         model=settings.model or "default",
         messages=messages,
         stream=True,
         temperature=settings.temperature,
     )
+    try:
+        kwargs["stream_options"] = {"include_usage": True}
+        stream = client.chat.completions.create(**kwargs)
+    except Exception:
+        stream = client.chat.completions.create(
+            model=settings.model or "default",
+            messages=messages,
+            stream=True,
+            temperature=settings.temperature,
+        )
     for chunk in stream:
         if not chunk.choices:
             continue
@@ -58,3 +68,6 @@ def stream_reply(settings: Settings, messages: list[dict]) -> Iterator[StreamIte
             timings = getattr(chunk, "timings", None)
             if isinstance(timings, dict):
                 yield ("timings", timings)
+        usage = getattr(chunk, "usage", None)
+        if usage is not None and usage.prompt_tokens:
+            yield ("usage", {"prompt_tokens": usage.prompt_tokens})

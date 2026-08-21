@@ -52,11 +52,9 @@ def fetch_server_info(settings: Settings) -> ServerInfo:
 
     if info.models:
         try:
-            meta = _request(f"{_base(settings)}/models/{quote(info.models[0], safe='')}").get(
-                "meta", {}
-            )
-            info.context_length = meta.get("llama.context_length")
-        except Exception:  # noqa: BLE001, S110 - context length is optional
+            meta = data["data"][0].get("meta", {})
+            info.context_length = meta.get("n_ctx") or meta.get("llama.context_length")
+        except (IndexError, AttributeError):
             pass
     return info
 

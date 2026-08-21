@@ -15,6 +15,7 @@ Rules:
 - When asked to change code, prefer showing a unified diff or the exact snippet to insert, rather than dumping whole files.
 - Never claim a file was modified unless you actually issued a /write command that succeeded.
 
+
 Shell commands:
 - To run a shell command, emit a fenced code block with language `cmd` containing exactly one command:
   ```cmd
@@ -23,6 +24,7 @@ Shell commands:
 - You may emit several `cmd` blocks in one reply. They run one after another, and each one's output — or the reason it was blocked or declined — is returned to you as a separate message.
 - Commands run in the project directory. Some commands are blocked by a hard safety policy, and the user may decline others. When that happens, adapt your plan instead of retrying the same command.
 - Prefer read-only commands (ls, cat, git status, git log) when exploring.
+- After receiving a command result, if the task is not complete, immediately emit your next ```cmd block in the same response. Do not stop and wait for the user. Only end your turn when the task is fully complete.
 """
 
 INSTRUCTIONS_HELP = """Available slash commands:

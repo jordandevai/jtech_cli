@@ -47,6 +47,7 @@ from jtech_cli.config import (
     Settings,
     save_settings,
 )
+from jtech_cli import server_info
 from jtech_cli.llm_client import stream_reply
 from jtech_cli.server_info import ServerInfo
 from jtech_cli.session import Session
@@ -551,6 +552,7 @@ class ChatApp(App):
         self._multiline_terminator = "'''"
         self._generating = False
         self._stop_event = threading.Event()
+        self._prompt_tokens: int = 0
         self._queue: list[str] = []
         # The "Queued" chat line for each entry (same order as _queue), so the
         # line can be removed when its message leaves the queue.
@@ -583,7 +585,7 @@ class ChatApp(App):
             )
             yield Static(id="status")
 
-    def on_mount(self) -> None:
+    async def on_mount(self) -> None:
         self.register_theme(JTECH_DARK)
         self.register_theme(JTECH_LIGHT)
         self.theme = textual_theme_name(self.settings.theme)
@@ -596,6 +598,8 @@ class ChatApp(App):
         self.query_one("#suggestions", Static).display = False
         self._render_status()
         self._focus_input()
+        if self.session.messages and self.server.context_length:
+            await self._init_token_count()
 
     def push_message(self, role: str, text: str) -> tuple[Static, Markdown]:
         return self._append(role, text)
@@ -631,6 +635,16 @@ class ChatApp(App):
             self.query_one("#input", _ChatInput).focus()
         except Exception:  # noqa: BLE001, S110 - input may not be mounted yet
             pass
+
+    async def _init_token_count(self) -> None:
+        """Count session tokens on startup so the footer is accurate immediately."""
+        text = " ".join(m["content"] for m in self.session.messages)
+        if not text:
+            return
+        count = await asyncio.to_thread(server_info.fetch_token_count, self.settings, text)
+        if count:
+            self._prompt_tokens = count
+            self._render_status()
 
     def on_input_changed(self, _event: Input.Changed) -> None:
         self._update_suggestions()
@@ -723,14 +737,18 @@ class ChatApp(App):
             parts.append(running)
         if self.settings.base_url:
             parts.append(self.settings.base_url)
-        model = self.settings.model or self.server.model
-        if model:
-            parts.append(f"model: {model}")
         if self.server.context_length:
-            parts.append(f"ctx {self.server.context_length}")
+            if self._prompt_tokens:
+                total = self.server.context_length
+                remaining_pct = max(0, (1 - self._prompt_tokens / total) * 100)
+                parts.append(
+                    f"ctx {self._prompt_tokens // 1000}k"
+                    f"/{total // 1000}k ({remaining_pct:.0f}% left)"
+                )
+            else:
+                parts.append("ctx n/a")
         if self._queue:
             parts.append(f"queue: {len(self._queue)}")
-        parts.append(str(self.session.path))
         self.query_one("#status", Static).update("  ·  ".join(parts))
 
     def _save(self) -> None:
@@ -985,8 +1003,11 @@ class ChatApp(App):
                         kind, payload = item
                         if kind == "reasoning":
                             reason_parts.append(payload)
+                        elif kind == "usage":
+                            self._prompt_tokens = payload["prompt_tokens"]
                         else:
                             timings = payload
+                            self._prompt_tokens = int(payload.get("prompt_n", 0))
                     else:
                         parts.append(item)
                     got_token = True
@@ -1056,9 +1077,21 @@ class ChatApp(App):
         self._tool_rounds_active = True
         try:
             rounds = 0
+            nudges = 0
             while rounds < MAX_TOOL_ROUNDS:
                 blocks = extract_cmd_blocks(reply)
                 if not blocks:
+                    # Model stopped mid-task: nudge it (max 2, ephemeral).
+                    if nudges < 2:
+                        nudges += 1
+                        nudge = "[system] Continue your task or respond to the user."
+                        self.session.add("system", nudge)
+                        reply = await self._stream_once()
+                        # Remove the ephemeral nudge so it doesn't pollute history.
+                        self.session.messages.remove({"role": "system", "content": nudge})
+                        if reply is None:
+                            return
+                        continue
                     return
                 if len(blocks) > MAX_BLOCKS_PER_REPLY:
                     self.push_message(
@@ -1195,6 +1228,8 @@ class ChatApp(App):
 
     def _clear_chat(self) -> None:
         self.query_one("#chat", VerticalScroll).remove_children()
+        self._prompt_tokens = 0
+        self._render_status()
 
     def action_clear_chat(self) -> None:
         self.commands.handle("/clear")
