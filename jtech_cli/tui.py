@@ -1082,7 +1082,7 @@ class ChatApp(App):
                 blocks = extract_cmd_blocks(reply)
                 if not blocks:
                     # Model stopped mid-task: nudge it (max 2, ephemeral).
-                    if nudges < 2:
+                    if rounds > 0 and nudges < 2:
                         nudges += 1
                         nudge = "[system] Continue your task or respond to the user."
                         self.session.add("system", nudge)
