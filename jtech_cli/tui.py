@@ -430,6 +430,13 @@ class ChatApp(App):
     .bubble {
         margin-bottom: 1;
     }
+    /* Wrap long code lines instead of letting them run off the right edge:
+       MarkdownFence's Label defaults to content width (expand=True) and the
+       fence's horizontal scrollbar is hidden, so unbroken words were cut off.
+       Constrained to the bubble width, the content folds like normal text. */
+    #chat MarkdownFence > Label {
+        width: 1fr;
+    }
     .bubble.user {
         background: $surface;
         color: $text;
@@ -890,6 +897,14 @@ class ChatApp(App):
             # above the pinned AI label — in view as long as we follow along.
             reason_pair = self._append_plain("reasoning", "", hidden=True)
         label, ai_md = self._append("ai", "")
+        # Stream the answer through Markdown.append (parses only the new lines,
+        # mounts only the new blocks) instead of Markdown.update per token,
+        # which re-parses and re-mounts the whole document while holding the
+        # widget lock: quadratic re-parse work (UI lag) and fire-and-forget
+        # update tasks that surface as "GatheringFuture exception was never
+        # retrieved" CancelledError noise when they are cancelled at exit.
+        ai_stream = Markdown.get_stream(ai_md)
+        stream_closed = False
 
         def drop_reason_bubble() -> None:
             if reason_pair is None:
@@ -900,7 +915,7 @@ class ChatApp(App):
 
         def paint() -> None:
             """Re-render the live bubbles + status label. UI thread only."""
-            nonlocal reason_visible, last_content, last_reason
+            nonlocal reason_visible, last_content, last_reason, stream_closed
             if not label.is_mounted:  # a queued tick may run after the stop teardown
                 return
             reason = "".join(reason_parts)
@@ -927,10 +942,16 @@ class ChatApp(App):
                             reason_pair[1].update(shown)
                             last_reason = shown
                             moved = True
-            # answer bubble — content only, never reasoning
-            if content and content != last_content:
-                ai_md.update(content)
+            # answer bubble — content only, never reasoning. Only the new delta
+            # goes to the stream; it coalesces fragments and appends, so the
+            # widget never re-parses the whole document per token.
+            if not stream_closed and content and content != last_content:
+                delta = content[len(last_content):]
                 last_content = content
+                # paint always runs on the event-loop thread (timer ticks and
+                # call_from_thread both marshal here); schedule the tiny write
+                # coroutine without blocking this repaint.
+                asyncio.ensure_future(ai_stream.write(delta))
                 moved = True
             # status label — time-based (tick-driven) so it advances even while
             # the stream is silent
@@ -982,6 +1003,15 @@ class ChatApp(App):
 
         try:
             timer.stop()
+            # Settle the stream before touching the bubble: stop() cancels the
+            # stream task and flushes pending fragments, but an in-flight
+            # append (shielded inside the stream task) may outlive it; holding
+            # the widget lock until it is fully done is what makes the
+            # remove/replace below safe.
+            stream_closed = True
+            await ai_stream.stop()
+            async with ai_md.lock:
+                pass
             if self._stop_event.is_set():
                 drop_reason_bubble()
                 label.remove()
@@ -993,7 +1023,9 @@ class ChatApp(App):
                     drop_reason_bubble()
                 label.update("AI")
                 ai_md.add_class("error")
-                ai_md.update(f"{CONNECTION_ERROR}\n\n{error}")
+                # Awaited (not fire-and-forget): a dangling update task is what
+                # produced the "GatheringFuture never retrieved" noise.
+                await ai_md.update(f"{CONNECTION_ERROR}\n\n{error}")
                 self.query_one("#chat", VerticalScroll).scroll_end(animate=False)
                 return None
             else:

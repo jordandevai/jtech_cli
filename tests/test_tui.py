@@ -80,6 +80,44 @@ async def test_submit_shows_user_and_ai_bubble(tmp_path, monkeypatch):
         assert "hi there" in text
 
 
+async def test_long_code_line_wraps_in_fence(tmp_path, monkeypatch):
+    """Unbroken words longer than the screen must wrap, not run off it.
+
+    MarkdownFence's Label defaults to content width with its horizontal
+    scrollbar hidden, so long code lines used to be cut off at the right
+    edge. The app CSS constrains the label to the bubble width so the
+    content folds like normal text — the whole word stays visible.
+    """
+    from textual.widgets._markdown import MarkdownFence
+
+    # 'z' is unused elsewhere on screen (the status bar's "ctx" would skew
+    # a character count if we used 'x').
+    long_word = "z" * 300
+    reply = f"```\n{long_word}\nafter-line\n```\n"
+    monkeypatch.setattr(
+        "jtech_cli.tui.stream_reply", lambda settings, messages: iter([reply])
+    )
+    app = make_app(tmp_path)
+    async with app.run_test() as pilot:
+        inp = app.query_one("#input", Input)
+        inp.value = "go"
+        await pilot.press("enter")
+        for _ in range(10):
+            await pilot.pause()
+        await pilot.pause()
+
+        fence = app.query_one("#chat").query_one(MarkdownFence)
+        label = fence.query_one("#code-content", Static)
+        # The label must be constrained to the bubble width (it wraps);
+        # before the fix it was as wide as the longest line (300+ cells).
+        assert label.size.width <= fence.size.width
+        assert label.size.height > 1
+        # And every character of the long word must actually be rendered.
+        comp = app.screen._compositor
+        visible = sum(s.text.count("z") for s in comp.render_strips(comp.size))
+        assert visible == len(long_word)
+
+
 async def test_status_bar_omits_base_url_prefix(tmp_path):
     app = make_app(tmp_path)
     async with app.run_test():
