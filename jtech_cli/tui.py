@@ -37,6 +37,7 @@ from jtech_cli.cmd_tools import (
     decide,
     extract_cmd_blocks,
     format_result,
+    timeout_partial_output,
     truncate_output,
 )
 from jtech_cli.commands import CommandContext, build_registry
@@ -1073,22 +1074,35 @@ class ChatApp(App):
         message, then re-stream so the model can react. Bounded by
         MAX_TOOL_ROUNDS so a looping model cannot run forever. While active,
         newly submitted messages queue (they drain once the turn ends).
+
+        A model that stops acting (no command blocks) after a round that
+        actually executed a command is nudged to continue or respond, up to 2
+        times per turn. A stop after a declined or blocked command is a
+        response to user/guardrail input, not a stall, and a final answer to a
+        plain question is never nudged either.
         """
         self._tool_rounds_active = True
         try:
             rounds = 0
             nudges = 0
+            executed = 0  # commands actually run in the last round
             while rounds < MAX_TOOL_ROUNDS:
                 blocks = extract_cmd_blocks(reply)
                 if not blocks:
-                    # Model stopped mid-task: nudge it (max 2, ephemeral).
-                    if rounds > 0 and nudges < 2:
+                    # Model stopped after a tool call that ran: nudge it
+                    # (max 2, ephemeral). A decline or block means the
+                    # user/guardrail took the wheel — the stop is a response
+                    # to that, so no nudge.
+                    if executed > 0 and nudges < 2:
                         nudges += 1
                         nudge = "[system] Continue your task or respond to the user."
                         self.session.add("system", nudge)
                         reply = await self._stream_once()
                         # Remove the ephemeral nudge so it doesn't pollute history.
+                        # _stream_once saved while the nudge was still in the
+                        # list, so re-save to keep the JSONL file consistent.
                         self.session.messages.remove({"role": "system", "content": nudge})
+                        self._save()
                         if reply is None:
                             return
                         continue
@@ -1099,7 +1113,7 @@ class ChatApp(App):
                         f"{len(blocks) - MAX_BLOCKS_PER_REPLY} extra command block(s) "
                         f"ignored (max {MAX_BLOCKS_PER_REPLY} per reply).",
                     )
-                await self._process_blocks(blocks[:MAX_BLOCKS_PER_REPLY])
+                executed = await self._process_blocks(blocks[:MAX_BLOCKS_PER_REPLY])
                 rounds += 1
                 reply = await self._stream_once()
                 if reply is None:
@@ -1107,7 +1121,9 @@ class ChatApp(App):
         finally:
             self._tool_rounds_active = False
 
-    async def _process_blocks(self, blocks: list[str]) -> None:
+    async def _process_blocks(self, blocks: list[str]) -> int:
+        """Gate and run each block; return how many were actually executed."""
+        executed = 0
         for block in blocks:
             if not block.strip():
                 await self._note_command(block, "empty command — not run")
@@ -1120,18 +1136,27 @@ class ChatApp(App):
                 choice = await self._prompt_for_command(block, decision.reason)
                 if choice is CmdChoice.DECLINE:
                     await self._note_command(block, "declined by the user")
+                    # A decline means the user's intent differs from the model's
+                    # plan: tell it to ask, not to silently adapt on its own.
+                    self._add_system(
+                        "The user declined this command. Do not retry it; "
+                        "ask the user how they would like to proceed."
+                    )
+                    self._save()
                     continue
                 if choice is CmdChoice.ALWAYS:
-                    self._add_allow_rule(allow_rule_for(block))
+                    self._add_allow_rule(allow_rule_for(block, self.cmd.allow))
             result = await self._exec_command(block)
+            executed += 1
             self.push_message("system", self._cmd_bubble(block, result))
-            self.session.add("system", format_result(block, result=result))
+            self._add_system(format_result(block, result=result))
             self._save()
+        return executed
 
     async def _note_command(self, command: str, note: str) -> None:
         """Feed a non-executed command outcome back to the model and show it."""
         self.push_message("system", f"$ {command}\n→ {note}")
-        self.session.add("system", format_result(command, note=note))
+        self._add_system(format_result(command, note=note))
         self._save()
 
     async def _prompt_for_command(self, command: str, reason: str) -> CmdChoice:
@@ -1169,14 +1194,22 @@ class ChatApp(App):
                 out, _ = await asyncio.to_thread(
                     proc.communicate, timeout=self.cmd.timeout
                 )
-            except subprocess.TimeoutExpired:
+            except subprocess.TimeoutExpired as e:
                 proc.kill()
                 await asyncio.to_thread(proc.wait)
-                return ExecResult(124, "", timed_out=True)
+                # Keep what it printed before dying: the model needs to see how
+                # far it got to decide the next move instead of blind-retrying.
+                partial, truncated = truncate_output(
+                    timeout_partial_output(e), self.cmd.max_output
+                )
+                return ExecResult(124, partial, timed_out=True, truncated=truncated)
             out = out or ""
             if self._cmd_interrupted:
                 self._cmd_interrupted = False
-                return ExecResult(130, out.strip("\n"), interrupted=True)
+                # Cap partial output like any other result: an Esc on a chatty
+                # command must not dump unbounded text into the session.
+                text, truncated = truncate_output(out, self.cmd.max_output)
+                return ExecResult(130, text, interrupted=True, truncated=truncated)
             text, truncated = truncate_output(out, self.cmd.max_output)
             return ExecResult(proc.returncode, text, truncated=truncated)
         finally:
@@ -1225,6 +1258,12 @@ class ChatApp(App):
     def _on_settings_saved(self) -> None:
         self._switch_theme()
         self._render_status()
+
+    def _add_system(self, content: str) -> None:
+        """Add a system message to session; render in chat if debug_level == system."""
+        self.session.add("system", content)
+        if self.settings.debug_level == "system":
+            self.push_message("system", content)
 
     def _clear_chat(self) -> None:
         self.query_one("#chat", VerticalScroll).remove_children()

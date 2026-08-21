@@ -1221,6 +1221,186 @@ async def test_cmd_always_allow_saves_rule(tmp_path, monkeypatch):
         assert any("git status:*" in b for b in bubbles(app))
 
 
+async def test_nudge_fires_after_tool_stop(tmp_path, monkeypatch):
+    """A model that stops acting after a tool call is nudged (max 2) to continue."""
+    app = make_app_with_cmd(tmp_path, CmdPolicy(mode="auto", allow=["echo:*"]))
+    calls = {"n": 0}
+
+    def fake(settings, messages):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            yield "```cmd\necho nudge-out\n```"
+        else:
+            yield "stopped"
+
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    async with app.run_test() as pilot:
+        inp = app.query_one("#input", Input)
+        inp.value = "go"
+        await pilot.press("enter")
+        # 1 initial + 1 post-tool + 2 nudges; then the budget is exhausted.
+        await _wait_until(app, pilot, lambda: calls["n"] >= 4, tries=100)
+        # the turn must be fully quiescent: the last nudge is stripped and the
+        # loop exits before teardown (a live stream races _render_status).
+        await _wait_until(app, pilot, lambda: not app._tool_rounds_active, tries=100)
+        await pilot.pause()
+
+        assert calls["n"] == 4
+        roles = [m["role"] for m in app.session.messages]
+        assert roles == [
+            "user", "assistant", "system", "assistant", "assistant", "assistant",
+        ]
+        assert not any(
+            "Continue your task" in m["content"] for m in app.session.messages
+        )
+
+
+async def test_no_nudge_on_final_answer(tmp_path, monkeypatch):
+    """A plain final answer (no tool rounds yet) is never nudged."""
+    app = make_app(tmp_path)
+    calls = {"n": 0}
+
+    def fake(settings, messages):
+        calls["n"] += 1
+        yield "all done"
+
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    async with app.run_test() as pilot:
+        inp = app.query_one("#input", Input)
+        inp.value = "hello"
+        await pilot.press("enter")
+        await _wait_until(app, pilot, lambda: calls["n"] >= 1)
+        # give a would-be (incorrect) nudge stream time to fire
+        for _ in range(10):
+            await pilot.pause()
+
+    assert calls["n"] == 1
+    assert app.session.messages == [
+        {"role": "user", "content": "hello"},
+        {"role": "assistant", "content": "all done"},
+    ]
+
+
+async def test_nudge_not_persisted_to_disk(tmp_path, monkeypatch):
+    """The ephemeral nudge is stripped from the JSONL file, not just memory."""
+    session = Session(tmp_path / "s.jsonl", persist=True)
+    app = make_app_with_cmd(
+        tmp_path, CmdPolicy(mode="auto", allow=["echo:*"]), session=session
+    )
+    calls = {"n": 0}
+
+    def fake(settings, messages):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            yield "```cmd\necho disk-out\n```"
+        else:
+            yield "stopped"
+
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    async with app.run_test() as pilot:
+        inp = app.query_one("#input", Input)
+        inp.value = "go"
+        await pilot.press("enter")
+        await _wait_until(app, pilot, lambda: calls["n"] >= 4, tries=100)
+        # quiescent before reading the file: the final _save (post-nudge-strip)
+        # must have landed
+        await _wait_until(app, pilot, lambda: not app._tool_rounds_active, tries=100)
+        await pilot.pause()
+
+    on_disk = (tmp_path / "s.jsonl").read_text()
+    assert "Continue your task" not in on_disk
+    assert "disk-out" in on_disk  # the real result was persisted
+
+
+async def test_no_nudge_after_declined_command(tmp_path, monkeypatch):
+    """A decline is user input: a stop after it is a response, not a stall."""
+    app = make_app_with_cmd(tmp_path, CmdPolicy(mode="ask", allow=[]))
+    calls = {"n": 0}
+
+    def fake(settings, messages):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            yield "```cmd\necho declined-out\n```"
+        else:
+            yield "stopped"
+
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    async with app.run_test() as pilot:
+        inp = app.query_one("#input", Input)
+        inp.value = "go"
+        await pilot.press("enter")
+        await _wait_until(app, pilot, lambda: isinstance(app.screen, CommandPrompt), tries=50)
+        await pilot.press("n")
+        await _wait_until(app, pilot, lambda: calls["n"] >= 2)
+        # give a would-be (incorrect) nudge stream time to fire
+        for _ in range(10):
+            await pilot.pause()
+
+    assert calls["n"] == 2
+    assert [m["role"] for m in app.session.messages] == [
+        "user", "assistant", "system", "system", "assistant",
+    ]
+    # the model is told to ask the user, not to silently adapt
+    assert any("ask the user" in m["content"] for m in app.session.messages)
+    assert not any("Continue your task" in m["content"] for m in app.session.messages)
+
+
+async def test_no_nudge_after_blocked_command(tmp_path, monkeypatch):
+    """A block is guardrail input: a stop after it is not a stall either."""
+    app = make_app_with_cmd(tmp_path, CmdPolicy(mode="yolo"))
+    calls = {"n": 0}
+
+    def fake(settings, messages):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            yield "```cmd\nsudo ls\n```"
+        else:
+            yield "stopped"
+
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    async with app.run_test() as pilot:
+        inp = app.query_one("#input", Input)
+        inp.value = "go"
+        await pilot.press("enter")
+        await _wait_until(app, pilot, lambda: calls["n"] >= 2)
+        # give a would-be (incorrect) nudge stream time to fire
+        for _ in range(10):
+            await pilot.pause()
+        assert not isinstance(app.screen, CommandPrompt)
+
+    assert calls["n"] == 2
+    assert not any("Continue your task" in m["content"] for m in app.session.messages)
+
+
+async def test_cmd_timeout_feeds_partial_output(tmp_path, monkeypatch):
+    """A command killed by the timeout feeds its partial output to the model."""
+    app = make_app_with_cmd(tmp_path, CmdPolicy(mode="yolo", timeout=1))
+    calls = {"n": 0}
+
+    def fake(settings, messages):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            yield "```cmd\necho got-far; sleep 5\n```"
+        else:
+            yield "final"
+
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    async with app.run_test() as pilot:
+        inp = app.query_one("#input", Input)
+        inp.value = "go"
+        await pilot.press("enter")
+        await _wait_until(app, pilot, lambda: calls["n"] >= 2, tries=100)
+
+        sys_msgs = [m["content"] for m in app.session.messages if m["role"] == "system"]
+        assert any("timed out" in m and "got-far" in m for m in sys_msgs)
+        assert any("timed out" in b for b in bubbles(app))
+
+        # let the turn (nudges included) finish before teardown: a still-live
+        # stream would race _render_status against the unmounting widgets
+        await _wait_until(app, pilot, lambda: not app._tool_rounds_active, tries=100)
+        await pilot.pause()
+
+
 async def test_queue_drains_after_esc_stop(tmp_path, monkeypatch):
     """Esc-stopping the in-flight reply still unblocks the queue."""
     app = make_app(tmp_path)

@@ -1,11 +1,13 @@
 """Unit tests for the guarded shell command parse/policy/execute layer."""
 
+import subprocess
 from pathlib import Path
 
 import pytest
 
 from jtech_cli.cmd_tools import (
     CmdPolicy,
+    ExecResult,
     allow_rule_for,
     check_blacklist,
     decide,
@@ -15,6 +17,7 @@ from jtech_cli.cmd_tools import (
     format_result,
     matches_allow,
     split_segments,
+    timeout_partial_output,
     truncate_output,
 )
 
@@ -126,7 +129,10 @@ def test_blacklist_allows(command):
 def test_allow_program_with_any_args():
     assert matches_allow("ls -la", ["ls:*"])
     assert matches_allow("ls", ["ls:*"])
-    assert not matches_allow("ls | wc", ["ls:*"])  # chains never match
+    # a chain auto-runs only when every segment is allowlisted
+    assert not matches_allow("ls | wc", ["ls:*"])  # wc uncovered
+    assert matches_allow("ls | wc", ["ls:*", "wc:*"])
+    assert not matches_allow("grep x | head", ["grep:*"])
 
 
 def test_allow_program_subcommand():
@@ -134,6 +140,13 @@ def test_allow_program_subcommand():
     assert matches_allow("git status", ["git status:*"])
     assert not matches_allow("git push", ["git status:*"])
     assert not matches_allow("git statusx", ["git status:*"])
+
+
+def test_allow_pipeline_every_segment_vetted():
+    """Each part of a chain must have its own rule; one unknown forces a prompt."""
+    assert matches_allow("grep -rn foo . | head -50", ["grep:*", "head:*"])
+    assert not matches_allow("grep x | python", ["grep:*", "head:*"])
+    assert not matches_allow("git status && git push", ["git status:*", "git log:*"])
 
 
 def test_allow_bare_program_requires_no_args():
@@ -159,8 +172,35 @@ def test_allow_rule_bare_program():
     assert allow_rule_for("echo -n x") == "echo:*"  # -n is not a subcommand
 
 
-def test_allow_rule_rejects_chains():
-    assert allow_rule_for("ls && rm x") is None
+def test_allow_rule_interpreter_is_bare_program():
+    """'a' on any python/node invocation saves prog:*, covering every script."""
+    assert allow_rule_for("python script.py") == "python:*"
+    assert allow_rule_for("python3 -m pytest tests") == "python3:*"
+    assert allow_rule_for("node app.js") == "node:*"
+    assert allow_rule_for("bash run.sh") == "bash:*"
+
+
+def test_allow_rule_operand_first_tools_are_bare_program():
+    """grep/rm/etc. take operands, not subcommands: never pin the first arg."""
+    assert allow_rule_for("grep foo bar.py") == "grep:*"
+    assert allow_rule_for("rg -n foo .") == "rg:*"
+    assert allow_rule_for("rm x") == "rm:*"
+    assert allow_rule_for("cat file.py") == "cat:*"
+
+
+def test_allow_rule_pins_subcommand_only_for_known_clis():
+    """git/npm keep a pinned subcommand rule; git flags fall back to git:*."""
+    assert allow_rule_for("git push origin") == "git push:*"
+    assert allow_rule_for("npm install") == "npm install:*"
+    assert allow_rule_for("git -C subdir status") == "git:*"
+
+
+def test_allow_rule_chain_targets_uncovered_segment():
+    """A chain earns rules one segment at a time; the prompt-causing piece wins."""
+    assert allow_rule_for("ls && rm x") == "ls:*"  # no allowlist -> first segment
+    assert allow_rule_for("ls && rm x", ["ls:*"]) == "rm:*"
+    assert allow_rule_for("grep x | head", ["grep:*"]) == "head:*"
+    assert allow_rule_for("ls && wc x", ["ls:*", "wc:*"]) is None  # all covered
 
 
 # ---------------------------------------------------------------- scope
@@ -225,6 +265,33 @@ def test_execute_timeout(tmp_path):
     r = execute("sleep 5", tmp_path, timeout=1)
     assert r.timed_out
     assert r.exit_code == 124
+
+
+def test_execute_timeout_keeps_partial_output(tmp_path):
+    """Output printed before the kill is retained so the model can see progress."""
+    r = execute("echo got-far; sleep 5", tmp_path, timeout=1)
+    assert r.timed_out
+    assert r.exit_code == 124
+    assert "got-far" in r.output
+
+
+def test_timeout_partial_output_decoding():
+    """TimeoutExpired carries bytes even with text=True; decode defensively."""
+    assert timeout_partial_output(subprocess.TimeoutExpired("c", 1, output=b"x\n")) == "x\n"
+    assert timeout_partial_output(subprocess.TimeoutExpired("c", 1, output="x\n")) == "x\n"
+    assert timeout_partial_output(subprocess.TimeoutExpired("c", 1)) == ""
+
+
+def test_format_result_timeout_includes_partial():
+    """A timed-out result feeds its partial output back, like an interrupted one."""
+    out = format_result("sleep 5", result=ExecResult(124, "got-far", timed_out=True))
+    assert "timed out" in out
+    assert "got-far" in out
+    # no partial output -> the plain note, unchanged
+    assert (
+        format_result("sleep 5", result=ExecResult(124, "", timed_out=True))
+        == "$ sleep 5\n→ timed out (killed)"
+    )
 
 
 def test_truncate_output_head_and_tail():

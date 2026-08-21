@@ -23,6 +23,8 @@ from jtech_cli.theme import VALID_THEMES, resolve_theme
 DEFAULT_TEMPERATURE = 0.7
 DEFAULT_REASONING = "transient"
 VALID_REASONING_MODES = ("hide", "transient", "tail", "always")
+DEFAULT_DEBUG_LEVEL = "none"
+VALID_DEBUG_LEVELS = ("none", "system")
 
 
 def home_dir() -> Path:
@@ -80,6 +82,10 @@ SETTINGS: tuple[SettingSpec, ...] = (
         "AI shell execution: ask (prompt each command) | auto (allowlist runs silently) "
         " | yolo (all run except the hard blacklist) | off",
     ),
+    SettingSpec(
+        "debug_level", "Debug level",
+        "System messages in chat: none (session only) | system (also render in chat)",
+    ),
 )
 
 # Derived: one-line help per setting (shown by the TUI settings menu).
@@ -101,6 +107,8 @@ class Settings:
     theme: str = field(default="auto")
     reasoning: str = field(default=DEFAULT_REASONING)
     cmd_mode: str = field(default="ask")
+    debug_level: str = field(default="none")
+    debug_level: str = field(default=DEFAULT_DEBUG_LEVEL)
 
     def make_client(self) -> OpenAI:
         return OpenAI(base_url=self.base_url, api_key="none", timeout=30, max_retries=0)
@@ -133,6 +141,11 @@ class Settings:
             if choice not in VALID_CMD_MODES:
                 raise ValueError(f"cmd_mode must be one of: {', '.join(VALID_CMD_MODES)}")
             self.cmd_mode = choice
+        elif key == "debug_level":
+            choice = value.strip().lower()
+            if choice not in VALID_DEBUG_LEVELS:
+                raise ValueError(f"debug_level must be one of: {', '.join(VALID_DEBUG_LEVELS)}")
+            self.debug_level = choice
         else:
             raise ValueError(f"Unknown setting: {key}")
 
@@ -161,6 +174,9 @@ def build_settings(
     reasoning = overrides.get("reasoning", DEFAULT_REASONING)
     if reasoning not in VALID_REASONING_MODES:  # stale/typo'd value in an old config
         reasoning = DEFAULT_REASONING
+    debug_level = overrides.get("debug_level", DEFAULT_DEBUG_LEVEL)
+    if debug_level not in VALID_DEBUG_LEVELS:  # stale/typo'd value in an old config
+        debug_level = DEFAULT_DEBUG_LEVEL
     settings = Settings(
         base_url=overrides.get("base_url", ""),
         model=overrides.get("model", ""),
@@ -168,6 +184,7 @@ def build_settings(
         system_prompt=overrides.get("system_prompt", ""),
         theme=overrides.get("theme", "auto"),
         reasoning=reasoning,
+        debug_level=debug_level,
     )
     if base_url:
         settings.base_url = base_url
@@ -239,6 +256,8 @@ def save_settings(settings: Settings, path: Path = CONFIG_PATH, cmd: CmdPolicy |
         lines.append(f"theme = {_toml_str(settings.theme)}")
     if settings.reasoning and settings.reasoning != DEFAULT_REASONING:
         lines.append(f"reasoning = {_toml_str(settings.reasoning)}")
+    if settings.debug_level and settings.debug_level != DEFAULT_DEBUG_LEVEL:
+        lines.append(f"debug_level = {_toml_str(settings.debug_level)}")
     if settings.system_prompt:
         lines.append(f"system_prompt = {_toml_str(settings.system_prompt)}")
     if cmd is not None:

@@ -186,18 +186,27 @@ def check_blacklist(command: str) -> str | None:
 # ---------------------------------------------------------------- allowlist
 
 
-def matches_allow(command: str, allow: list[str]) -> bool:
-    """True when a single-segment command matches an allow rule.
+# CLIs whose first bare argument is a subcommand worth pinning (git status:*).
+# Everything else gets the bare prog:* rule — interpreters (python:*, one
+# approval covers every script) and search/file tools (grep:*, not
+# grep <pattern>:*) have operands first, not subcommands.
+_SUBCOMMAND_PROGRAMS = frozenset(
+    {
+        "git", "npm", "npx", "pnpm", "yarn", "bun", "docker", "podman",
+        "pip", "pip3", "cargo", "go", "make", "kubectl", "gh", "brew",
+        "composer", "gradle", "mvn",
+    }
+)
+
+
+def _segment_matches(segment: str, allow: list[str]) -> bool:
+    """True when one segment matches some allow rule.
 
     Rules: ``name`` matches the bare program with no args; ``name:*`` matches
     the program with any args; ``name sub:*`` matches the program with first
-    arg ``sub`` and any further args. Chained commands never match — an
-    allowlist entry must cover the whole thing being run.
+    arg ``sub`` and any further args.
     """
-    segs = split_segments(command)
-    if len(segs) != 1:
-        return False
-    tokens = _tokens(segs[0])
+    tokens = _tokens(segment)
     if not tokens:
         return False
     prog = tokens[0].rsplit("/", 1)[-1]
@@ -214,21 +223,48 @@ def matches_allow(command: str, allow: list[str]) -> bool:
     return False
 
 
-def allow_rule_for(command: str) -> str | None:
-    """The rule to persist for 'always allow' on this command, or None.
+def matches_allow(command: str, allow: list[str]) -> bool:
+    """True when every segment of the command matches an allow rule.
 
-    Single segment only: program + first bare subcommand (if present) + ``:*``.
+    A pipeline or chain auto-runs only if each part is individually
+    allowlisted — ``grep x | head`` needs both ``grep:*`` and ``head:*``.
+    Any segment without a rule forces a prompt, so no part runs unvetted.
     """
     segs = split_segments(command)
-    if len(segs) != 1:
-        return None
-    tokens = _tokens(segs[0])
+    return bool(segs) and all(_segment_matches(seg, allow) for seg in segs)
+
+
+def _rule_for_segment(segment: str) -> str | None:
+    """The allow rule for one segment: program (+ pinned subcommand) + ``:*``.
+
+    The subcommand is pinned only for known subcommand-style CLIs; for
+    interpreters and operand-first tools the rule is the bare program so a
+    single approval covers all of them.
+    """
+    tokens = _tokens(segment)
     if not tokens:
         return None
     prog = tokens[0].rsplit("/", 1)[-1]
-    if len(tokens) >= 2 and re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]*", tokens[1]):
+    if (
+        prog in _SUBCOMMAND_PROGRAMS
+        and len(tokens) >= 2
+        and re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]*", tokens[1])
+    ):
         return f"{prog} {tokens[1]}:*"
     return f"{prog}:*"
+
+
+def allow_rule_for(command: str, allow: list[str] | None = None) -> str | None:
+    """The rule to persist for 'always allow' on this command, or None.
+
+    The rule for the first segment not already covered by ``allow`` — the
+    piece that made the command prompt. Chains earn their rules one segment
+    at a time, each explicitly approved; every segment covered -> None.
+    """
+    for seg in split_segments(command):
+        if allow is None or not _segment_matches(seg, allow):
+            return _rule_for_segment(seg)
+    return None
 
 
 # ---------------------------------------------------------------- scope
@@ -293,6 +329,20 @@ class ExecResult:
     truncated: bool = False
 
 
+def timeout_partial_output(exc: subprocess.TimeoutExpired) -> str:
+    """Partial stdout captured before a TimeoutExpired, decoded to text.
+
+    ``exc.output`` is bytes on POSIX even with ``text=True`` (subprocess joins
+    the partial chunks with ``b''``), so decode defensively.
+    """
+    out = exc.output
+    if out is None:
+        return ""
+    if isinstance(out, bytes):
+        out = out.decode(errors="replace")
+    return out
+
+
 def truncate_output(text: str, max_output: int) -> tuple[str, bool]:
     """Cap output at ``max_output`` chars, keeping head and tail."""
     text = text.strip("\n")
@@ -319,8 +369,11 @@ def execute(
             text=True,
             timeout=timeout,
         )
-    except subprocess.TimeoutExpired:
-        return ExecResult(124, "", timed_out=True)
+    except subprocess.TimeoutExpired as e:
+        # Keep partial output like the TUI's _exec_command: it tells the model
+        # how far the command got before being killed.
+        out, truncated = truncate_output(timeout_partial_output(e), max_output)
+        return ExecResult(124, out, timed_out=True, truncated=truncated)
     except OSError as e:
         return ExecResult(127, str(e))
     out, truncated = truncate_output(proc.stdout or "", max_output)
@@ -334,7 +387,8 @@ def format_result(command: str, *, result: ExecResult | None = None, note: str |
     if result is None:
         raise ValueError("provide either result or note")
     if result.timed_out:
-        return f"$ {command}\n→ timed out (killed)"
+        body = f"\n{result.output}" if result.output else ""
+        return f"$ {command}\n→ timed out (killed){body}"
     if result.interrupted:
         body = f"\n{result.output}" if result.output else ""
         return f"$ {command}\n→ interrupted by user{body}"
