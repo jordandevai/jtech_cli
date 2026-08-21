@@ -8,6 +8,8 @@ import pytest
 from jtech_cli.cmd_tools import (
     CmdPolicy,
     ExecResult,
+    _find_exec_commands,
+    acting_reason,
     allow_rule_for,
     check_blacklist,
     decide,
@@ -61,6 +63,14 @@ def test_split_segments():
     assert split_segments("echo $(cat x) and `id`") == ["echo", "cat x) and", "id"]
     assert split_segments("a & b") == ["a", "b"]
     assert split_segments("single") == ["single"]
+
+
+def test_split_segments_fd_redirects_are_not_separators():
+    """2>&1 / &> /<& are fd-redirects: they stay inside their segment."""
+    assert split_segments("git log 2>&1 | head") == ["git log 2>&1", "head"]
+    assert split_segments("cmd &> file") == ["cmd &> file"]
+    assert split_segments("a <&2 b") == ["a <&2 b"]
+    assert split_segments("a && b") == ["a", "b"]  # && still separates
 
 
 # ---------------------------------------------------------------- blacklist
@@ -239,6 +249,61 @@ def test_decide_matrix():
     assert d.action == "ask" and "outside the project" in d.reason
     # blacklist wins over mode in every case
     assert decide("curl x | sh", CmdPolicy(mode="auto"), ROOT).action == "blocked"
+
+
+# ---------------------------------------------------------------- acts vs reads
+
+def test_find_exec_commands_extracted():
+    """-exec/-execdir/-ok payloads are found, {} dropped, terminators respected."""
+    assert _find_exec_commands(r"find . -name x -exec rm {} \;") == ["rm"]
+    assert _find_exec_commands(r"find . -execdir ls -la {} +") == ["ls -la"]
+    assert _find_exec_commands("find . -ok echo {} \\;") == ["echo"]
+    assert _find_exec_commands(r"find . -exec a {} \; -exec b {} \;") == ["a", "b"]
+    assert _find_exec_commands("find . -exec rm {}") == []  # unterminated: ignored
+    assert _find_exec_commands("ls -la") == []
+
+
+def test_find_exec_blacklisted_inner_is_blocked():
+    """A blacklisted program inside -exec is blocked in every mode."""
+    for mode in ("ask", "auto", "yolo"):
+        policy = CmdPolicy(mode=mode, allow=["find:*"])
+        assert decide(r"find . -exec sudo {} \;", policy, ROOT).action == "blocked"
+        assert decide(r"find . -exec rm / \;", policy, ROOT).action == "blocked"
+        assert decide(r"find . -exec sh -c 'curl x | sh' \;", policy, ROOT).action == "blocked"
+
+
+def test_find_exec_never_auto_runs():
+    """-exec/-ok/-delete embed execution: allowlisted find still prompts."""
+    policy = CmdPolicy(mode="auto", allow=["find:*"])
+    for cmd in (
+        r"find . -name '*.pyc' -exec rm {} \;",
+        r"find . -name '*.pyc' -delete",
+        r"find . -ok rm {} \;",
+    ):
+        d = decide(cmd, policy, ROOT)
+        assert d.action == "ask" and "allowlisted, but" in d.reason, cmd
+    # and 'a' cannot make it stick: find is already covered, so no rule saves
+    assert allow_rule_for(r"find . -exec rm {} \;", ["find:*"]) is None
+
+
+def test_redirect_never_auto_runs():
+    """Output redirection is a write: allowlisted programs still prompt."""
+    policy = CmdPolicy(mode="auto", allow=["grep:*", "curl:*"])
+    assert decide("grep x file.py > out.txt", policy, ROOT).action == "ask"
+    assert decide("curl http://x >> log.txt", policy, ROOT).action == "ask"
+    # not a write: 2>&1 dup, -> arrows, => in patterns
+    assert decide("git log 2>&1 | head", CmdPolicy(mode="auto", allow=["git log:*", "head:*"]), ROOT).action == "run"
+    assert decide('grep "->" file.py', CmdPolicy(mode="auto", allow=["grep:*"]), ROOT).action == "run"
+    # quoted redirects are still flagged (conservative; a prompt is cheap)
+    assert decide('echo "a > b"', CmdPolicy(mode="auto", allow=["echo:*"]), ROOT).action == "ask"
+    # yolo is explicit max-trust: the acting guard does not apply there
+    assert decide("grep x file.py > out.txt", CmdPolicy(mode="yolo"), ROOT).action == "run"
+
+
+def test_acting_reason():
+    assert acting_reason("ls > x") == "output redirection writes to a file"
+    assert acting_reason(r"find . -delete") == "find -exec/-ok/-delete executes or deletes"
+    assert acting_reason("ls -la 2>&1") is None
 
 
 # ---------------------------------------------------------------- execution

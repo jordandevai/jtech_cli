@@ -98,10 +98,11 @@ def split_segments(command: str) -> list[str]:
     """Split a command into segments on ``&&``, ``||``, ``|``, ``;``, ``$(``, backticks.
 
     A lone ``&`` (background) also separates commands, so it is normalized to
-    ``;`` first. Chaining means *every* segment must be vetted, not just the
-    first one.
+    ``;`` first — but only when it stands alone: ``2>&1``, ``&>`` and ``<&``
+    are fd-redirects, not command separators. Chaining means *every* segment
+    must be vetted, not just the first one.
     """
-    cmd = re.sub(r"(?<!&)&(?!&)", ";", command)
+    cmd = re.sub(r"(?<![<>&])&(?![<>&])", ";", command)
     return [s.strip() for s in _OPS_RE.split(cmd) if s.strip()]
 
 
@@ -153,12 +154,33 @@ def _dangerous_rm_target(token: str) -> bool:
     return t in RM_ROOT_TARGETS or t.startswith(RM_PREFIX_TARGETS)
 
 
+def _find_exec_commands(command: str) -> list[str]:
+    """Commands find would execute via -exec/-execdir/-ok, in order.
+
+    Each is the tokens between the flag and its ``\\;``/``+`` terminator,
+    with the ``{}`` placeholder dropped. An unterminated -exec is ignored.
+    """
+    commands: list[str] = []
+    current: list[str] | None = None
+    for tok in command.split():
+        if current is None:
+            if tok in ("-exec", "-execdir", "-ok"):
+                current = []
+        elif tok in ("\\;", ";", "+"):
+            commands.append(" ".join(t for t in current if t != "{}"))
+            current = None
+        elif tok != "{}":
+            current.append(tok)
+    return commands
+
+
 def check_blacklist(command: str) -> str | None:
     """Return a reason if the command touches the absolute blacklist, else None.
 
     Checked against every segment of the chain plus whole-line patterns, so
     ``git status && rm -rf /`` and ``curl x | sh`` are caught, not just their
-    first word.
+    first word. Commands embedded in ``find -exec`` are vetted too —
+    ``find . -exec rm / \\;`` is an rm of ``/``, whatever wraps it.
     """
     for prog in program_names(command):
         # mkfs is a family (mkfs, mkfs.ext4, mkfs.xfs, ...): prefix-match it.
@@ -171,6 +193,11 @@ def check_blacklist(command: str) -> str | None:
             for arg in tokens[1:]:
                 if not arg.startswith("-") and _dangerous_rm_target(arg):
                     return f"rm targeting '{arg.strip(chr(39))}' is on the absolute blacklist"
+
+    for inner in _find_exec_commands(command):
+        reason = check_blacklist(inner)
+        if reason is not None:
+            return f"{reason} (inside find -exec)"
 
     if re.search(r"\bdd\b[^|;&]*\bof=/dev/", command):
         return "dd writing to a raw device is on the absolute blacklist"
@@ -300,8 +327,30 @@ class Decision:
     reason: str = ""
 
 
+# Shell-level actions an allowlist grant must never silently cover: writing to
+# a file (output redirection) or executing other programs from inside an
+# allowlisted one (find -exec/-ok/-delete). An allowlist match is a read-only
+# grant; anything acting on disk forces a prompt.
+_REDIRECT_RE = re.compile(r"(?<![-=])>{1,2}(?!&)")  # > or >>, not -> => or >&1
+_FIND_ACT_RE = re.compile(r"(?<!\S)(-exec|-execdir|-ok|-delete)(?!\S)")
+
+
+def acting_reason(command: str) -> str | None:
+    """Why an allowlisted command still must prompt, or None if it is inert."""
+    if _FIND_ACT_RE.search(command):
+        return "find -exec/-ok/-delete executes or deletes"
+    if _REDIRECT_RE.search(command):
+        return "output redirection writes to a file"
+    return None
+
+
 def decide(command: str, policy: CmdPolicy, root: Path) -> Decision:
-    """The full gate: blacklist (absolute) -> off -> yolo -> allowlist -> ask."""
+    """The full gate: blacklist (absolute) -> off -> yolo -> allowlist -> ask.
+
+    An allowlist match only auto-runs commands that stay read-only; a command
+    that writes files or embeds execution prompts even when fully allowlisted.
+    yolo is exempt (explicit max-trust mode; the blacklist still applies).
+    """
     reason = check_blacklist(command)
     if reason is not None:
         return Decision("blocked", reason)
@@ -310,7 +359,10 @@ def decide(command: str, policy: CmdPolicy, root: Path) -> Decision:
     if policy.mode == "yolo":
         return Decision("run")
     if matches_allow(command, policy.allow):
-        return Decision("run")
+        acting = acting_reason(command)
+        if acting is None:
+            return Decision("run")
+        return Decision("ask", f"allowlisted, but {acting}")
     why = "not in the allowlist"
     if escape_project(command, root):
         why += "; references paths outside the project"

@@ -44,11 +44,13 @@ INSTRUCTIONS_HELP = """Available slash commands:
   /stats             Show history size, tokens, and context usage
   /render            Re-render the last reply as Markdown
 
-AI shell:
+  AI shell:
   The AI can request shell commands via ```cmd blocks. Each one is gated:
   a hard blacklist always blocks; then /set cmd_mode decides — ask (prompt
   for each command), auto (allowlisted commands run silently, the rest
   prompt), yolo (everything runs except the blacklist), off (no execution).
+  An allowlist entry is a read-only grant: commands that write files (>) or
+  embed execution (find -exec) always prompt, even when allowlisted.
   At each prompt: y allow, a always allow (saves a prefix rule to config),
   n decline. Esc kills a command that is running.
 
