@@ -38,8 +38,8 @@ AI shell:
   a hard blacklist always blocks; then /set cmd_mode decides — ask (prompt
   for each command), auto (allowlisted commands run silently, the rest
   prompt), yolo (everything runs except the blacklist), off (no execution).
-  At each prompt: a allow, A always allow (saves a prefix rule to config),
-  d decline. Esc kills a command that is running.
+  At each prompt: y allow, a always allow (saves a prefix rule to config),
+  n decline. Esc kills a command that is running.
 
 Keys:
   /                  Command menu: type /, then ↑/↓ to pick, Enter runs it, Tab completes

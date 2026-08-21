@@ -69,15 +69,15 @@ class CmdChoice(enum.Enum):
 class CommandPrompt(ModalScreen[CmdChoice]):
     """Approval prompt for one AI-requested shell command.
 
-    a = allow once, A = always allow (persists a prefix rule to config),
-    d/Esc = decline. The decision is fed back to the model as the command's
+    y = allow once, a = always allow (persists a prefix rule to config),
+    n/Esc = decline. The decision is fed back to the model as the command's
     result, so a decline does not cancel the rest of the turn.
     """
 
     BINDINGS: ClassVar[list[Binding]] = [
-        Binding("a", "allow_once", "Allow", show=False),
-        Binding("shift+a", "always_allow", "Always allow", show=False),
-        Binding("d", "decline_cmd", "Decline", show=False),
+        Binding("y", "allow_once", "Allow", show=False),
+        Binding("a", "always_allow", "Always allow", show=False),
+        Binding("n", "decline_cmd", "Decline", show=False),
         Binding("escape", "decline_cmd", "Decline", show=False),
     ]
 
@@ -92,7 +92,7 @@ class CommandPrompt(ModalScreen[CmdChoice]):
             yield Static(self._command, id="cmd-command")
             if self._reason:
                 yield Static(self._reason, id="cmd-reason")
-            yield Static("a allow · A always allow · d decline", id="cmd-hint")
+            yield Static("y allow · a always allow · n decline", id="cmd-hint")
 
     def action_allow_once(self) -> None:
         self.dismiss(CmdChoice.ALLOW)

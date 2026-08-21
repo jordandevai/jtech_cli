@@ -1094,7 +1094,7 @@ async def test_cmd_auto_allowlist_runs_silently(tmp_path, monkeypatch):
 
 
 async def test_cmd_ask_prompts_then_allow_runs(tmp_path, monkeypatch):
-    """ask mode: a non-allowlisted command prompts; 'a' allows and runs it."""
+    """ask mode: a non-allowlisted command prompts; 'y' allows and runs it."""
     app = make_app_with_cmd(tmp_path, CmdPolicy(mode="ask", allow=[]))
     fake, calls = cmd_stream("```cmd\necho prompt-out\n```", "done")
     monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
@@ -1103,7 +1103,7 @@ async def test_cmd_ask_prompts_then_allow_runs(tmp_path, monkeypatch):
         inp.value = "go"
         await pilot.press("enter")
         await _wait_until(app, pilot, lambda: isinstance(app.screen, CommandPrompt), tries=50)
-        await pilot.press("a")
+        await pilot.press("y")
         await _wait_until(app, pilot, lambda: calls["n"] >= 2, tries=50)
 
         assert any("prompt-out" in b for b in bubbles(app))
@@ -1112,7 +1112,7 @@ async def test_cmd_ask_prompts_then_allow_runs(tmp_path, monkeypatch):
 
 
 async def test_cmd_ask_decline_feeds_back(tmp_path, monkeypatch):
-    """ask mode: 'd' declines; the command does not run but the model still reacts."""
+    """ask mode: 'n' declines; the command does not run but the model still reacts."""
     app = make_app_with_cmd(tmp_path, CmdPolicy(mode="ask", allow=[]))
     fake, calls = cmd_stream("```cmd\necho never-runs\n```", "done")
     monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
@@ -1121,7 +1121,7 @@ async def test_cmd_ask_decline_feeds_back(tmp_path, monkeypatch):
         inp.value = "go"
         await pilot.press("enter")
         await _wait_until(app, pilot, lambda: isinstance(app.screen, CommandPrompt), tries=50)
-        await pilot.press("d")
+        await pilot.press("n")
         await _wait_until(app, pilot, lambda: calls["n"] >= 2, tries=50)
 
         # the command text is in the AI's own bubble (the fenced block), so
@@ -1166,7 +1166,7 @@ async def test_cmd_off_mode_disables_execution(tmp_path, monkeypatch):
 
 
 async def test_cmd_always_allow_saves_rule(tmp_path, monkeypatch):
-    """'A' in the prompt persists a prefix rule to config and runs the command."""
+    """'a' in the prompt persists a prefix rule to config and runs the command."""
     app = make_app_with_cmd(tmp_path, CmdPolicy(mode="ask", allow=[]))
     fake, calls = cmd_stream("```cmd\ngit status\n```", "done")
     monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
@@ -1175,7 +1175,7 @@ async def test_cmd_always_allow_saves_rule(tmp_path, monkeypatch):
         inp.value = "go"
         await pilot.press("enter")
         await _wait_until(app, pilot, lambda: isinstance(app.screen, CommandPrompt), tries=50)
-        await pilot.press("shift+a")
+        await pilot.press("a")
         await _wait_until(app, pilot, lambda: calls["n"] >= 2, tries=50)
 
         loaded = load_cmd_policy(app.config_path)
