@@ -19,6 +19,7 @@ from rich.console import Console
 from rich.markdown import Markdown
 
 from jtech_cli import file_tools, server_info
+from jtech_cli.cmd_tools import CmdPolicy
 from jtech_cli.config import CONFIG_PATH, SETTABLE_KEYS, Settings, save_settings
 from jtech_cli.prompts import INSTRUCTIONS_HELP
 from jtech_cli.session import Session
@@ -42,6 +43,7 @@ class CommandContext:
     console: Console
     enter_multiline: EnterMultiline = _no_multiline
     server: server_info.ServerInfo = field(default_factory=server_info.ServerInfo)
+    cmd: CmdPolicy | None = None
     last_reply: str = ""
     config_path: Path = field(default_factory=lambda: CONFIG_PATH)
     refresh_footer: Callable[[], None] = field(default=lambda: None)
@@ -57,7 +59,12 @@ class CommandContext:
 
     def persist_settings(self) -> None:
         try:
-            save_settings(self.settings, self.config_path)
+            if self.cmd is not None:
+                # keep the [cmd] table's mode in sync with the live setting
+                self.cmd.mode = self.settings.cmd_mode
+                save_settings(self.settings, self.config_path, cmd=self.cmd)
+            else:
+                save_settings(self.settings, self.config_path)
             self.console.print(f"[dim]Saved settings to {self.config_path}[/dim]")
         except OSError as e:
             self.console.print(f"[yellow]Could not save settings:[/yellow] {e}")

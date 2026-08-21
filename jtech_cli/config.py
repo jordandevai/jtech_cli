@@ -10,6 +10,14 @@ from pathlib import Path
 
 from openai import OpenAI
 
+from jtech_cli.cmd_tools import (
+    DEFAULT_ALLOW,
+    DEFAULT_MAX_OUTPUT,
+    DEFAULT_TIMEOUT,
+    CmdPolicy,
+    VALID_CMD_MODES,
+)
+from jtech_cli.prompts import DEFAULT_SYSTEM_PROMPT
 from jtech_cli.theme import VALID_THEMES, resolve_theme
 
 DEFAULT_TEMPERATURE = 0.7
@@ -67,6 +75,11 @@ SETTINGS: tuple[SettingSpec, ...] = (
         "Instructions prepended to every message. Load from file: /prompt FILE",
         settable=False,
     ),
+    SettingSpec(
+        "cmd_mode", "Shell mode",
+        "AI shell execution: ask (prompt each command) | auto (allowlist runs silently) "
+        " | yolo (all run except the hard blacklist) | off",
+    ),
 )
 
 # Derived: one-line help per setting (shown by the TUI settings menu).
@@ -87,6 +100,7 @@ class Settings:
     system_prompt: str = field(default="")
     theme: str = field(default="auto")
     reasoning: str = field(default=DEFAULT_REASONING)
+    cmd_mode: str = field(default="ask")
 
     def make_client(self) -> OpenAI:
         return OpenAI(base_url=self.base_url, api_key="none", timeout=30, max_retries=0)
@@ -114,6 +128,11 @@ class Settings:
             if choice not in VALID_REASONING_MODES:
                 raise ValueError(f"reasoning must be one of: {', '.join(VALID_REASONING_MODES)}")
             self.reasoning = choice
+        elif key == "cmd_mode":
+            choice = value.strip().lower()
+            if choice not in VALID_CMD_MODES:
+                raise ValueError(f"cmd_mode must be one of: {', '.join(VALID_CMD_MODES)}")
+            self.cmd_mode = choice
         else:
             raise ValueError(f"Unknown setting: {key}")
 
@@ -157,13 +176,60 @@ def build_settings(
     return settings
 
 
+def apply_default_prompt(settings: Settings) -> Settings:
+    """Use the built-in default prompt when no prompt is configured.
+
+    Startup-only: an empty prompt means nothing was set up, so the default
+    applies. The result lives on the in-memory Settings only — it is never
+    written to the config file. A prompt cleared mid-session stays cleared
+    (the live setting is the source of truth, filled or empty).
+    """
+    if not settings.system_prompt:
+        settings.system_prompt = DEFAULT_SYSTEM_PROMPT
+    return settings
+
+
 def _toml_str(value: str) -> str:
     """Escape a string for a TOML basic string (JSON escaping is TOML-compatible)."""
     return json.dumps(value, ensure_ascii=False)
 
 
-def save_settings(settings: Settings, path: Path = CONFIG_PATH) -> None:
-    """Persist settings to a TOML [server] table. Round-trips via load_config_overrides."""
+def load_cmd_policy(path: Path = CONFIG_PATH) -> CmdPolicy:
+    """Read the [cmd] table (mode, allow, timeout, max_output). Missing/absent -> defaults.
+
+    ``allow`` defaults to DEFAULT_ALLOW (the read-only seed) when the key is
+    absent; an explicit empty list is respected. Invalid values fall back to
+    defaults per key.
+    """
+    table: dict = {}
+    if path.exists():
+        try:
+            with path.open("rb") as fh:
+                table = tomllib.load(fh).get("cmd", {})
+        except (OSError, tomllib.TOMLDecodeError):
+            table = {}
+    mode = table.get("mode", "ask")
+    if not isinstance(mode, str) or mode not in VALID_CMD_MODES:
+        mode = "ask"
+    allow = table.get("allow", DEFAULT_ALLOW)
+    if not isinstance(allow, list) or not all(isinstance(a, str) for a in allow):
+        allow = list(DEFAULT_ALLOW)
+    timeout = table.get("timeout", DEFAULT_TIMEOUT)
+    if not isinstance(timeout, int) or timeout <= 0:
+        timeout = DEFAULT_TIMEOUT
+    max_output = table.get("max_output", DEFAULT_MAX_OUTPUT)
+    if not isinstance(max_output, int) or max_output <= 0:
+        max_output = DEFAULT_MAX_OUTPUT
+    return CmdPolicy(mode=mode, allow=list(allow), timeout=timeout, max_output=max_output)
+
+
+def save_settings(settings: Settings, path: Path = CONFIG_PATH, cmd: CmdPolicy | None = None) -> None:
+    """Persist settings to a TOML [server] table. Round-trips via load_config_overrides.
+
+    With ``cmd`` given, a [cmd] table (policy for AI shell execution) is written
+    too. Without it, an existing file's [cmd] table is simply not touched here —
+    callers that hold a CmdPolicy should pass it so the table stays in sync.
+    """
     lines = ["[server]"]
     lines.append(f"base_url = {_toml_str(settings.base_url)}")
     if settings.model:
@@ -175,5 +241,12 @@ def save_settings(settings: Settings, path: Path = CONFIG_PATH) -> None:
         lines.append(f"reasoning = {_toml_str(settings.reasoning)}")
     if settings.system_prompt:
         lines.append(f"system_prompt = {_toml_str(settings.system_prompt)}")
+    if cmd is not None:
+        lines.append("")
+        lines.append("[cmd]")
+        lines.append(f"mode = {_toml_str(cmd.mode)}")
+        lines.append(f"allow = {json.dumps(cmd.allow, ensure_ascii=False)}")
+        lines.append(f"timeout = {cmd.timeout}")
+        lines.append(f"max_output = {cmd.max_output}")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines) + "\n")

@@ -6,10 +6,11 @@ import time
 from textual.containers import Vertical
 from textual.widgets import Input, Markdown, Static, TextArea
 
-from jtech_cli.config import Settings
+from jtech_cli.cmd_tools import CmdPolicy
+from jtech_cli.config import Settings, load_cmd_policy
 from jtech_cli.server_info import ServerInfo
 from jtech_cli.session import Session
-from jtech_cli.tui import ChatApp, SettingsScreen
+from jtech_cli.tui import ChatApp, CommandPrompt, SettingsScreen
 
 
 def make_app(tmp_path, settings=None, session=None, server=None):
@@ -1052,6 +1053,134 @@ async def test_queue_drains_in_order(tmp_path, monkeypatch):
         "one", "two", "three",
     ]
     assert app._queue == []
+
+
+def make_app_with_cmd(tmp_path, cmd: CmdPolicy, settings=None, session=None):
+    app = make_app(tmp_path, settings=settings, session=session)
+    app.cmd = cmd
+    app.settings.cmd_mode = cmd.mode
+    return app
+
+
+def cmd_stream(first: str, second: str):
+    """A stream fake: first call yields a reply with a cmd block, next yields the final."""
+    calls = {"n": 0}
+
+    def fake(settings, messages):
+        calls["n"] += 1
+        yield (first if calls["n"] == 1 else second)
+
+    return fake, calls
+
+
+async def test_cmd_auto_allowlist_runs_silently(tmp_path, monkeypatch):
+    """auto mode: an allowlisted command runs without a prompt; output feeds back."""
+    app = make_app_with_cmd(tmp_path, CmdPolicy(mode="auto", allow=["echo:*"]))
+    fake, calls = cmd_stream("here\n```cmd\necho hello-out\n```", "done")
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    async with app.run_test() as pilot:
+        inp = app.query_one("#input", Input)
+        inp.value = "go"
+        await pilot.press("enter")
+        await _wait_until(app, pilot, lambda: calls["n"] >= 2, tries=50)
+
+        assert not isinstance(app.screen, CommandPrompt)
+        assert any("hello-out" in b for b in bubbles(app))
+        assert any("done" in b for b in bubbles(app))
+        roles = [m["role"] for m in app.session.messages]
+        assert "system" in roles
+        sys_msgs = [m["content"] for m in app.session.messages if m["role"] == "system"]
+        assert any("hello-out" in m and "exit 0" in m for m in sys_msgs)
+
+
+async def test_cmd_ask_prompts_then_allow_runs(tmp_path, monkeypatch):
+    """ask mode: a non-allowlisted command prompts; 'a' allows and runs it."""
+    app = make_app_with_cmd(tmp_path, CmdPolicy(mode="ask", allow=[]))
+    fake, calls = cmd_stream("```cmd\necho prompt-out\n```", "done")
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    async with app.run_test() as pilot:
+        inp = app.query_one("#input", Input)
+        inp.value = "go"
+        await pilot.press("enter")
+        await _wait_until(app, pilot, lambda: isinstance(app.screen, CommandPrompt), tries=50)
+        await pilot.press("a")
+        await _wait_until(app, pilot, lambda: calls["n"] >= 2, tries=50)
+
+        assert any("prompt-out" in b for b in bubbles(app))
+        sys_msgs = [m["content"] for m in app.session.messages if m["role"] == "system"]
+        assert any("prompt-out" in m for m in sys_msgs)
+
+
+async def test_cmd_ask_decline_feeds_back(tmp_path, monkeypatch):
+    """ask mode: 'd' declines; the command does not run but the model still reacts."""
+    app = make_app_with_cmd(tmp_path, CmdPolicy(mode="ask", allow=[]))
+    fake, calls = cmd_stream("```cmd\necho never-runs\n```", "done")
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    async with app.run_test() as pilot:
+        inp = app.query_one("#input", Input)
+        inp.value = "go"
+        await pilot.press("enter")
+        await _wait_until(app, pilot, lambda: isinstance(app.screen, CommandPrompt), tries=50)
+        await pilot.press("d")
+        await _wait_until(app, pilot, lambda: calls["n"] >= 2, tries=50)
+
+        # the command text is in the AI's own bubble (the fenced block), so
+        # "not run" is proven by the absence of an exit-code result message
+        sys_msgs = [m["content"] for m in app.session.messages if m["role"] == "system"]
+        assert any("declined by the user" in m for m in sys_msgs)
+        assert not any("exit 0" in m for m in sys_msgs)
+        assert any("done" in b for b in bubbles(app))
+
+
+async def test_cmd_blacklist_blocked_even_in_yolo(tmp_path, monkeypatch):
+    """The blacklist is absolute: even yolo blocks sudo, and no prompt is shown."""
+    app = make_app_with_cmd(tmp_path, CmdPolicy(mode="yolo"))
+    fake, calls = cmd_stream("```cmd\nsudo ls\n```", "done")
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    async with app.run_test() as pilot:
+        inp = app.query_one("#input", Input)
+        inp.value = "go"
+        await pilot.press("enter")
+        await _wait_until(app, pilot, lambda: calls["n"] >= 2, tries=50)
+
+        assert not isinstance(app.screen, CommandPrompt)
+        sys_msgs = [m["content"] for m in app.session.messages if m["role"] == "system"]
+        assert any("blocked" in m and "sudo" in m for m in sys_msgs)
+        assert not any("exit 0" in m for m in sys_msgs)  # never executed
+
+
+async def test_cmd_off_mode_disables_execution(tmp_path, monkeypatch):
+    """off mode: requested commands are not run; a disabled note is fed back."""
+    app = make_app_with_cmd(tmp_path, CmdPolicy(mode="off"))
+    fake, calls = cmd_stream("```cmd\necho should-not-run\n```", "done")
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    async with app.run_test() as pilot:
+        inp = app.query_one("#input", Input)
+        inp.value = "go"
+        await pilot.press("enter")
+        await _wait_until(app, pilot, lambda: calls["n"] >= 2, tries=50)
+
+        sys_msgs = [m["content"] for m in app.session.messages if m["role"] == "system"]
+        assert any("disabled" in m for m in sys_msgs)
+        assert not any("exit 0" in m for m in sys_msgs)  # never executed
+
+
+async def test_cmd_always_allow_saves_rule(tmp_path, monkeypatch):
+    """'A' in the prompt persists a prefix rule to config and runs the command."""
+    app = make_app_with_cmd(tmp_path, CmdPolicy(mode="ask", allow=[]))
+    fake, calls = cmd_stream("```cmd\ngit status\n```", "done")
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    async with app.run_test() as pilot:
+        inp = app.query_one("#input", Input)
+        inp.value = "go"
+        await pilot.press("enter")
+        await _wait_until(app, pilot, lambda: isinstance(app.screen, CommandPrompt), tries=50)
+        await pilot.press("shift+a")
+        await _wait_until(app, pilot, lambda: calls["n"] >= 2, tries=50)
+
+        loaded = load_cmd_policy(app.config_path)
+        assert "git status:*" in loaded.allow
+        assert any("git status:*" in b for b in bubbles(app))
 
 
 async def test_queue_drains_after_esc_stop(tmp_path, monkeypatch):

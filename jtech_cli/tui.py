@@ -14,6 +14,8 @@ row in place (Enter saves, Esc cancels).
 from __future__ import annotations
 
 import asyncio
+import enum
+import subprocess
 import threading
 import time
 from collections.abc import Callable, Sequence
@@ -28,6 +30,15 @@ from textual.message import Message
 from textual.screen import ModalScreen
 from textual.widgets import Input, Markdown, Static, TextArea
 
+from jtech_cli.cmd_tools import (
+    CmdPolicy,
+    ExecResult,
+    allow_rule_for,
+    decide,
+    extract_cmd_blocks,
+    format_result,
+    truncate_output,
+)
 from jtech_cli.commands import CommandContext, build_registry
 from jtech_cli.config import (
     CONFIG_PATH,
@@ -43,6 +54,54 @@ from jtech_cli.theme import JTECH_DARK, JTECH_LIGHT, textual_theme_name
 
 CONNECTION_ERROR = "Connection failed — check base_url in /settings"
 SPINNER_FRAMES = "-\\|/"
+
+# Caps for the AI command loop: blocks per reply and re-stream rounds per turn.
+MAX_BLOCKS_PER_REPLY = 5
+MAX_TOOL_ROUNDS = 5
+
+
+class CmdChoice(enum.Enum):
+    ALLOW = "allow"
+    ALWAYS = "always"
+    DECLINE = "decline"
+
+
+class CommandPrompt(ModalScreen[CmdChoice]):
+    """Approval prompt for one AI-requested shell command.
+
+    a = allow once, A = always allow (persists a prefix rule to config),
+    d/Esc = decline. The decision is fed back to the model as the command's
+    result, so a decline does not cancel the rest of the turn.
+    """
+
+    BINDINGS: ClassVar[list[Binding]] = [
+        Binding("a", "allow_once", "Allow", show=False),
+        Binding("shift+a", "always_allow", "Always allow", show=False),
+        Binding("d", "decline_cmd", "Decline", show=False),
+        Binding("escape", "decline_cmd", "Decline", show=False),
+    ]
+
+    def __init__(self, command: str, reason: str) -> None:
+        super().__init__()
+        self._command = command
+        self._reason = reason
+
+    def compose(self) -> ComposeResult:
+        with VerticalScroll(id="cmd-dialog"):
+            yield Static("Run command?", classes="dialog-title")
+            yield Static(self._command, id="cmd-command")
+            if self._reason:
+                yield Static(self._reason, id="cmd-reason")
+            yield Static("a allow · A always allow · d decline", id="cmd-hint")
+
+    def action_allow_once(self) -> None:
+        self.dismiss(CmdChoice.ALLOW)
+
+    def action_always_allow(self) -> None:
+        self.dismiss(CmdChoice.ALWAYS)
+
+    def action_decline_cmd(self) -> None:
+        self.dismiss(CmdChoice.DECLINE)
 
 
 def render_menu_rows(items: Sequence[tuple[str, str]], index: int) -> Text:
@@ -229,11 +288,13 @@ class SettingsScreen(ModalScreen[None]):
         settings: Settings,
         config_path: Path,
         on_save: Callable[[], None],
+        cmd: CmdPolicy | None = None,
     ) -> None:
         super().__init__()
         self._settings = settings
         self._config_path = config_path
         self._on_save = on_save
+        self._cmd = cmd
         self._cursor = 0
         self._row: str | None = None  # key of the row currently being edited
 
@@ -298,7 +359,11 @@ class SettingsScreen(ModalScreen[None]):
                 self.notify(str(e), severity="error")
                 return
         try:
-            save_settings(self._settings, self._config_path)
+            if self._cmd is not None:
+                self._cmd.mode = self._settings.cmd_mode
+                save_settings(self._settings, self._config_path, cmd=self._cmd)
+            else:
+                save_settings(self._settings, self._config_path)
         except OSError as e:
             self.notify(f"Could not save settings: {e}", severity="warning")
         self._on_save()
@@ -416,6 +481,32 @@ class ChatApp(App):
         margin-top: 1;
         text-align: center;
     }
+    #cmd-dialog {
+        width: 72;
+        height: auto;
+        max-height: 100%;
+        border: round $warning;
+        background: $surface;
+        padding: 1 2;
+        margin: 1 4;
+    }
+    #cmd-dialog .dialog-title {
+        text-style: bold;
+        text-align: center;
+        margin-bottom: 1;
+    }
+    #cmd-command {
+        padding: 0 1;
+        margin-bottom: 1;
+    }
+    #cmd-reason {
+        color: $warning;
+        margin-bottom: 1;
+    }
+    #cmd-hint {
+        color: $text-muted;
+        text-align: center;
+    }
     """
 
     BINDINGS: ClassVar[list[Binding]] = [
@@ -435,12 +526,19 @@ class ChatApp(App):
         session: Session,
         server: ServerInfo,
         config_path: Path = CONFIG_PATH,
+        cmd: CmdPolicy | None = None,
     ) -> None:
         super().__init__()
         self.settings = settings
         self.session = session
         self.server = server
         self.config_path = config_path
+        self.cmd = cmd if cmd is not None else CmdPolicy()
+        self.settings.cmd_mode = self.cmd.mode
+        self._project_root = Path.cwd().resolve()
+        self._running_proc: subprocess.Popen | None = None
+        self._cmd_interrupted = False
+        self._tool_rounds_active = False
         self._multiline_textarea: _MultilineInput | None = None
         self._multiline_future: asyncio.Future[str] | None = None
         self._multiline_terminator = "'''"
@@ -455,6 +553,7 @@ class ChatApp(App):
             settings=settings,
             console=OutputSink(self),
             server=server,
+            cmd=self.cmd,
             config_path=config_path,
             enter_multiline=self._enter_multiline,
             refresh_footer=self._render_status,
@@ -611,8 +710,10 @@ class ChatApp(App):
         self._hide_suggestions()
         inp.focus()
 
-    def _render_status(self) -> None:
+    def _render_status(self, running: str | None = None) -> None:
         parts: list[str] = []
+        if running:
+            parts.append(running)
         if self.settings.base_url:
             parts.append(self.settings.base_url)
         model = self.settings.model or self.server.model
@@ -737,7 +838,7 @@ class ChatApp(App):
         content = content.strip()
         if not content:
             return
-        if self._generating:
+        if self._generating or self._tool_rounds_active:
             # A reply is in flight: queue instead of running two generations
             # concurrently (the in-flight _stream_reply drains the queue).
             self._enqueue(content)
@@ -748,6 +849,20 @@ class ChatApp(App):
         await self._stream_reply()
 
     async def _stream_reply(self) -> None:
+        reply = await self._stream_once()
+        if reply is not None:
+            await self._tool_rounds(reply)
+
+        # Drain queued messages in order. Each send re-enters _stream_reply and
+        # drains again, so the while loop re-checks for anything queued in the
+        # meantime; frames unwind between iterations (no deep recursion).
+        while self._queue:
+            text = self._queue[0]
+            self._remove_queue_entry(0)  # the USER bubble replaces the line
+            await self._send_message(text)
+
+    async def _stream_once(self) -> str | None:
+        """One stream: returns the reply text, or None when stopped or errored."""
         parts: list[str] = []
         reason_parts: list[str] = []
         timings: dict | None = None
@@ -872,6 +987,7 @@ class ChatApp(App):
                 label.remove()
                 ai_md.remove()
                 self.push_message("system", "Generation stopped.")
+                return None
             elif error is not None:
                 if mode == "transient":
                     drop_reason_bubble()
@@ -879,6 +995,7 @@ class ChatApp(App):
                 ai_md.add_class("error")
                 ai_md.update(f"{CONNECTION_ERROR}\n\n{error}")
                 self.query_one("#chat", VerticalScroll).scroll_end(animate=False)
+                return None
             else:
                 if mode == "transient":
                     # covers the reasoning-only stream where no content token ever
@@ -890,17 +1007,125 @@ class ChatApp(App):
                     self.session.add("assistant", reply)
                     self._save()
                 self.ctx.last_reply = reply
+                return reply
         finally:
             self._generating = False
             self._render_status()
 
-        # Drain queued messages in order. Each send re-enters _stream_reply and
-        # drains again, so the while loop re-checks for anything queued in the
-        # meantime; frames unwind between iterations (no deep recursion).
-        while self._queue:
-            text = self._queue[0]
-            self._remove_queue_entry(0)  # the USER bubble replaces the line
-            await self._send_message(text)
+    async def _tool_rounds(self, reply: str) -> None:
+        """Process `` ```cmd `` blocks in a reply, re-streaming after each round.
+
+        Each round: gate every block (blacklist -> mode -> allowlist -> prompt),
+        run or note the outcome, append the result to the session as a system
+        message, then re-stream so the model can react. Bounded by
+        MAX_TOOL_ROUNDS so a looping model cannot run forever. While active,
+        newly submitted messages queue (they drain once the turn ends).
+        """
+        self._tool_rounds_active = True
+        try:
+            rounds = 0
+            while rounds < MAX_TOOL_ROUNDS:
+                blocks = extract_cmd_blocks(reply)
+                if not blocks:
+                    return
+                if len(blocks) > MAX_BLOCKS_PER_REPLY:
+                    self.push_message(
+                        "system",
+                        f"{len(blocks) - MAX_BLOCKS_PER_REPLY} extra command block(s) "
+                        f"ignored (max {MAX_BLOCKS_PER_REPLY} per reply).",
+                    )
+                await self._process_blocks(blocks[:MAX_BLOCKS_PER_REPLY])
+                rounds += 1
+                reply = await self._stream_once()
+                if reply is None:
+                    return
+        finally:
+            self._tool_rounds_active = False
+
+    async def _process_blocks(self, blocks: list[str]) -> None:
+        for block in blocks:
+            if not block.strip():
+                await self._note_command(block, "empty command — not run")
+                continue
+            decision = decide(block, self.cmd, self._project_root)
+            if decision.action == "blocked":
+                await self._note_command(block, f"blocked — {decision.reason}")
+                continue
+            if decision.action == "ask":
+                choice = await self._prompt_for_command(block, decision.reason)
+                if choice is CmdChoice.DECLINE:
+                    await self._note_command(block, "declined by the user")
+                    continue
+                if choice is CmdChoice.ALWAYS:
+                    self._add_allow_rule(allow_rule_for(block))
+            result = await self._exec_command(block)
+            self.push_message("system", self._cmd_bubble(block, result))
+            self.session.add("system", format_result(block, result=result))
+            self._save()
+
+    async def _note_command(self, command: str, note: str) -> None:
+        """Feed a non-executed command outcome back to the model and show it."""
+        self.push_message("system", f"$ {command}\n→ {note}")
+        self.session.add("system", format_result(command, note=note))
+        self._save()
+
+    async def _prompt_for_command(self, command: str, reason: str) -> CmdChoice:
+        return await self.push_screen_wait(CommandPrompt(command, reason))
+
+    def _add_allow_rule(self, rule: str | None) -> None:
+        if not rule or rule in self.cmd.allow:
+            return
+        self.cmd.allow.append(rule)
+        try:
+            self.cmd.mode = self.settings.cmd_mode
+            save_settings(self.settings, self.config_path, cmd=self.cmd)
+            self.push_message("system", f"Always-allow saved: {rule}")
+        except OSError:
+            pass
+
+    async def _exec_command(self, command: str) -> ExecResult:
+        """Run one command in a thread; Esc kills it, the timeout kills it."""
+        self._render_status(running="running command…")
+        self._cmd_interrupted = False
+        try:
+            proc = subprocess.Popen(
+                ["bash", "-c", command],
+                cwd=self._project_root,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+        except OSError as e:
+            self._render_status()
+            return ExecResult(127, str(e))
+        self._running_proc = proc
+        try:
+            try:
+                out, _ = await asyncio.to_thread(
+                    proc.communicate, timeout=self.cmd.timeout
+                )
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                await asyncio.to_thread(proc.wait)
+                return ExecResult(124, "", timed_out=True)
+            out = out or ""
+            if self._cmd_interrupted:
+                self._cmd_interrupted = False
+                return ExecResult(130, out.strip("\n"), interrupted=True)
+            text, truncated = truncate_output(out, self.cmd.max_output)
+            return ExecResult(proc.returncode, text, truncated=truncated)
+        finally:
+            self._running_proc = None
+            self._render_status()
+
+    @staticmethod
+    def _cmd_bubble(command: str, result: ExecResult) -> str:
+        if result.timed_out:
+            return f"$ {command}\n\n**timed out**"
+        if result.interrupted:
+            return f"$ {command}\n\n**interrupted**"
+        body = result.output if result.output else "(no output)"
+        return f"$ {command} — exit {result.exit_code}\n\n```\n{body}\n```"
 
     @staticmethod
     def _done_label(timings: dict | None) -> str:
@@ -915,11 +1140,17 @@ class ChatApp(App):
     def action_stop_stream(self) -> None:
         if self._generating:
             self._stop_event.set()
-            return
-        self._hide_suggestions()
+        elif self._running_proc is not None:
+            # a command is running: kill it (communicate returns the partial output)
+            self._cmd_interrupted = True
+            self._running_proc.kill()
+        else:
+            self._hide_suggestions()
 
     def _open_settings(self) -> None:
-        self.push_screen(SettingsScreen(self.settings, self.config_path, self._on_settings_saved))
+        self.push_screen(
+            SettingsScreen(self.settings, self.config_path, self._on_settings_saved, cmd=self.cmd)
+        )
 
     def _switch_theme(self) -> None:
         name = textual_theme_name(self.settings.theme)

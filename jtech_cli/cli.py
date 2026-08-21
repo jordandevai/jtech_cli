@@ -9,7 +9,7 @@ from pathlib import Path
 from rich.console import Console
 
 from jtech_cli import __version__
-from jtech_cli.config import Settings, build_settings
+from jtech_cli.config import Settings, apply_default_prompt, build_settings, load_cmd_policy
 from jtech_cli.server_info import ServerInfo, fetch_server_info
 from jtech_cli.session import Session
 from jtech_cli.theme import VALID_THEMES
@@ -64,7 +64,13 @@ def make_app(args: argparse.Namespace) -> ChatApp:
     console = Console()
 
     settings = resolve_settings(args, console)
+    settings = apply_default_prompt(settings)
     session = make_session(args)
+
+    # The [cmd] policy (AI shell execution) is loaded after the wizard so a
+    # freshly written config is picked up; its mode is the source of truth.
+    cmd = load_cmd_policy()
+    settings.cmd_mode = cmd.mode
 
     server = ServerInfo()
     if not args.no_discover and settings.base_url:
@@ -76,6 +82,7 @@ def make_app(args: argparse.Namespace) -> ChatApp:
         settings=settings,
         session=session,
         server=server,
+        cmd=cmd,
     )
 
 

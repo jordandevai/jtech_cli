@@ -5,6 +5,15 @@ Rules:
 - Use Markdown for code blocks.
 - When asked to change code, prefer showing a unified diff or the exact snippet to insert, rather than dumping whole files.
 - Never claim a file was modified unless you actually issued a /write command that succeeded.
+
+Shell commands:
+- To run a shell command, emit a fenced code block with language `cmd` containing exactly one command:
+  ```cmd
+  git status
+  ```
+- You may emit several `cmd` blocks in one reply. They run one after another, and each one's output — or the reason it was blocked or declined — is returned to you as a separate message.
+- Commands run in the project directory. Some commands are blocked by a hard safety policy, and the user may decline others. When that happens, adapt your plan instead of retrying the same command.
+- Prefer read-only commands (ls, cat, git status, git log) when exploring.
 """
 
 INSTRUCTIONS_HELP = """Available slash commands:
@@ -23,6 +32,14 @@ INSTRUCTIONS_HELP = """Available slash commands:
   /models            List models served by the endpoint
   /stats             Show history size, tokens, and context usage
   /render            Re-render the last reply as Markdown
+
+AI shell:
+  The AI can request shell commands via ```cmd blocks. Each one is gated:
+  a hard blacklist always blocks; then /set cmd_mode decides — ask (prompt
+  for each command), auto (allowlisted commands run silently, the rest
+  prompt), yolo (everything runs except the blacklist), off (no execution).
+  At each prompt: a allow, A always allow (saves a prefix rule to config),
+  d decline. Esc kills a command that is running.
 
 Keys:
   /                  Command menu: type /, then ↑/↓ to pick, Enter runs it, Tab completes
