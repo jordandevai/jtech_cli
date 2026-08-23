@@ -1,0 +1,12 @@
+name = "jtech-light"
+primary = "#3b6fd4"
+secondary = "#6b7a99"
+warning = "#b07d2a"
+error = "#c74e5e"
+success = "#3f8f5f"
+accent = "#3b6fd4"
+foreground = "#3a4250"
+background = "#f2f4f8"
+surface = "#e9edf3"
+panel = "#c3cbd8"
+dark = false

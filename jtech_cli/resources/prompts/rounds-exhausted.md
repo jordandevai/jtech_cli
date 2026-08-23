@@ -1,0 +1,1 @@
+The command round limit for this turn has been reached, so nothing further will run and any command blocks in your last reply were not executed. Summarise what you did and what is left; the user has to reply before you can run another command.

@@ -9,7 +9,12 @@ from pathlib import Path
 from rich.console import Console
 
 from jtech_cli import __version__
-from jtech_cli.config import Settings, apply_default_prompt, build_settings, load_cmd_policy
+from jtech_cli.config import (
+    Settings,
+    apply_default_prompt,
+    build_settings,
+    load_cmd_policy,
+)
 from jtech_cli.server_info import ServerInfo
 from jtech_cli.session import Session
 from jtech_cli.theme import VALID_THEMES

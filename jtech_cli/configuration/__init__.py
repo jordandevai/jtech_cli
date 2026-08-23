@@ -1,7 +1,7 @@
-"""Stable configuration API backed by the ``configuration`` implementation package."""
+"""Configuration implementation: paths, validation, and TOML persistence."""
 
-from jtech_cli.configuration import (
-    CONFIG_PATH,
+from jtech_cli.configuration.paths import CONFIG_PATH, home_dir
+from jtech_cli.configuration.settings import (
     DEFAULT_DEBUG_LEVEL,
     DEFAULT_REASONING,
     DEFAULT_TEMPERATURE,
@@ -12,9 +12,10 @@ from jtech_cli.configuration import (
     VALID_REASONING_MODES,
     Settings,
     SettingSpec,
+)
+from jtech_cli.configuration.storage import (
     apply_default_prompt,
     build_settings,
-    home_dir,
     load_cmd_policy,
     load_config_overrides,
     save_settings,

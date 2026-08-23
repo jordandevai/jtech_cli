@@ -1,0 +1,12 @@
+name = "jtech-dark"
+primary = "#7aa2f7"
+secondary = "#565f89"
+warning = "#e0af68"
+error = "#f7768e"
+success = "#9ece6a"
+accent = "#7aa2f7"
+foreground = "#d7dae0"
+background = "#1c1e21"
+surface = "#262a30"
+panel = "#3a4048"
+dark = true

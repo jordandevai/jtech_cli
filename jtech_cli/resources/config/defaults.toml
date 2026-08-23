@@ -1,0 +1,6 @@
+[settings]
+temperature = 0.7
+reasoning = "transient"
+theme = "auto"
+cmd_mode = "ask"
+debug_level = "none"

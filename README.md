@@ -139,15 +139,31 @@ as globals.
 ```
 jtech_cli/
   cli.py          # composition root: arg parsing + dependency wiring + entry point
-  tui.py          # the Textual TUI (ChatApp) + settings dialog + output sink
+  configuration/  # settings schema, paths, and TOML persistence
+    paths.py
+    settings.py
+    storage.py
+  resources/      # static-only package data; no Python modules
+    config/defaults.toml
+    prompts/*.md
+    themes/dark.toml
+    themes/light.toml
+    styles/tui.css
+  resource_loader.py # validated access to bundled resources
+  config.py       # stable configuration API facade
+  prompts.py      # Markdown prompt API
+  theme.py        # TOML theme API and terminal detection
+  tui.py          # stable public TUI import/facade
+  tui_app.py      # Textual app lifecycle, streaming, and tool orchestration
+  tui_screens.py  # settings and command-approval modals
+  tui_widgets.py  # reusable inputs, events, and output sink
   commands.py     # slash-command registry/handlers + CommandContext (DI container)
-  config.py       # Settings + TOML config persistence
+  cmd_tools.py    # shell policy, parsing, and execution result helpers
   session.py      # JSONL conversation history
   llm_client.py   # streaming OpenAI-compatible client
   server_info.py  # server introspection (/models, /tokenize)
   file_tools.py   # /read, /write, /diff helpers
   wizard.py       # first-run setup wizard (line-based, runs before the TUI)
-  prompts.py      # default system prompt + /help text
 ```
 
 ## Test

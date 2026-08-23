@@ -11,7 +11,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
-from jtech_cli.config import home_dir
+from jtech_cli.configuration.paths import home_dir
 
 DEFAULT_DIR = home_dir()
 

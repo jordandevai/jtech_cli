@@ -1,0 +1,132 @@
+#chat {
+    height: 1fr;
+    padding: 0 1;
+}
+
+#status {
+    height: 1;
+    color: $text-muted;
+    background: $surface;
+    padding: 0 1;
+}
+
+#input {
+    border: round $panel;
+    padding: 0 1;
+    margin-bottom: 1;
+}
+
+#suggestions {
+    height: auto;
+    max-height: 11;
+    padding: 0 1;
+    background: $surface;
+    color: $text-muted;
+}
+
+#multiline-input {
+    height: 6;
+    dock: bottom;
+}
+
+.bubble-label {
+    color: $text-muted;
+    text-style: bold;
+    margin-top: 1;
+}
+
+.bubble {
+    margin-bottom: 1;
+}
+
+/* Keep fenced code inside its bubble so long unbroken lines wrap. */
+#chat MarkdownFence > Label {
+    width: 1fr;
+}
+
+.bubble.user {
+    background: $surface;
+    color: $text;
+    padding: 1 2;
+}
+
+.bubble.ai {
+    color: $text;
+}
+
+.bubble.reasoning {
+    color: $text-muted;
+}
+
+.bubble.error {
+    color: $error;
+}
+
+.bubble.system {
+    color: $text-muted;
+}
+
+#settings-dialog,
+#cmd-dialog {
+    width: 72;
+    height: auto;
+    max-height: 100%;
+    background: $surface;
+    padding: 1 2;
+    margin: 1 4;
+}
+
+#settings-dialog {
+    border: round $primary;
+}
+
+#cmd-dialog {
+    border: round $warning;
+}
+
+#settings-dialog .dialog-title,
+#cmd-dialog .dialog-title {
+    text-style: bold;
+    text-align: center;
+    margin-bottom: 1;
+}
+
+#settings-rows,
+#settings-editor {
+    padding: 0 1;
+}
+
+#settings-editor {
+    height: auto;
+}
+
+#settings-editor TextArea {
+    height: 5;
+}
+
+#settings-help {
+    color: $text-muted;
+    padding: 0 1;
+    margin-top: 1;
+}
+
+#settings-hint {
+    color: $text-muted;
+    margin-top: 1;
+    text-align: center;
+}
+
+#cmd-command {
+    padding: 0 1;
+    margin-bottom: 1;
+}
+
+#cmd-reason {
+    color: $warning;
+    margin-bottom: 1;
+}
+
+#cmd-hint {
+    color: $text-muted;
+    text-align: center;
+}
