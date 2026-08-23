@@ -138,6 +138,12 @@ FORBIDDEN_PROGRAMS = {
     "pass", "keyring", "secrets",
 }
 
+# Punctuation that clings to a path token once a command has been split:
+# quotes, list commas, and the parens left behind when $( ) is treated as a
+# separator. The rm blacklist and the project-scope check strip the same set —
+# a character they disagree about is one that a token can hide behind.
+_ARG_STRIP = "();,'\"`"
+
 # rm targets that are absolute no-go (exact match).
 RM_ROOT_TARGETS = {"/", "/*", "~", "$HOME", "/etc", "/usr", "/var", "/boot", "/home", "/System"}
 # rm targets whose subpaths are still system files (prefix match).
@@ -150,7 +156,7 @@ _CREDENTIAL_RE = re.compile(
 
 
 def _dangerous_rm_target(token: str) -> bool:
-    t = token.strip(",'\"")
+    t = token.strip(_ARG_STRIP)
     return t in RM_ROOT_TARGETS or t.startswith(RM_PREFIX_TARGETS)
 
 
@@ -192,7 +198,8 @@ def check_blacklist(command: str) -> str | None:
         if tokens and tokens[0].rsplit("/", 1)[-1] == "rm":
             for arg in tokens[1:]:
                 if not arg.startswith("-") and _dangerous_rm_target(arg):
-                    return f"rm targeting '{arg.strip(chr(39))}' is on the absolute blacklist"
+                    target = arg.strip(_ARG_STRIP)
+                    return f"rm targeting '{target}' is on the absolute blacklist"
 
     for inner in _find_exec_commands(command):
         reason = check_blacklist(inner)
@@ -304,7 +311,7 @@ def escape_project(command: str, root: Path) -> bool:
     under ``root``. Used to force a prompt in ask/auto modes; yolo ignores it.
     """
     for tok in command.split():
-        t = tok.strip("();,'\"`")
+        t = tok.strip(_ARG_STRIP)
         if not t:
             continue
         if t in ("~", "$HOME") or t.startswith(("~/", "$HOME/")):

@@ -107,7 +107,6 @@ class Settings:
     theme: str = field(default="auto")
     reasoning: str = field(default=DEFAULT_REASONING)
     cmd_mode: str = field(default="ask")
-    debug_level: str = field(default="none")
     debug_level: str = field(default=DEFAULT_DEBUG_LEVEL)
 
     def make_client(self) -> OpenAI:
@@ -177,12 +176,22 @@ def build_settings(
     debug_level = overrides.get("debug_level", DEFAULT_DEBUG_LEVEL)
     if debug_level not in VALID_DEBUG_LEVELS:  # stale/typo'd value in an old config
         debug_level = DEFAULT_DEBUG_LEVEL
+    theme = overrides.get("theme", "auto")
+    # An unknown theme reaches resolve_theme at mount, which raises — and the
+    # settings dialog that would fix it is behind that crash.
+    if theme not in VALID_THEMES:
+        theme = "auto"
+    temperature = overrides.get("temperature", DEFAULT_TEMPERATURE)
+    # bool is an int subclass, so `temperature = true` slips past a bare
+    # isinstance((int, float)) check and reaches the API as a boolean.
+    if isinstance(temperature, bool) or not isinstance(temperature, (int, float)):
+        temperature = DEFAULT_TEMPERATURE
     settings = Settings(
         base_url=overrides.get("base_url", ""),
         model=overrides.get("model", ""),
-        temperature=overrides.get("temperature", DEFAULT_TEMPERATURE),
+        temperature=float(temperature),
         system_prompt=overrides.get("system_prompt", ""),
-        theme=overrides.get("theme", "auto"),
+        theme=theme,
         reasoning=reasoning,
         debug_level=debug_level,
     )
@@ -240,12 +249,15 @@ def load_cmd_policy(path: Path = CONFIG_PATH) -> CmdPolicy:
     return CmdPolicy(mode=mode, allow=list(allow), timeout=timeout, max_output=max_output)
 
 
-def save_settings(settings: Settings, path: Path = CONFIG_PATH, cmd: CmdPolicy | None = None) -> None:
-    """Persist settings to a TOML [server] table. Round-trips via load_config_overrides.
+def save_settings(settings: Settings, path: Path = CONFIG_PATH, *, cmd: CmdPolicy) -> None:
+    """Persist settings to a TOML [server] table plus the [cmd] policy table.
 
-    With ``cmd`` given, a [cmd] table (policy for AI shell execution) is written
-    too. Without it, an existing file's [cmd] table is simply not touched here —
-    callers that hold a CmdPolicy should pass it so the table stays in sync.
+    The file is rewritten in full, so every table must be supplied on every
+    write. ``cmd`` is required rather than optional precisely because omitting
+    it used to erase the user's shell policy — mode plus every accumulated
+    allow rule — with no error and no way back. A caller that does not already
+    hold a policy passes ``load_cmd_policy(path)`` to carry the file's existing
+    one through unchanged.
     """
     lines = ["[server]"]
     lines.append(f"base_url = {_toml_str(settings.base_url)}")
@@ -260,12 +272,11 @@ def save_settings(settings: Settings, path: Path = CONFIG_PATH, cmd: CmdPolicy |
         lines.append(f"debug_level = {_toml_str(settings.debug_level)}")
     if settings.system_prompt:
         lines.append(f"system_prompt = {_toml_str(settings.system_prompt)}")
-    if cmd is not None:
-        lines.append("")
-        lines.append("[cmd]")
-        lines.append(f"mode = {_toml_str(cmd.mode)}")
-        lines.append(f"allow = {json.dumps(cmd.allow, ensure_ascii=False)}")
-        lines.append(f"timeout = {cmd.timeout}")
-        lines.append(f"max_output = {cmd.max_output}")
+    lines.append("")
+    lines.append("[cmd]")
+    lines.append(f"mode = {_toml_str(cmd.mode)}")
+    lines.append(f"allow = {json.dumps(cmd.allow, ensure_ascii=False)}")
+    lines.append(f"timeout = {cmd.timeout}")
+    lines.append(f"max_output = {cmd.max_output}")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines) + "\n")

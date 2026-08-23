@@ -4,6 +4,7 @@ import pytest
 
 from jtech_cli.cmd_tools import DEFAULT_ALLOW, CmdPolicy
 from jtech_cli.config import (
+    DEFAULT_TEMPERATURE,
     Settings,
     apply_default_prompt,
     build_settings,
@@ -133,7 +134,7 @@ def test_save_settings_roundtrip(tmp_path):
         temperature=0.5,
         system_prompt='line1\nline2 "quoted"',
     )
-    save_settings(s, path)
+    save_settings(s, path, cmd=CmdPolicy())
     assert path.exists()
     loaded = build_settings(config_path=path)
     assert loaded.base_url == s.base_url
@@ -146,7 +147,7 @@ def test_save_settings_roundtrip(tmp_path):
 def test_save_settings_theme_roundtrip(tmp_path):
     path = tmp_path / "config.toml"
     s = Settings(base_url="http://x:1/v1", model="m", theme="light")
-    save_settings(s, path)
+    save_settings(s, path, cmd=CmdPolicy())
     loaded = build_settings(config_path=path)
     assert loaded.theme == "light"
 
@@ -154,7 +155,7 @@ def test_save_settings_theme_roundtrip(tmp_path):
 def test_save_settings_reasoning_roundtrip(tmp_path):
     path = tmp_path / "config.toml"
     s = Settings(base_url="http://x:1/v1", model="m", reasoning="always")
-    save_settings(s, path)
+    save_settings(s, path, cmd=CmdPolicy())
     loaded = build_settings(config_path=path)
     assert loaded.reasoning == "always"
 
@@ -162,7 +163,7 @@ def test_save_settings_reasoning_roundtrip(tmp_path):
 def test_save_settings_omits_default_reasoning(tmp_path):
     path = tmp_path / "config.toml"
     s = Settings(base_url="http://x:1/v1", model="m")
-    save_settings(s, path)
+    save_settings(s, path, cmd=CmdPolicy())
     assert "reasoning" not in path.read_text()
 
 
@@ -185,7 +186,7 @@ def test_build_settings_bad_reasoning_falls_back_to_default(tmp_path):
 def test_save_settings_control_chars_roundtrip(tmp_path, prompt):
     path = tmp_path / "config.toml"
     s = Settings(base_url="http://x:1/v1", system_prompt=prompt)
-    save_settings(s, path)
+    save_settings(s, path, cmd=CmdPolicy())
     loaded = build_settings(config_path=path)
     assert loaded.system_prompt == prompt
 
@@ -243,7 +244,60 @@ def test_save_settings_with_cmd_roundtrip(tmp_path):
     assert loaded.max_output == 2000
 
 
-def test_save_settings_without_cmd_omits_table(tmp_path):
+def test_save_settings_requires_a_cmd_policy(tmp_path):
+    """Omitting the policy is a TypeError, never a silent wipe of [cmd]."""
     path = tmp_path / "config.toml"
-    save_settings(Settings(base_url="http://x:1/v1"), path)
-    assert "[cmd]" not in path.read_text()
+    with pytest.raises(TypeError):
+        save_settings(Settings(base_url="http://x:1/v1"), path)
+
+
+@pytest.mark.parametrize(
+    "line, name, expected",
+    [
+        ('theme = "solarized"', "theme", "auto"),
+        ('temperature = "hot"', "temperature", DEFAULT_TEMPERATURE),
+        ("temperature = true", "temperature", DEFAULT_TEMPERATURE),
+    ],
+)
+def test_build_settings_rejects_unusable_values(tmp_path, line, name, expected):
+    """A stale or mistyped value falls back instead of reaching the app."""
+    path = tmp_path / "config.toml"
+    path.write_text(f"[server]\n{line}\n")
+    assert getattr(build_settings(config_path=path), name) == expected
+
+
+def test_bad_theme_in_config_resolves_instead_of_raising(tmp_path):
+    """The TUI resolves the theme at mount, before the dialog that would fix it."""
+    from jtech_cli.theme import textual_theme_name
+
+    path = tmp_path / "config.toml"
+    path.write_text('[server]\ntheme = "solarized"\n')
+    name = textual_theme_name(build_settings(config_path=path).theme)
+    assert name in ("jtech-dark", "jtech-light")
+
+
+def test_persist_settings_syncs_cmd_mode_without_a_policy_in_hand(tmp_path):
+    """/set cmd_mode must reach the file even when the context holds no policy."""
+    from rich.console import Console
+
+    from jtech_cli.commands import CommandContext
+    from jtech_cli.session import Session
+
+    path = tmp_path / "config.toml"
+    save_settings(
+        Settings(base_url="http://x:1/v1"), path,
+        cmd=CmdPolicy(mode="ask", allow=["cargo build:*"], timeout=7),
+    )
+    ctx = CommandContext(
+        session=Session(tmp_path / "s.jsonl", persist=False),
+        settings=Settings(base_url="http://x:1/v1", cmd_mode="yolo"),
+        console=Console(record=True, width=100),
+        cmd=None,
+        config_path=path,
+    )
+    ctx.persist_settings()
+
+    policy = load_cmd_policy(path)
+    assert policy.mode == "yolo"            # the live setting reached the file
+    assert policy.allow == ["cargo build:*"]  # the rest was carried through
+    assert policy.timeout == 7

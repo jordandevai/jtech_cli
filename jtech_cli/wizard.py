@@ -12,7 +12,13 @@ from pathlib import Path
 
 from rich.console import Console
 
-from jtech_cli.config import CONFIG_PATH, Settings, build_settings, save_settings
+from jtech_cli.config import (
+    CONFIG_PATH,
+    Settings,
+    build_settings,
+    load_cmd_policy,
+    save_settings,
+)
 from jtech_cli.server_info import ServerInfo, fetch_server_info
 
 Ask = Callable[[str], str]
@@ -71,7 +77,9 @@ def run_setup(
     settings.model = _pick_model(console, ask, info.models, info.model or info.models[0])
     settings.theme = theme
 
-    save_settings(settings, config_path)
+    # Carry the existing [cmd] policy through untouched: re-running setup
+    # re-points the endpoint, it does not reset the user's shell allowlist.
+    save_settings(settings, config_path, cmd=load_cmd_policy(config_path))
     console.print(f"[green]Configuration saved to {config_path}[/green]")
     console.print(f"  base_url = {settings.base_url}")
     console.print(f"  model    = {settings.model}")

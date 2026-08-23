@@ -22,6 +22,7 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import ClassVar
 
+from rich.console import Console
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -46,11 +47,18 @@ from jtech_cli.config import (
     SETTING_DESCRIPTIONS,
     SETTINGS,
     Settings,
+    load_cmd_policy,
     save_settings,
 )
 from jtech_cli import server_info
 from jtech_cli.llm_client import stream_reply
-from jtech_cli.server_info import ServerInfo
+from jtech_cli.prompts import (
+    BLOCKS_DROPPED_PROMPT,
+    COMMAND_DECLINED_PROMPT,
+    NUDGE_PROMPT,
+    ROUNDS_EXHAUSTED_PROMPT,
+)
+from jtech_cli.server_info import ServerInfo, fetch_server_info
 from jtech_cli.session import Session
 from jtech_cli.theme import JTECH_DARK, JTECH_LIGHT, textual_theme_name
 
@@ -252,9 +260,23 @@ class OutputSink:
 
     def __init__(self, app: ChatApp) -> None:
         self._app = app
+        # Headless console used only to turn rich renderables into text. A bare
+        # str() on one yields "<rich.markdown.Markdown object at 0x…>", which
+        # is what the chat used to show.
+        self._renderer = Console(width=100, no_color=True, highlight=False)
+
+    def _to_text(self, obj: object) -> str:
+        """One printable object as plain text, rendering rich objects properly."""
+        if isinstance(obj, str):
+            return obj
+        if not hasattr(obj, "__rich_console__") and not hasattr(obj, "__rich__"):
+            return str(obj)
+        with self._renderer.capture() as capture:
+            self._renderer.print(obj)
+        return capture.get().rstrip("\n")
 
     def print(self, *objects: object, sep: str = " ", end: str = "\n") -> None:
-        text = sep.join(str(o) for o in objects) + end
+        text = sep.join(self._to_text(o) for o in objects) + end
         if not text.strip():
             return
         try:
@@ -361,11 +383,13 @@ class SettingsScreen(ModalScreen[None]):
                 self.notify(str(e), severity="error")
                 return
         try:
-            if self._cmd is not None:
-                self._cmd.mode = self._settings.cmd_mode
-                save_settings(self._settings, self._config_path, cmd=self._cmd)
-            else:
-                save_settings(self._settings, self._config_path)
+            cmd = self._cmd
+            if cmd is None:
+                # No policy in hand: preserve the file's allow/timeout entries.
+                cmd = load_cmd_policy(self._config_path)
+            # The live setting is the source of truth for the mode either way.
+            cmd.mode = self._settings.cmd_mode
+            save_settings(self._settings, self._config_path, cmd=cmd)
         except OSError as e:
             self.notify(f"Could not save settings: {e}", severity="warning")
         self._on_save()
@@ -536,12 +560,14 @@ class ChatApp(App):
         server: ServerInfo,
         config_path: Path = CONFIG_PATH,
         cmd: CmdPolicy | None = None,
+        no_discover: bool = False,
     ) -> None:
         super().__init__()
         self.settings = settings
         self.session = session
         self.server = server
         self.config_path = config_path
+        self._no_discover = no_discover
         self.cmd = cmd if cmd is not None else CmdPolicy()
         self.settings.cmd_mode = self.cmd.mode
         self._project_root = Path.cwd().resolve()
@@ -558,6 +584,8 @@ class ChatApp(App):
         # The "Queued" chat line for each entry (same order as _queue), so the
         # line can be removed when its message leaves the queue.
         self._queue_lines: list[tuple[Static, Markdown]] = []
+        # NB: ctx.server is the *same* ServerInfo as self.server, not a copy.
+        # _discover_server updates it in place so both stay in sync.
         self.ctx = CommandContext(
             session=session,
             settings=settings,
@@ -599,6 +627,35 @@ class ChatApp(App):
         self.query_one("#suggestions", Static).display = False
         self._render_status()
         self._focus_input()
+        if self.session.messages and self.server.context_length:
+            await self._init_token_count()
+        if not self._no_discover and self.settings.base_url:
+            self.call_later(self._discover_server)
+
+    async def _discover_server(self) -> None:
+        """Fill in model/context info from the endpoint, in place.
+
+        Two rules, both learned the hard way. A *failed* probe changes nothing:
+        discovery is best-effort, so it may not downgrade what is already known,
+        and it says so rather than leaving an unexplained empty footer. A
+        *successful* probe is authoritative and updates the ServerInfo **in
+        place** — ``self.server`` and ``self.ctx.server`` are deliberately the
+        same object, so rebinding one of them would leave /models and /stats
+        reading stale info while the footer showed the fresh values.
+        """
+        info = await asyncio.to_thread(fetch_server_info, self.settings)
+        if not info.known:
+            self.push_message(
+                "system",
+                f"Could not reach {self.settings.base_url} — model and context "
+                "info unavailable. Check base_url in /settings.",
+            )
+            return
+        self.server.models = info.models
+        self.server.context_length = info.context_length
+        if self.server.model and not self.settings.model:
+            self.settings.model = self.server.model
+        self._render_status()
         if self.session.messages and self.server.context_length:
             await self._init_token_count()
 
@@ -1006,9 +1063,18 @@ class ChatApp(App):
                             reason_parts.append(payload)
                         elif kind == "usage":
                             self._prompt_tokens = payload["prompt_tokens"]
-                        else:
+                        elif kind == "timings":
                             timings = payload
-                            self._prompt_tokens = int(payload.get("prompt_n", 0))
+                            # Only overwrite with a real count. A missing
+                            # prompt_n means "this payload carries none", not
+                            # "the prompt was 0 tokens" — defaulting to 0 threw
+                            # away whatever the usage event had just supplied.
+                            prompt_n = payload.get("prompt_n")
+                            if prompt_n:
+                                self._prompt_tokens = int(prompt_n)
+                        # Any other kind is ignored on purpose: a future event
+                        # type must not be read as timings just by falling off
+                        # the end of the chain.
                     else:
                         parts.append(item)
                     got_token = True
@@ -1072,77 +1138,115 @@ class ChatApp(App):
         Each round: gate every block (blacklist -> mode -> allowlist -> prompt),
         run or note the outcome, append the result to the session as a system
         message, then re-stream so the model can react. Bounded by
-        MAX_TOOL_ROUNDS so a looping model cannot run forever. While active,
-        newly submitted messages queue (they drain once the turn ends).
+        MAX_TOOL_ROUNDS so a looping model cannot run forever; exhausting that
+        budget is reported to both the user and the model rather than ending
+        the turn silently. While active, newly submitted messages queue (they
+        drain once the turn ends).
 
-        A model that stops acting (no command blocks) after a round that
-        actually executed a command is nudged to continue or respond, up to 2
-        times per turn. A stop after a declined or blocked command is a
-        response to user/guardrail input, not a stall, and a final answer to a
-        plain question is never nudged either.
+        A reply with no command blocks ends the turn — unless the round that
+        produced it actually ran something, in which case the model stopped
+        mid-task and gets one nudge to continue. The nudge consumes
+        ``executed``: whatever comes back answers the nudge rather than a
+        command, so the next stop is a real stop. Only _process_blocks refills
+        ``executed``, and that always costs a round, so nudges never outnumber
+        rounds and the MAX_TOOL_ROUNDS budget bounds both.
+
+        A stop after a declined or blocked command leaves ``executed`` at 0 —
+        the user or the guardrail took the wheel, so the stop is a response to
+        them, not a stall. A final answer to a plain question is never nudged
+        either, having run nothing.
         """
         self._tool_rounds_active = True
         try:
             rounds = 0
-            nudges = 0
-            executed = 0  # commands actually run in the last round
+            executed = 0  # commands run by the round that produced `reply`
             while rounds < MAX_TOOL_ROUNDS:
                 blocks = extract_cmd_blocks(reply)
                 if not blocks:
-                    # Model stopped after a tool call that ran: nudge it
-                    # (max 2, ephemeral). A decline or block means the
-                    # user/guardrail took the wheel — the stop is a response
-                    # to that, so no nudge.
-                    if executed > 0 and nudges < 2:
-                        nudges += 1
-                        nudge = "[system] Continue your task or respond to the user."
-                        self.session.add("system", nudge)
-                        reply = await self._stream_once()
-                        # Remove the ephemeral nudge so it doesn't pollute history.
-                        # _stream_once saved while the nudge was still in the
-                        # list, so re-save to keep the JSONL file consistent.
-                        self.session.messages.remove({"role": "system", "content": nudge})
-                        self._save()
-                        if reply is None:
-                            return
-                        continue
+                    if not executed:
+                        return
+                    executed = 0
+                    reply = await self._nudge()
+                else:
+                    if len(blocks) > MAX_BLOCKS_PER_REPLY:
+                        self._report_blocks_dropped(len(blocks))
+                    executed = await self._process_blocks(blocks[:MAX_BLOCKS_PER_REPLY])
+                    rounds += 1
+                    reply = await self._stream_once()
+                if reply is None:  # stopped or errored
                     return
-                if len(blocks) > MAX_BLOCKS_PER_REPLY:
-                    self.push_message(
-                        "system",
-                        f"{len(blocks) - MAX_BLOCKS_PER_REPLY} extra command block(s) "
-                        f"ignored (max {MAX_BLOCKS_PER_REPLY} per reply).",
-                    )
-                executed = await self._process_blocks(blocks[:MAX_BLOCKS_PER_REPLY])
-                rounds += 1
-                reply = await self._stream_once()
-                if reply is None:
-                    return
+            # Falling out of the loop is its only non-return exit: the budget
+            # ran out rather than the model choosing to stop.
+            self._report_rounds_exhausted(len(extract_cmd_blocks(reply)))
         finally:
             self._tool_rounds_active = False
+
+    def _report_blocks_dropped(self, total: int) -> None:
+        """Report command blocks discarded past the per-reply cap.
+
+        The model has to hear it too, not just the user: it gets results for
+        the blocks that ran and would otherwise take the silence on the rest
+        as success and report work that never happened.
+        """
+        dropped = total - MAX_BLOCKS_PER_REPLY
+        self.push_message(
+            "system",
+            f"{dropped} extra command block(s) ignored "
+            f"(max {MAX_BLOCKS_PER_REPLY} per reply).",
+        )
+        self._add_system(
+            BLOCKS_DROPPED_PROMPT.format(kept=MAX_BLOCKS_PER_REPLY, dropped=dropped)
+        )
+
+    def _report_rounds_exhausted(self, dropped: int) -> None:
+        """Report a turn cut short by the round budget.
+
+        The user needs to know why the model stopped mid-task, and the model
+        needs to know that its last commands never ran — otherwise the next
+        turn continues from results it never received.
+        """
+        detail = f" {dropped} command block(s) were not run." if dropped else ""
+        self.push_message(
+            "system",
+            f"Command round limit reached "
+            f"(max {MAX_TOOL_ROUNDS} per turn).{detail}",
+        )
+        self._add_system(ROUNDS_EXHAUSTED_PROMPT)
+
+    async def _nudge(self) -> str | None:
+        """Re-stream once with an ephemeral "keep going" system message.
+
+        The nudge has to reach the model and then vanish: kept in history it
+        would re-read as a standing instruction on every later turn, and it is
+        deliberately given no chat bubble, so a persisted copy would be
+        invisible and unremovable from the UI. Session.ephemeral strips it even
+        if the stream raises; the re-save then publishes the stripped history,
+        because _stream_once already wrote the JSONL with the nudge in it.
+        """
+        try:
+            with self.session.ephemeral("system", NUDGE_PROMPT):
+                return await self._stream_once()
+        finally:
+            self._save()
 
     async def _process_blocks(self, blocks: list[str]) -> int:
         """Gate and run each block; return how many were actually executed."""
         executed = 0
         for block in blocks:
             if not block.strip():
-                await self._note_command(block, "empty command — not run")
+                self._note_command(block, "empty command — not run")
                 continue
             decision = decide(block, self.cmd, self._project_root)
             if decision.action == "blocked":
-                await self._note_command(block, f"blocked — {decision.reason}")
+                self._note_command(block, f"blocked — {decision.reason}")
                 continue
             if decision.action == "ask":
                 choice = await self._prompt_for_command(block, decision.reason)
                 if choice is CmdChoice.DECLINE:
-                    await self._note_command(block, "declined by the user")
+                    self._note_command(block, "declined by the user")
                     # A decline means the user's intent differs from the model's
                     # plan: tell it to ask, not to silently adapt on its own.
-                    self._add_system(
-                        "The user declined this command. Do not retry it; "
-                        "ask the user how they would like to proceed."
-                    )
-                    self._save()
+                    self._add_system(COMMAND_DECLINED_PROMPT)
                     continue
                 if choice is CmdChoice.ALWAYS:
                     self._add_allow_rule(allow_rule_for(block, self.cmd.allow))
@@ -1150,14 +1254,12 @@ class ChatApp(App):
             executed += 1
             self.push_message("system", self._cmd_bubble(block, result))
             self._add_system(format_result(block, result=result))
-            self._save()
         return executed
 
-    async def _note_command(self, command: str, note: str) -> None:
+    def _note_command(self, command: str, note: str) -> None:
         """Feed a non-executed command outcome back to the model and show it."""
         self.push_message("system", f"$ {command}\n→ {note}")
         self._add_system(format_result(command, note=note))
-        self._save()
 
     async def _prompt_for_command(self, command: str, reason: str) -> CmdChoice:
         return await self.push_screen_wait(CommandPrompt(command, reason))
@@ -1260,8 +1362,13 @@ class ChatApp(App):
         self._render_status()
 
     def _add_system(self, content: str) -> None:
-        """Add a system message to session; render in chat if debug_level == system."""
+        """Persist a system message; render it in chat if debug_level == system.
+
+        Saves as it adds: every caller is feeding command output back to the
+        model, and surviving a crash mid-turn is the point of persisting at all.
+        """
         self.session.add("system", content)
+        self._save()
         if self.settings.debug_level == "system":
             self.push_message("system", content)
 

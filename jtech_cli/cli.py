@@ -10,7 +10,7 @@ from rich.console import Console
 
 from jtech_cli import __version__
 from jtech_cli.config import Settings, apply_default_prompt, build_settings, load_cmd_policy
-from jtech_cli.server_info import ServerInfo, fetch_server_info
+from jtech_cli.server_info import ServerInfo
 from jtech_cli.session import Session
 from jtech_cli.theme import VALID_THEMES
 from jtech_cli.tui import ChatApp
@@ -73,16 +73,13 @@ def make_app(args: argparse.Namespace) -> ChatApp:
     settings.cmd_mode = cmd.mode
 
     server = ServerInfo()
-    if not args.no_discover and settings.base_url:
-        server = fetch_server_info(settings)
-    if server.model:
-        settings.model = server.model
 
     return ChatApp(
         settings=settings,
         session=session,
         server=server,
         cmd=cmd,
+        no_discover=args.no_discover,
     )
 
 

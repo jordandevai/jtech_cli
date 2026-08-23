@@ -10,10 +10,22 @@ from jtech_cli.cmd_tools import CmdPolicy
 from jtech_cli.config import Settings, load_cmd_policy
 from jtech_cli.server_info import ServerInfo
 from jtech_cli.session import Session
-from jtech_cli.tui import ChatApp, CommandPrompt, SettingsScreen
+from jtech_cli.tui import (
+    MAX_BLOCKS_PER_REPLY,
+    MAX_TOOL_ROUNDS,
+    ChatApp,
+    CommandPrompt,
+    SettingsScreen,
+)
 
 
-def make_app(tmp_path, settings=None, session=None, server=None):
+def make_app(tmp_path, settings=None, session=None, server=None, no_discover=True):
+    """A ChatApp for tests. Discovery is off unless a test opts in.
+
+    Left on, every app here fires a real HTTP request at host:9000 and waits
+    out the 5s timeout — network I/O in a unit test, and a failure notice in
+    the chat that tests asserting on bubbles have to know to ignore.
+    """
     settings = settings or Settings(base_url="http://host:9000/v1", model="qwen3")
     session = session or Session(tmp_path / "s.jsonl", persist=False)
     server = server or ServerInfo(models=["qwen3"], context_length=4096)
@@ -22,6 +34,7 @@ def make_app(tmp_path, settings=None, session=None, server=None):
         session=session,
         server=server,
         config_path=tmp_path / "config.toml",
+        no_discover=no_discover,
     )
 
 
@@ -1221,8 +1234,74 @@ async def test_cmd_always_allow_saves_rule(tmp_path, monkeypatch):
         assert any("git status:*" in b for b in bubbles(app))
 
 
+async def test_blocks_over_cap_are_reported_to_the_model(tmp_path, monkeypatch):
+    """Blocks past the per-reply cap are dropped — the model has to be told.
+
+    Silence would read as success: the model sees results for the blocks that
+    ran and no sign the rest were discarded.
+    """
+    app = make_app_with_cmd(tmp_path, CmdPolicy(mode="auto", allow=["echo:*"]))
+    over = MAX_BLOCKS_PER_REPLY + 2
+    calls = {"n": 0}
+
+    def fake(settings, messages):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            yield "\n".join(f"```cmd\necho blk-{i}\n```" for i in range(over))
+        else:
+            yield "stopped"
+
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    async with app.run_test() as pilot:
+        inp = app.query_one("#input", Input)
+        inp.value = "go"
+        await pilot.press("enter")
+        await _wait_until(app, pilot, lambda: calls["n"] >= 2, tries=150)
+        await _wait_until(app, pilot, lambda: not app._tool_rounds_active, tries=100)
+        await pilot.pause()
+
+        assert any("2 extra command block(s) ignored" in b for b in bubbles(app))
+
+    fed = "\n".join(m["content"] for m in app.session.messages if m["role"] == "system")
+    assert "were ignored and produced no output" in fed
+    assert f"blk-{MAX_BLOCKS_PER_REPLY - 1}" in fed  # last kept block ran
+    assert f"blk-{MAX_BLOCKS_PER_REPLY}" not in fed  # first dropped one did not
+
+
+async def test_round_limit_is_reported_to_user_and_model(tmp_path, monkeypatch):
+    """Exhausting the round budget ends the turn loudly, not silently."""
+    app = make_app_with_cmd(tmp_path, CmdPolicy(mode="auto", allow=["echo:*"]))
+    calls = {"n": 0}
+
+    def fake(settings, messages):
+        calls["n"] += 1
+        yield f"```cmd\necho round-{calls['n']}\n```"  # never stops asking
+
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    async with app.run_test() as pilot:
+        inp = app.query_one("#input", Input)
+        inp.value = "go"
+        await pilot.press("enter")
+        await _wait_until(
+            app, pilot, lambda: calls["n"] >= MAX_TOOL_ROUNDS + 1, tries=200
+        )
+        await _wait_until(app, pilot, lambda: not app._tool_rounds_active, tries=100)
+        for _ in range(10):  # nothing further may stream once the budget is gone
+            await pilot.pause()
+
+        assert calls["n"] == MAX_TOOL_ROUNDS + 1
+        assert any("Command round limit reached" in b for b in bubbles(app))
+        # the final reply's block never ran, and the notice says so
+        assert any("1 command block(s) were not run" in b for b in bubbles(app))
+
+    fed = [m for m in app.session.messages if m["role"] == "system"]
+    assert len(fed) == MAX_TOOL_ROUNDS + 1  # one result per round, plus the notice
+    assert "command round limit for this turn has been reached" in fed[-1]["content"]
+    assert f"round-{MAX_TOOL_ROUNDS + 1}" not in "\n".join(m["content"] for m in fed)
+
+
 async def test_nudge_fires_after_tool_stop(tmp_path, monkeypatch):
-    """A model that stops acting after a tool call is nudged (max 2) to continue."""
+    """A model that stops acting after a tool call is nudged once to continue."""
     app = make_app_with_cmd(tmp_path, CmdPolicy(mode="auto", allow=["echo:*"]))
     calls = {"n": 0}
 
@@ -1238,18 +1317,92 @@ async def test_nudge_fires_after_tool_stop(tmp_path, monkeypatch):
         inp = app.query_one("#input", Input)
         inp.value = "go"
         await pilot.press("enter")
-        # 1 initial + 1 post-tool + 2 nudges; then the budget is exhausted.
-        await _wait_until(app, pilot, lambda: calls["n"] >= 4, tries=100)
-        # the turn must be fully quiescent: the last nudge is stripped and the
+        # 1 initial + 1 post-tool + 1 nudge. The reply to the nudge follows a
+        # nudge, not a command, so it ends the turn instead of nudging again.
+        await _wait_until(app, pilot, lambda: calls["n"] >= 3, tries=100)
+        # the turn must be fully quiescent: the nudge is stripped and the
         # loop exits before teardown (a live stream races _render_status).
+        await _wait_until(app, pilot, lambda: not app._tool_rounds_active, tries=100)
+        for _ in range(10):  # a would-be second nudge would fire in this window
+            await pilot.pause()
+
+        assert calls["n"] == 3
+        roles = [m["role"] for m in app.session.messages]
+        assert roles == [
+            "user", "assistant", "system", "assistant", "assistant",
+        ]
+        assert not any(
+            "Continue your task" in m["content"] for m in app.session.messages
+        )
+
+
+async def test_nudge_budget_is_per_round_not_per_turn(tmp_path, monkeypatch):
+    """Every round that runs a command earns its own nudge, however many rounds."""
+    app = make_app_with_cmd(tmp_path, CmdPolicy(mode="auto", allow=["echo:*"]))
+    calls = {"n": 0}
+
+    def fake(settings, messages):
+        calls["n"] += 1
+        # act, stall, act, stall, act, stall — three command rounds, each
+        # followed by a stop that has to be nudged (a flat two-per-turn cap
+        # would starve the third and stop the turn a stream early).
+        if calls["n"] in (1, 3, 5):
+            yield f"```cmd\necho round-{calls['n']}\n```"
+        else:
+            yield "stopped"
+
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    async with app.run_test() as pilot:
+        inp = app.query_one("#input", Input)
+        inp.value = "go"
+        await pilot.press("enter")
+        await _wait_until(app, pilot, lambda: calls["n"] >= 7, tries=150)
         await _wait_until(app, pilot, lambda: not app._tool_rounds_active, tries=100)
         await pilot.pause()
 
-        assert calls["n"] == 4
-        roles = [m["role"] for m in app.session.messages]
-        assert roles == [
-            "user", "assistant", "system", "assistant", "assistant", "assistant",
-        ]
+        assert calls["n"] == 7  # 3 rounds x (act + stall) + the final stop
+        results = [m for m in app.session.messages if m["role"] == "system"]
+        assert len(results) == 3
+        assert not any(
+            "Continue your task" in m["content"] for m in app.session.messages
+        )
+
+
+async def test_clear_during_nudge_does_not_crash(tmp_path, monkeypatch):
+    """/clear can empty history mid-nudge: stripping the nudge must not raise."""
+    app = make_app_with_cmd(tmp_path, CmdPolicy(mode="auto", allow=["echo:*"]))
+    gate = threading.Event()
+    calls = {"n": 0}
+
+    def fake(settings, messages):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            yield "```cmd\necho clear-out\n```"
+        elif calls["n"] == 3:
+            gate.wait(5)  # hold the nudge stream open across the /clear
+            yield "after clear"
+        else:
+            yield "stopped"
+
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    async with app.run_test() as pilot:
+        inp = app.query_one("#input", Input)
+        inp.value = "go"
+        await pilot.press("enter")
+        await _wait_until(app, pilot, lambda: calls["n"] >= 3, tries=100)
+
+        # /clear is dispatched straight from the input, bypassing the
+        # tool-rounds queue guard, so it lands while the nudge is in flight.
+        inp.value = "/clear"
+        await pilot.press("enter")
+        await _wait_until(app, pilot, lambda: app.session.messages == [], tries=50)
+        gate.set()
+
+        await _wait_until(app, pilot, lambda: not app._tool_rounds_active, tries=100)
+        await pilot.pause()
+
+        assert app._exception is None
+        assert calls["n"] == 3
         assert not any(
             "Continue your task" in m["content"] for m in app.session.messages
         )
@@ -1301,7 +1454,7 @@ async def test_nudge_not_persisted_to_disk(tmp_path, monkeypatch):
         inp = app.query_one("#input", Input)
         inp.value = "go"
         await pilot.press("enter")
-        await _wait_until(app, pilot, lambda: calls["n"] >= 4, tries=100)
+        await _wait_until(app, pilot, lambda: calls["n"] >= 3, tries=100)
         # quiescent before reading the file: the final _save (post-nudge-strip)
         # must have landed
         await _wait_until(app, pilot, lambda: not app._tool_rounds_active, tries=100)
@@ -1438,3 +1591,162 @@ async def test_queue_drains_after_esc_stop(tmp_path, monkeypatch):
         {"role": "user", "content": "two"},
         {"role": "assistant", "content": "r2"},
     ]
+
+
+def test_output_sink_renders_rich_objects_instead_of_their_repr():
+    """A renderable must not reach the chat as "<... object at 0x...>"."""
+    from rich.markdown import Markdown
+
+    from jtech_cli.tui import OutputSink
+
+    class _StubApp:
+        def __init__(self):
+            self.messages = []
+
+        def push_message(self, role, text):
+            self.messages.append((role, text))
+
+    app = _StubApp()
+    sink = OutputSink(app)
+    sink.print(Markdown("# Heading"))
+
+    _role, text = app.messages[-1]
+    assert "object at" not in text
+    assert "Heading" in text
+
+
+def test_output_sink_passes_plain_strings_through():
+    from jtech_cli.tui import OutputSink
+
+    class _StubApp:
+        def __init__(self):
+            self.messages = []
+
+        def push_message(self, role, text):
+            self.messages.append((role, text))
+
+    app = _StubApp()
+    OutputSink(app).print("[dim]hello[/dim]")
+    assert app.messages[-1][1].strip() == "hello"
+
+
+def _event_stream(*items):
+    """A stream yielding exactly ``items``, counting invocations."""
+    calls = {"n": 0}
+
+    def fake(settings, messages):
+        calls["n"] += 1
+        yield from items
+
+    return fake, calls
+
+
+async def test_timings_without_prompt_n_keeps_the_usage_count(tmp_path, monkeypatch):
+    """A timings payload carrying no prompt_n must not zero a known count.
+
+    Both events can arrive for one reply, in either order. Whichever carries a
+    real number wins; neither may clobber the other with a zero.
+    """
+    app = make_app(tmp_path)
+    fake, calls = _event_stream(
+        "hi",
+        ("usage", {"prompt_tokens": 8192}),
+        ("timings", {"prompt_ms": 431.0}),  # no prompt_n
+    )
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    async with app.run_test() as pilot:
+        app.query_one("#input", Input).value = "go"
+        await pilot.press("enter")
+        await _wait_until(app, pilot, lambda: calls["n"] >= 1, tries=50)
+        await _wait_until(app, pilot, lambda: not app._generating, tries=50)
+
+        assert app._prompt_tokens == 8192
+
+
+async def test_unknown_stream_event_is_not_treated_as_timings(tmp_path, monkeypatch):
+    """A new event kind must not be mistaken for timings and zero the counter."""
+    app = make_app(tmp_path)
+    fake, calls = _event_stream(
+        "hi",
+        ("usage", {"prompt_tokens": 512}),
+        ("some_future_event", {"whatever": True}),
+    )
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    async with app.run_test() as pilot:
+        app.query_one("#input", Input).value = "go"
+        await pilot.press("enter")
+        await _wait_until(app, pilot, lambda: calls["n"] >= 1, tries=50)
+        await _wait_until(app, pilot, lambda: not app._generating, tries=50)
+
+        assert app._prompt_tokens == 512
+
+
+async def test_timings_with_prompt_n_still_sets_the_count(tmp_path, monkeypatch):
+    """The llama.cpp path is unchanged: a real prompt_n still drives the footer."""
+    app = make_app(tmp_path)
+    fake, calls = _event_stream("hi", ("timings", {"prompt_n": 2048, "prompt_ms": 12.0}))
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    async with app.run_test() as pilot:
+        app.query_one("#input", Input).value = "go"
+        await pilot.press("enter")
+        await _wait_until(app, pilot, lambda: calls["n"] >= 1, tries=50)
+        await _wait_until(app, pilot, lambda: not app._generating, tries=50)
+
+        assert app._prompt_tokens == 2048
+
+
+async def test_successful_discovery_reaches_the_command_context(tmp_path, monkeypatch):
+    """/models and /stats read ctx.server — discovery has to update that too.
+
+    The footer reads app.server and the commands read app.ctx.server. They are
+    one object; rebinding only the first left /models reporting "unreachable"
+    against a perfectly healthy server.
+    """
+    monkeypatch.setattr(
+        "jtech_cli.tui.fetch_server_info",
+        lambda settings: ServerInfo(models=["qwen3"], context_length=4096),
+    )
+    app = make_app(tmp_path, server=ServerInfo(), no_discover=False)  # cli.make_app shape
+    async with app.run_test() as pilot:
+        await _wait_until(app, pilot, lambda: bool(app.server.models), tries=50)
+
+        assert app.ctx.server.models == ["qwen3"]
+        assert app.ctx.server.context_length == 4096
+        assert app.ctx.server is app.server
+
+        app.query_one("#input", Input).value = "/models"
+        await pilot.press("enter")
+        await pilot.pause()
+        assert any("qwen3" in b for b in bubbles(app))
+        assert not any("No model info available" in b for b in bubbles(app))
+
+
+async def test_failed_discovery_keeps_known_info_and_says_so(tmp_path, monkeypatch):
+    """A best-effort probe may not downgrade what is already known."""
+    monkeypatch.setattr("jtech_cli.tui.fetch_server_info", lambda settings: ServerInfo())
+    app = make_app(
+        tmp_path, server=ServerInfo(models=["qwen3"], context_length=4096), no_discover=False
+    )
+    async with app.run_test() as pilot:
+        await _wait_until(app, pilot, lambda: any("Could not reach" in b for b in bubbles(app)), tries=50)
+
+        assert app.server.models == ["qwen3"]
+        assert app.server.context_length == 4096
+        assert app.ctx.server.models == ["qwen3"]
+
+
+async def test_discovery_does_not_overwrite_an_explicit_model(tmp_path, monkeypatch):
+    """A model set in config/flags wins over the discovered one."""
+    monkeypatch.setattr(
+        "jtech_cli.tui.fetch_server_info",
+        lambda settings: ServerInfo(models=["discovered"], context_length=4096),
+    )
+    app = make_app(
+        tmp_path,
+        settings=Settings(base_url="http://host:9000/v1", model="explicit"),
+        server=ServerInfo(),
+        no_discover=False,
+    )
+    async with app.run_test() as pilot:
+        await _wait_until(app, pilot, lambda: bool(app.server.models), tries=50)
+        assert app.settings.model == "explicit"

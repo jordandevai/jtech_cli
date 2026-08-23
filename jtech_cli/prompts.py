@@ -27,6 +27,27 @@ Shell commands:
 - After receiving a command result, if the task is not complete, immediately emit your next ```cmd block in the same response. Do not stop and wait for the user. Only end your turn when the task is fully complete.
 """
 
+# Mid-turn prompts: injected by the command loop, not part of the system prompt.
+NUDGE_PROMPT = "[system] Continue your task or respond to the user."
+
+COMMAND_DECLINED_PROMPT = (
+    "The user declined this command. Do not retry it; "
+    "ask the user how they would like to proceed."
+)
+
+BLOCKS_DROPPED_PROMPT = (
+    "Only the first {kept} command blocks in that reply were run; the other "
+    "{dropped} were ignored and produced no output. Re-issue any you still "
+    "need, at most {kept} per reply."
+)
+
+ROUNDS_EXHAUSTED_PROMPT = (
+    "The command round limit for this turn has been reached, so nothing "
+    "further will run and any command blocks in your last reply were not "
+    "executed. Summarise what you did and what is left; the user has to "
+    "reply before you can run another command."
+)
+
 INSTRUCTIONS_HELP = """Available slash commands:
 
   /exit              Quit the session (also Ctrl+Q / Ctrl+C)

@@ -9,11 +9,13 @@ from openai import OpenAI
 from jtech_cli.config import Settings
 
 # Stream items: plain content deltas (str), or tagged events:
-# ("reasoning", text) for thinking tokens, ("timings", dict) for llama.cpp
-# prompt/generation stats (prompt_n, prompt_ms, prompt_per_second, ...).
+# ("reasoning", text) for thinking tokens, ("usage", dict) for the standard
+# OpenAI token counts, and ("timings", dict) for llama.cpp prompt/generation
+# stats (prompt_n, prompt_ms, prompt_per_second, ...).
 ReasoningEvent = tuple[str, str]
+UsageEvent = tuple[str, dict]
 TimingsEvent = tuple[str, dict]
-StreamItem = str | ReasoningEvent | TimingsEvent
+StreamItem = str | ReasoningEvent | UsageEvent | TimingsEvent
 
 # Reuse one OpenAI client (connection pool) per base_url instead of building a
 # new one per message. A changed base_url naturally gets its own entry.
@@ -33,9 +35,11 @@ def stream_reply(settings: Settings, messages: list[dict]) -> Iterator[StreamIte
     """Yield content deltas from a streaming chat completion.
 
     Content deltas are plain ``str``. Thinking models additionally produce
-    ``("reasoning", text)`` events for their reasoning tokens, and llama.cpp
-    servers append one final ``("timings", dict)`` event with prompt/generation
-    stats (``prompt_n``, ``prompt_ms``, ``prompt_per_second``, ...).
+    ``("reasoning", text)`` events for their reasoning tokens. Servers honouring
+    ``include_usage`` emit one ``("usage", dict)`` event carrying
+    ``prompt_tokens``, and llama.cpp appends one final ``("timings", dict)``
+    event with prompt/generation stats (``prompt_n``, ``prompt_ms``,
+    ``prompt_per_second``, ...).
     """
     client = make_client(settings)
     kwargs = dict(
@@ -55,6 +59,12 @@ def stream_reply(settings: Settings, messages: list[dict]) -> Iterator[StreamIte
             temperature=settings.temperature,
         )
     for chunk in stream:
+        # Usage first. The chunk carrying it has an empty ``choices`` list —
+        # that is the shape ``include_usage`` asks for — so reading it after
+        # the guard below made the event unreachable on compliant servers.
+        usage = getattr(chunk, "usage", None)
+        if usage is not None and usage.prompt_tokens:
+            yield ("usage", {"prompt_tokens": usage.prompt_tokens})
         if not chunk.choices:
             continue
         choice = chunk.choices[0]
@@ -68,6 +78,3 @@ def stream_reply(settings: Settings, messages: list[dict]) -> Iterator[StreamIte
             timings = getattr(chunk, "timings", None)
             if isinstance(timings, dict):
                 yield ("timings", timings)
-        usage = getattr(chunk, "usage", None)
-        if usage is not None and usage.prompt_tokens:
-            yield ("usage", {"prompt_tokens": usage.prompt_tokens})

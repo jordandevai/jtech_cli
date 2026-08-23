@@ -64,3 +64,54 @@ def test_messages_with_system():
     # no system prompt -> passthrough, original list unmutated
     assert s.messages_with_system("") == [{"role": "user", "content": "hi"}]
     assert s.messages == [{"role": "user", "content": "hi"}]
+
+
+def test_ephemeral_adds_then_strips():
+    s = Session(persist=False)
+    s.add("user", "hi")
+    with s.ephemeral("system", "keep going"):
+        assert s.messages[-1] == {"role": "system", "content": "keep going"}
+    assert s.messages == [{"role": "user", "content": "hi"}]
+
+
+def test_ephemeral_strips_when_the_body_raises():
+    """A leaked ephemeral would be permanent — the strip has to run on failure."""
+    s = Session(persist=False)
+    try:
+        with s.ephemeral("system", "keep going"):
+            raise RuntimeError("stream died")
+    except RuntimeError:
+        pass
+    assert s.messages == []
+
+
+def test_ephemeral_strips_its_own_copy_not_an_equal_one():
+    """Identity, not equality: an equal message from a crashed run must survive."""
+    s = Session(persist=False)
+    s.add("system", "keep going")  # stale twin, e.g. left by an earlier crash
+    with s.ephemeral("system", "keep going"):
+        assert len(s.messages) == 2
+    assert s.messages == [{"role": "system", "content": "keep going"}]
+
+
+def test_ephemeral_tolerates_history_cleared_underneath_it():
+    """/clear can empty the list mid-block; the strip must not raise."""
+    s = Session(persist=False)
+    with s.ephemeral("system", "keep going"):
+        s.messages.clear()
+    assert s.messages == []
+
+
+def test_clear_leaves_the_file_alone_when_not_persisting(tmp_path):
+    """--no-persist promises not to touch stored history, including on /clear."""
+    path = tmp_path / "session.jsonl"
+    path.write_text('{"role": "user", "content": "precious"}\n')
+
+    s = Session(path, persist=False)
+    s.load()
+    s.add("user", "throwaway")
+    s.clear()
+
+    assert s.messages == []
+    assert path.exists()
+    assert "precious" in path.read_text()

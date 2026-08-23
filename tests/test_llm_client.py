@@ -48,3 +48,24 @@ def test_stream_reply_concatenates_deltas(monkeypatch):
     assert fake.sent["temperature"] == 0.3
     assert fake.sent["stream"] is True
     assert fake.sent["messages"] == messages
+
+
+def _usage_chunk(prompt_tokens):
+    """The final chunk ``include_usage`` produces: usage set, choices empty."""
+    return SimpleNamespace(choices=[], usage=SimpleNamespace(prompt_tokens=prompt_tokens))
+
+
+def test_stream_reply_emits_usage_from_the_choiceless_final_chunk(monkeypatch):
+    """The usage chunk has no choices, so it must be read before that guard."""
+
+    class _Client(_FakeClient):
+        def create(self, **kwargs):
+            self.sent = kwargs
+            return iter([_chunk("hi"), _usage_chunk(4242)])
+
+    monkeypatch.setattr(Settings, "make_client", lambda self: _Client())
+    # Distinct base_url on purpose: llm_client caches one client per base_url,
+    # so sharing the default "" would hand this test the previous test's fake.
+    items = list(stream_reply(Settings(base_url="http://usage-test/v1", model="m"), []))
+    assert ("usage", {"prompt_tokens": 4242}) in items
+    assert "".join(i for i in items if isinstance(i, str)) == "hi"

@@ -3,6 +3,7 @@
 
 from rich.console import Console
 
+from jtech_cli.cmd_tools import CmdPolicy
 from jtech_cli.server_info import ServerInfo
 from jtech_cli.wizard import run_setup
 
@@ -84,7 +85,7 @@ def test_setup_requires_url_when_no_default(tmp_path, monkeypatch):
 def test_setup_uses_existing_config_as_default(tmp_path, monkeypatch):
     from jtech_cli.config import Settings, save_settings
     path = tmp_path / "c.toml"
-    save_settings(Settings(base_url="http://srv:4321/v1", model="m"), path)
+    save_settings(Settings(base_url="http://srv:4321/v1", model="m"), path, cmd=CmdPolicy())
 
     monkeypatch.setattr(
         "jtech_cli.wizard.fetch_server_info",
@@ -94,3 +95,26 @@ def test_setup_uses_existing_config_as_default(tmp_path, monkeypatch):
     # empty input -> falls back to the config file's base_url
     settings = run_setup(console, ask=_ask_script([""]), config_path=path)
     assert settings.base_url == "http://srv:4321/v1"
+
+
+def test_rerunning_setup_preserves_the_cmd_policy(tmp_path, monkeypatch):
+    """Re-running setup re-points the endpoint; it must not reset shell policy."""
+    from jtech_cli.config import Settings, load_cmd_policy, save_settings
+
+    path = tmp_path / "c.toml"
+    save_settings(
+        Settings(base_url="http://old:1/v1", model="m"),
+        path,
+        cmd=CmdPolicy(mode="yolo", allow=["cargo build:*"], timeout=5, max_output=99),
+    )
+    monkeypatch.setattr(
+        "jtech_cli.wizard.fetch_server_info", lambda settings: _fake_info(["m"])
+    )
+
+    run_setup(_console(), ask=_ask_script(["http://new:2/v1"]), config_path=path)
+
+    policy = load_cmd_policy(path)
+    assert policy.mode == "yolo"
+    assert policy.allow == ["cargo build:*"]
+    assert policy.timeout == 5
+    assert policy.max_output == 99

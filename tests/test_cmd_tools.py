@@ -378,3 +378,24 @@ def test_format_result_exec():
     msg = format_result("echo out", result=r)
     assert msg.startswith("$ echo out\nexit 0\n")
     assert "out" in msg
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "echo $(rm -rf /)",
+        "$(rm -rf /etc)",
+        "ls && echo $(rm -rf /usr/lib)",
+        "echo `rm -rf /`",
+        "ls; rm -rf \'/\'",
+        "rm -rf /",
+    ],
+)
+def test_blacklist_survives_substitution_and_quoting(command):
+    """Punctuation left by $( ) or quoting must not hide an rm target."""
+    assert check_blacklist(command) is not None
+
+
+def test_blacklist_reason_names_the_bare_target():
+    reason = check_blacklist("echo $(rm -rf /etc)")
+    assert "rm targeting \'/etc\'" in reason

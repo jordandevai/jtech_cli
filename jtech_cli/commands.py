@@ -16,11 +16,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from rich.console import Console
-from rich.markdown import Markdown
 
 from jtech_cli import file_tools, server_info
 from jtech_cli.cmd_tools import CmdPolicy
-from jtech_cli.config import CONFIG_PATH, SETTABLE_KEYS, Settings, save_settings
+from jtech_cli.config import (
+    CONFIG_PATH,
+    SETTABLE_KEYS,
+    Settings,
+    load_cmd_policy,
+    save_settings,
+)
 from jtech_cli.prompts import INSTRUCTIONS_HELP
 from jtech_cli.session import Session
 from jtech_cli.theme import VALID_THEMES
@@ -59,12 +64,14 @@ class CommandContext:
 
     def persist_settings(self) -> None:
         try:
-            if self.cmd is not None:
-                # keep the [cmd] table's mode in sync with the live setting
-                self.cmd.mode = self.settings.cmd_mode
-                save_settings(self.settings, self.config_path, cmd=self.cmd)
-            else:
-                save_settings(self.settings, self.config_path)
+            cmd = self.cmd
+            if cmd is None:
+                # No policy in hand: carry the file's existing allow/timeout
+                # through, so a settings write never drops the [cmd] table.
+                cmd = load_cmd_policy(self.config_path)
+            # The live setting is the source of truth for the mode either way.
+            cmd.mode = self.settings.cmd_mode
+            save_settings(self.settings, self.config_path, cmd=cmd)
             self.console.print(f"[dim]Saved settings to {self.config_path}[/dim]")
         except OSError as e:
             self.console.print(f"[yellow]Could not save settings:[/yellow] {e}")
@@ -227,7 +234,9 @@ def build_registry(ctx: CommandContext) -> CommandRegistry:
         if not ctx.last_reply:
             c.print("[dim]No reply to render yet.[/dim]")
             return
-        c.print(Markdown(ctx.last_reply))
+        # Hand over the text, not a renderable: the console decides how to
+        # present it, and the TUI's sink re-renders it as a Markdown bubble.
+        c.print(ctx.last_reply)
 
     for name, handler, help_text in [
         ("exit", cmd_exit, "Quit"),

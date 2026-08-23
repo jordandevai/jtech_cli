@@ -7,6 +7,8 @@ survives crashes, detaches from tmux, and process kills.
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 from jtech_cli.config import home_dir
@@ -44,6 +46,29 @@ class Session:
     def add(self, role: str, content: str) -> None:
         self.messages.append({"role": role, "content": content})
 
+    @contextmanager
+    def ephemeral(self, role: str, content: str) -> Iterator[None]:
+        """Hold a message in history for the body of the block, then strip it.
+
+        For prompts that must reach the model on one request without joining
+        the conversation. Removal is by identity, not equality, and runs even
+        if the body raises: an equal message may survive from a crashed run,
+        and the list can be emptied concurrently (``/clear``), which would make
+        ``list.remove`` raise.
+
+        Persistence stays the caller's job — a save inside the block writes the
+        message out with everything else, so the caller re-saves afterwards.
+        """
+        msg = {"role": role, "content": content}
+        self.messages.append(msg)
+        try:
+            yield
+        finally:
+            for i, held in enumerate(self.messages):
+                if held is msg:
+                    del self.messages[i]
+                    break
+
     def save(self) -> None:
         if not self.persist:
             return
@@ -55,7 +80,15 @@ class Session:
         tmp.replace(self.path)
 
     def clear(self) -> None:
+        """Drop the in-memory history, and the file too when persisting.
+
+        With ``persist=False`` the file was never loaded and is not ours to
+        delete: --no-persist promises not to touch stored history, so /clear
+        in a throwaway session must not destroy the real one.
+        """
         self.messages = []
+        if not self.persist:
+            return
         if self.path.exists():
             self.path.unlink()
 
