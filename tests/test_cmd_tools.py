@@ -8,6 +8,7 @@ import pytest
 from jtech_cli.cmd_tools import (
     CmdPolicy,
     ExecResult,
+    ShellParseError,
     _find_exec_commands,
     acting_reason,
     allow_rule_for,
@@ -117,9 +118,31 @@ def test_quoted_commands_support_escaped_values():
 def test_split_segments():
     assert split_segments("git status && git log | head") == ["git status", "git log", "head"]
     assert split_segments("a; b") == ["a", "b"]
-    assert split_segments("echo $(cat x) and `id`") == ["echo", "cat x) and", "id"]
+    assert split_segments("echo $(cat x) and `id`") == [
+        "echo $(cat x) and `id`",
+        "cat x",
+        "id",
+    ]
     assert split_segments("a & b") == ["a", "b"]
     assert split_segments("single") == ["single"]
+
+
+def test_split_segments_respects_quotes_and_escapes():
+    assert split_segments(r"grep -rn 'block\|round\|cap' README.md") == [
+        r"grep -rn 'block\|round\|cap' README.md"
+    ]
+    assert split_segments('echo "a|b;c"') == ['echo "a|b;c"']
+    assert split_segments(r"printf a\|b") == [r"printf a\|b"]
+    assert split_segments("echo one\necho two") == ["echo one", "echo two"]
+
+
+def test_shell_parse_errors_are_explicit_and_blocked():
+    with pytest.raises(ShellParseError, match="could not be analyzed"):
+        split_segments("echo 'unterminated")
+    for command in ("echo 'unterminated", "echo $((1 + 2))"):
+        decision = decide(command, CmdPolicy(mode="yolo"), ROOT)
+        assert decision.action == "blocked"
+        assert "could not be analyzed" in decision.reason
 
 
 def test_split_segments_fd_redirects_are_not_separators():
@@ -214,6 +237,20 @@ def test_allow_pipeline_every_segment_vetted():
     assert matches_allow("grep -rn foo . | head -50", ["grep:*", "head:*"])
     assert not matches_allow("grep x | python", ["grep:*", "head:*"])
     assert not matches_allow("git status && git push", ["git status:*", "git log:*"])
+
+
+def test_quoted_grep_alternation_is_one_allowlisted_command():
+    command = r"grep -rn 'block\|round\|cap\|MAX_BLOCKS' README.md"
+    allow = ["grep:*"]
+    assert matches_allow(command, allow)
+    assert allow_rule_for(command, allow) is None
+    assert decide(command, CmdPolicy(mode="auto", allow=allow), ROOT).action == "run"
+
+
+def test_nested_commands_are_individually_allowlisted():
+    command = "echo $(cat file.txt)"
+    assert not matches_allow(command, ["echo:*"])
+    assert matches_allow(command, ["echo:*", "cat:*"])
 
 
 def test_allow_bare_program_requires_no_args():
@@ -351,8 +388,8 @@ def test_redirect_never_auto_runs():
     # not a write: 2>&1 dup, -> arrows, => in patterns
     assert decide("git log 2>&1 | head", CmdPolicy(mode="auto", allow=["git log:*", "head:*"]), ROOT).action == "run"
     assert decide('grep "->" file.py', CmdPolicy(mode="auto", allow=["grep:*"]), ROOT).action == "run"
-    # quoted redirects are still flagged (conservative; a prompt is cheap)
-    assert decide('echo "a > b"', CmdPolicy(mode="auto", allow=["echo:*"]), ROOT).action == "ask"
+    # quoted operator characters are argument text, not shell redirection
+    assert decide('echo "a > b"', CmdPolicy(mode="auto", allow=["echo:*"]), ROOT).action == "run"
     # yolo is explicit max-trust: the acting guard does not apply there
     assert decide("grep x file.py > out.txt", CmdPolicy(mode="yolo"), ROOT).action == "run"
 
@@ -361,6 +398,19 @@ def test_acting_reason():
     assert acting_reason("ls > x") == "output redirection writes to a file"
     assert acting_reason(r"find . -delete") == "find -exec/-ok/-delete executes or deletes"
     assert acting_reason("ls -la 2>&1") is None
+    assert acting_reason('echo "a > b"') is None
+
+
+def test_blacklist_distinguishes_pipeline_syntax_from_quoted_text():
+    assert check_blacklist("curl x | sh") == "piping data into a shell is on the absolute blacklist"
+    assert check_blacklist("grep '| sh' README.md") is None
+
+
+def test_dynamic_program_name_is_blocked_in_every_mode():
+    for mode in ("ask", "auto", "yolo"):
+        decision = decide("$PROGRAM --version", CmdPolicy(mode=mode), ROOT)
+        assert decision.action == "blocked"
+        assert "dynamically computed command name" in decision.reason
 
 
 # ---------------------------------------------------------------- execution

@@ -5,6 +5,7 @@ description = "Full-screen terminal chat client for llama-server (OpenAI-compati
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "bashlex>=0.18",
     "openai>=1.30.0",
     "rich>=13.7.0",
     "textual>=0.80",
