@@ -26,7 +26,7 @@ from jtech_cli.config import (
     load_cmd_policy,
     save_settings,
 )
-from jtech_cli.prompts import INSTRUCTIONS_HELP
+from jtech_cli.prompts import INSTRUCTIONS_HELP, PromptSourceError
 from jtech_cli.session import Session
 from jtech_cli.theme import VALID_THEMES
 
@@ -186,17 +186,31 @@ def build_registry(ctx: CommandContext) -> CommandRegistry:
         c.print(f"Theme set to {choice}")
 
     def cmd_system(_: CommandContext, __: str) -> None:
-        c.print(ctx.settings.system_prompt)
+        c.print(f"Prompt source: {ctx.settings.prompt_source}")
+        if ctx.settings.prompt_notice:
+            c.print(ctx.settings.prompt_notice)
+        c.print(ctx.settings.effective_system_prompt())
 
     def cmd_prompt(_: CommandContext, arg: str) -> None:
         if not arg:
-            c.print("Usage: /prompt FILE")
+            c.print("Usage: /prompt FILE | /prompt reload | /prompt reset")
             return
+        action = arg.strip().lower()
         try:
-            ctx.settings.system_prompt = Path(arg).expanduser().read_text()
-            c.print(f"Loaded system prompt from {arg}")
-        except OSError as e:
-            c.print(f"[red]{e}[/red]")
+            if action == "reset":
+                ctx.settings.reset_prompt()
+                ctx.persist_settings()
+                c.print("Reset to the bundled runtime prompt.")
+            elif action == "reload":
+                ctx.settings.reload_prompt()
+                ctx.persist_settings()
+                c.print(f"Reloaded prompt file {ctx.settings.prompt_file}")
+            else:
+                ctx.settings.set_prompt_file(Path(arg))
+                ctx.persist_settings()
+                c.print(f"Loaded prompt file {ctx.settings.prompt_file}")
+        except PromptSourceError as error:
+            c.print(f"[red]{error}[/red]")
 
     def cmd_models(_: CommandContext, __: str) -> None:
         if not ctx.server.models:
@@ -213,7 +227,9 @@ def build_registry(ctx: CommandContext) -> CommandRegistry:
         s = ctx.session.stats()
         lines = [f"messages={s['messages']} chars={s['chars']}"]
 
-        text = " ".join(m["content"] for m in ctx.session.messages)
+        text = " ".join(
+            m["content"] for m in ctx.session.messages_with_system("")
+        )
         if text:
             total: int | None = await asyncio.to_thread(
                 server_info.fetch_token_count, ctx.settings, text

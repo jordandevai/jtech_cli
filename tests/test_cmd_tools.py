@@ -15,9 +15,9 @@ from jtech_cli.cmd_tools import (
     decide,
     escape_project,
     execute,
-    extract_cmd_blocks,
     format_result,
     matches_allow,
+    parse_jtech_reply,
     split_segments,
     timeout_partial_output,
     truncate_output,
@@ -28,33 +28,90 @@ ROOT = Path("/home/u/project")
 
 # ---------------------------------------------------------------- parsing
 
-def test_extract_single_block():
-    reply = 'Check this:\n\n```cmd\ngit status\n```\n\nDone.'
-    assert extract_cmd_blocks(reply) == ["git status"]
+def test_parse_single_command_call():
+    parsed = parse_jtech_reply('jtech_cmd("git status")')
+    assert parsed.commands == ["git status"]
+    assert parsed.commentary == ""
 
 
-def test_extract_multiline_block():
-    reply = "```cmd\nfor f in a b\ndo ls $f\ndone\n```"
-    # a block is returned as one multi-line string
-    assert extract_cmd_blocks(reply) == ["for f in a b\ndo ls $f\ndone"]
+def test_parse_multiline_triple_quoted_call():
+    reply = 'jtech_cmd("""for f in a b\ndo ls $f\ndone""")'
+    assert parse_jtech_reply(reply).commands == ["for f in a b\ndo ls $f\ndone"]
 
 
-def test_extract_multiple_blocks_in_order():
-    reply = "```cmd\nls\n```\nthen\n```cmd\ncat x.txt\n```\nand\n```cmd\necho hi\n```"
-    assert extract_cmd_blocks(reply) == ["ls", "cat x.txt", "echo hi"]
+def test_parse_multiple_calls_in_order():
+    reply = (
+        'jtech_cmd("ls")\n\njtech_cmd(\'cat x.txt\')\n'
+        'jtech_cmd("echo hi")\n\nI will review the results next.'
+    )
+    parsed = parse_jtech_reply(reply)
+    assert parsed.commands == ["ls", "cat x.txt", "echo hi"]
+    assert parsed.commentary == "I will review the results next."
 
 
-def test_ignores_other_fence_languages():
-    reply = "```python\nprint(1)\n```\n```\nplain\n```"
-    assert extract_cmd_blocks(reply) == []
+def test_parse_command_from_whole_html_code_wrapper():
+    reply = '\n\n<code>\njtech_cmd("pwd")\n</code>'
+    assert parse_jtech_reply(reply).commands == ["pwd"]
 
 
-def test_unclosed_fence_ignored():
-    assert extract_cmd_blocks("```cmd\ngit status\nno closing fence") == []
+def test_prose_and_markdown_examples_are_not_executable():
+    reply = 'Run this next: jtech_cmd("ls")\n\nThen continue.'
+    assert parse_jtech_reply(reply).commands == []
+    assert parse_jtech_reply('Run this:\n\n```cmd\npwd\n```').commands == []
+    assert parse_jtech_reply('<code>pwd\njtech_cmd("ls")</code>').commands == []
 
 
-def test_fence_language_case_insensitive():
-    assert extract_cmd_blocks("```CMD\nls\n```") == ["ls"]
+def test_command_prefix_can_include_commentary_after_blank_line():
+    reply = 'jtech_cmd("pwd && ls -la")\n\nLet me inspect the project structure next.'
+    parsed = parse_jtech_reply(reply)
+    assert parsed.commands == ["pwd && ls -la"]
+    assert parsed.commentary == "Let me inspect the project structure next."
+
+
+def test_command_suffix_can_follow_a_prose_preamble():
+    reply = (
+        "I will inspect the project structure first.\n\n"
+        'jtech_cmd("ls -la")\n'
+        'jtech_cmd("git status")'
+    )
+    parsed = parse_jtech_reply(reply)
+    assert parsed.commands == ["ls -la", "git status"]
+    assert parsed.commentary == "I will inspect the project structure first."
+
+
+def test_commands_can_be_interleaved_with_commentary():
+    reply = (
+        'jtech_cmd("cat prompts.py")\n'
+        "Let me read the prompt loader.\n"
+        'jtech_cmd("cat commands.py")\n'
+        "Let me read the commands module."
+    )
+    parsed = parse_jtech_reply(reply)
+    assert parsed.commands == ["cat prompts.py", "cat commands.py"]
+    assert "Let me read the prompt loader." in parsed.commentary
+    assert "Let me read the commands module." in parsed.commentary
+
+
+def test_inline_command_like_text_is_not_executable():
+    reply = 'jtech_cmd("pwd")\n\nI will explain this.\n\nHere is jtech_cmd("ls") in prose.'
+    parsed = parse_jtech_reply(reply)
+    assert parsed.commands == ["pwd"]
+
+
+def test_prose_after_single_newline_invalidates_command_prefix():
+    parsed = parse_jtech_reply('jtech_cmd("pwd")\nLet me explain what I am checking.')
+    assert parsed.commands == ["pwd"]
+    assert parsed.commentary == "Let me explain what I am checking."
+
+
+def test_empty_reply_and_malformed_call_are_not_commands():
+    assert parse_jtech_reply("").commands == []
+    assert parse_jtech_reply('jtech_cmd("git status"').commands == []
+    assert parse_jtech_reply("jtech_cmd(git status)").commands == []
+
+
+def test_quoted_commands_support_escaped_values():
+    assert parse_jtech_reply(r'jtech_cmd("printf \"hi\n\"")').commands == ['printf "hi\n"']
 
 
 def test_split_segments():

@@ -124,6 +124,37 @@ def test_clear_calls_clear_chat(tmp_path):
     assert cleared == [True]
 
 
+def test_clear_does_not_reset_prompt_source(tmp_path):
+    settings = Settings(system_prompt="keep these instructions")
+    ctx, _console = make_ctx(tmp_path, settings=settings)
+    reg = build_registry(ctx)
+    reg.handle("/clear")
+    assert settings.prompt_source == "inline"
+    assert settings.system_prompt == "keep these instructions"
+
+
+def test_prompt_file_reload_and_reset(tmp_path):
+    prompt = tmp_path / "instructions.md"
+    prompt.write_text("first")
+    ctx, console = make_ctx(tmp_path)
+    reg = build_registry(ctx)
+
+    reg.handle(f"/prompt {prompt}")
+    assert ctx.settings.prompt_source == "file"
+    assert ctx.settings.system_prompt == "first"
+    assert 'prompt_source = "file"' in (tmp_path / "config.toml").read_text()
+
+    prompt.write_text("second")
+    reg.handle("/prompt reload")
+    assert ctx.settings.system_prompt == "second"
+    assert "Reloaded prompt file" in output(console)
+
+    reg.handle("/prompt reset")
+    assert ctx.settings.prompt_source == "default"
+    assert ctx.settings.system_prompt == ""
+    assert "Reset to the bundled runtime prompt" in output(console)
+
+
 def test_set_theme_persists(tmp_path):
     settings = Settings()
     ctx, _console = make_ctx(tmp_path, settings=settings)

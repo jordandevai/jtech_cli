@@ -153,7 +153,7 @@ class SettingsScreen(ModalScreen[None]):
         field = self.query_one("#settings-field")
         value = field.text if isinstance(field, TextArea) else field.value
         if key == "system_prompt":
-            self._settings.system_prompt = value
+            self._settings.set_prompt_inline(value)
         else:
             try:
                 self._settings.set(key, value.strip())

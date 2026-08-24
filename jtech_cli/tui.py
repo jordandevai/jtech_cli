@@ -18,7 +18,6 @@ from jtech_cli.session import Session
 from jtech_cli.tui_app import (
     CONNECTION_ERROR,
     MAX_BLOCKS_PER_REPLY,
-    MAX_TOOL_ROUNDS,
     SPINNER_FRAMES,
     FetchServerInfo,
     FetchTokenCount,
@@ -96,7 +95,6 @@ class ChatApp(_ChatApp):
 __all__ = [
     "CONNECTION_ERROR",
     "MAX_BLOCKS_PER_REPLY",
-    "MAX_TOOL_ROUNDS",
     "SPINNER_FRAMES",
     "ChatApp",
     "CmdChoice",

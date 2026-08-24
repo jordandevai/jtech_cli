@@ -11,9 +11,9 @@ from rich.console import Console
 from jtech_cli import __version__
 from jtech_cli.config import (
     Settings,
-    apply_default_prompt,
     build_settings,
     load_cmd_policy,
+    resolve_prompt_source,
 )
 from jtech_cli.server_info import ServerInfo
 from jtech_cli.session import Session
@@ -44,7 +44,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def make_settings(args: argparse.Namespace) -> Settings:
     settings = build_settings(base_url=args.base_url, model=args.model)
     if args.instructions:
-        settings.system_prompt = args.instructions.read_text()
+        settings.set_prompt_file(args.instructions)
     return settings
 
 
@@ -69,7 +69,7 @@ def make_app(args: argparse.Namespace) -> ChatApp:
     console = Console()
 
     settings = resolve_settings(args, console)
-    settings = apply_default_prompt(settings)
+    settings = resolve_prompt_source(settings)
     session = make_session(args)
 
     # The [cmd] policy (AI shell execution) is loaded after the wizard so a

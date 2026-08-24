@@ -1,13 +1,14 @@
 """Guarded shell command execution: parse, policy, and executor.
 
-The AI requests commands by emitting fenced blocks with language ``cmd`` in its
-reply. Each block is decided in order: absolute blacklist (immutable, all modes)
--> mode (off/yolo) -> allowlist -> prompt. Pure logic lives here so it is
-unit-testable without the TUI; the TUI owns prompting, rendering, and re-stream.
+The AI requests commands with standalone ``jtech_cmd(...)`` calls. Each call is
+decided in order: absolute blacklist (immutable, all modes) -> mode (off/yolo)
+-> allowlist -> prompt. Pure logic lives here so it is unit-testable without
+the TUI; the TUI owns prompting, rendering, and re-stream.
 """
 
 from __future__ import annotations
 
+import ast
 import re
 import subprocess
 from dataclasses import dataclass, field
@@ -67,26 +68,185 @@ class CmdPolicy:
     max_output: int = DEFAULT_MAX_OUTPUT
 
 
+@dataclass
+class ParsedReply:
+    """The executable command region and optional surrounding commentary."""
+
+    commands: list[str]
+    commentary: str = ""
+
+
 # ---------------------------------------------------------------- parsing
 
-def extract_cmd_blocks(reply: str) -> list[str]:
-    """Return the bodies of all `````cmd```` fenced blocks in a reply, in order.
+_JTECH_CMD = "jtech_cmd"
 
-    Only the fence language ``cmd`` is honored; an unclosed fence is ignored.
-    """
-    blocks: list[str] = []
-    current: list[str] | None = None
-    for line in reply.splitlines():
-        stripped = line.strip()
-        if current is None:
-            if stripped.startswith("```") and stripped[3:].strip().lower() == "cmd":
-                current = []
-        elif stripped.startswith("```"):
-            blocks.append("\n".join(current))
-            current = None
+
+def _quoted_literal_end(text: str, start: int) -> int | None:
+    """Return the end of the quoted literal beginning at ``start``."""
+    quote = text[start]
+    delimiter = quote * 3 if text.startswith(quote * 3, start) else quote
+    position = start + len(delimiter)
+    while position < len(text):
+        if text[position] == "\\":
+            position += 2
+        elif text.startswith(delimiter, position):
+            return position + len(delimiter)
         else:
-            current.append(line)
-    return blocks
+            position += 1
+    return None
+
+
+def _unwrap_html_code(text: str) -> str:
+    """Remove one whole-response HTML code wrapper, if present."""
+    opening = "<code>"
+    closing = "</code>"
+    if text.startswith(opening) and text.endswith(closing):
+        inner = text[len(opening) : -len(closing)].strip()
+        if (
+            inner
+            and inner.startswith(_JTECH_CMD)
+            and "<code>" not in inner
+            and "</code>" not in inner
+        ):
+            return inner
+    return text
+
+
+def _parse_command_at(text: str, start: int) -> tuple[str, int] | None:
+    """Parse one command call at ``start`` and return its end position."""
+    position = start
+    if not text.startswith(_JTECH_CMD, position):
+        return None
+    position += len(_JTECH_CMD)
+    if position < len(text) and not (text[position].isspace() or text[position] == "("):
+        return None
+    while position < len(text) and text[position].isspace():
+        position += 1
+    if position >= len(text) or text[position] != "(":
+        return None
+    position += 1
+    while position < len(text) and text[position].isspace():
+        position += 1
+    if position >= len(text) or text[position] not in "'\"":
+        return None
+
+    literal_start = position
+    literal_end = _quoted_literal_end(text, literal_start)
+    if literal_end is None:
+        return None
+    try:
+        command = ast.literal_eval(text[literal_start:literal_end])
+    except (SyntaxError, ValueError):
+        return None
+    if not isinstance(command, str):
+        return None
+    position = literal_end
+    while position < len(text) and text[position].isspace():
+        position += 1
+    if position >= len(text) or text[position] != ")":
+        return None
+    return command, position + 1
+
+
+def _parse_command_line(
+    text: str, start: int
+) -> tuple[list[str], list[tuple[int, int]], int] | None:
+    """Parse standalone calls beginning at one line and return its next line."""
+    line_end = text.find("\n", start)
+    if line_end < 0:
+        line_end = len(text)
+    line = text[start:line_end]
+    position = start + len(line) - len(line.lstrip(" \t"))
+    if not text.startswith(_JTECH_CMD, position):
+        return None
+
+    commands: list[str] = []
+    spans: list[tuple[int, int]] = []
+    while True:
+        parsed = _parse_command_at(text, position)
+        if parsed is None:
+            return None
+        command, command_end = parsed
+        tail_end = text.find("\n", command_end)
+        if tail_end < 0:
+            tail_end = len(text)
+        tail_start = command_end
+        while tail_start < tail_end and text[tail_start] in " \t":
+            tail_start += 1
+        commands.append(command)
+        spans.append((position, command_end))
+        if tail_start == tail_end:
+            return commands, spans, tail_end + (tail_end < len(text))
+        if not text.startswith(_JTECH_CMD, tail_start):
+            return None
+        position = tail_start
+
+
+def parse_jtech_reply(reply: str) -> ParsedReply:
+    """Parse standalone command-call lines anywhere in a reply.
+
+    A call must begin a line (apart from indentation) and occupy the command
+    line, although multiple calls may share one line. This permits commentary
+    before, between, and after commands without executing inline examples.
+    Markdown fences and HTML ``<code>`` blocks are inert; a whole-response
+    ``<code>`` wrapper remains supported by the compatibility unwrapping above.
+    ``ast.literal_eval`` parses string arguments without evaluating Python code.
+    """
+    text = _unwrap_html_code(reply.strip())
+    if not text:
+        return ParsedReply([])
+
+    commands: list[str] = []
+    spans: list[tuple[int, int]] = []
+    position = 0
+    in_fence = False
+    in_html_code = False
+    while position < len(text):
+        line_end = text.find("\n", position)
+        if line_end < 0:
+            line_end = len(text)
+        line = text[position:line_end]
+        stripped = line.strip()
+        lower = stripped.lower()
+
+        if in_fence:
+            if stripped.startswith("```"):
+                in_fence = False
+            position = line_end + (line_end < len(text))
+            continue
+        if in_html_code:
+            if "</code>" in lower:
+                in_html_code = False
+            position = line_end + (line_end < len(text))
+            continue
+        if stripped.startswith("```"):
+            in_fence = True
+            position = line_end + (line_end < len(text))
+            continue
+        if "<code" in lower:
+            in_html_code = "</code>" not in lower
+            position = line_end + (line_end < len(text))
+            continue
+
+        parsed_line = _parse_command_line(text, position)
+        if parsed_line is None:
+            position = line_end + (line_end < len(text))
+            continue
+        line_commands, line_spans, next_position = parsed_line
+        commands.extend(line_commands)
+        spans.extend(line_spans)
+        position = next_position
+
+    if not commands:
+        return ParsedReply([], text)
+
+    masked = list(text)
+    for start, end in spans:
+        for index in range(start, end):
+            if masked[index] != "\n":
+                masked[index] = " "
+    commentary = "".join(masked).strip()
+    return ParsedReply(commands, commentary)
 
 
 # Shell operators that separate one command from the next inside a chain.

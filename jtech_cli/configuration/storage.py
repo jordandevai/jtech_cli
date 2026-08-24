@@ -17,15 +17,17 @@ from jtech_cli.configuration.paths import CONFIG_PATH
 from jtech_cli.configuration.settings import (
     DEFAULT_CMD_MODE,
     DEFAULT_DEBUG_LEVEL,
+    DEFAULT_PROMPT_SOURCE,
     DEFAULT_REASONING,
     DEFAULT_TEMPERATURE,
     DEFAULT_THEME,
     SETTING_KEYS,
     VALID_DEBUG_LEVELS,
+    VALID_PROMPT_SOURCES,
     VALID_REASONING_MODES,
     Settings,
 )
-from jtech_cli.prompts import DEFAULT_SYSTEM_PROMPT
+from jtech_cli.prompts import migrate_legacy_prompt
 from jtech_cli.theme import VALID_THEMES
 
 
@@ -62,15 +64,50 @@ def build_settings(
     temperature = overrides.get("temperature", DEFAULT_TEMPERATURE)
     if isinstance(temperature, bool) or not isinstance(temperature, (int, float)):
         temperature = DEFAULT_TEMPERATURE
+    prompt_text = overrides.get("system_prompt", "")
+    if not isinstance(prompt_text, str):
+        raise TypeError("system_prompt must be a string")
+    configured_source = overrides.get("prompt_source")
+    if configured_source is None:
+        # Legacy configs stored prompt text without source metadata. Preserve
+        # the useful instructions, but remove the retired command transport.
+        prompt_text, migrated = migrate_legacy_prompt(prompt_text)
+        prompt_source = "inline" if prompt_text else DEFAULT_PROMPT_SOURCE
+    elif configured_source not in VALID_PROMPT_SOURCES:
+        raise ValueError(
+            f"prompt_source must be one of: {', '.join(VALID_PROMPT_SOURCES)}"
+        )
+    else:
+        prompt_source = configured_source
+    prompt_file = overrides.get("prompt_file", "")
+    if not isinstance(prompt_file, str):
+        raise TypeError("prompt_file must be a string")
+    if prompt_source == "default" and prompt_text:
+        raise ValueError("system_prompt must be empty when prompt_source is default")
+    if prompt_source == "file" and not prompt_file:
+        raise ValueError("prompt_file is required when prompt_source is file")
+    if prompt_source == "inline" and not prompt_text:
+        raise ValueError("system_prompt is required when prompt_source is inline")
+
     settings = Settings(
         base_url=overrides.get("base_url", ""),
         model=overrides.get("model", ""),
         temperature=float(temperature),
-        system_prompt=overrides.get("system_prompt", ""),
+        prompt_source=prompt_source,
+        prompt_file=prompt_file,
         theme=theme,
         reasoning=reasoning,
         debug_level=debug_level,
     )
+    if prompt_source == "file":
+        settings.set_prompt_file(prompt_file)
+    elif prompt_source == "inline":
+        settings.set_prompt_inline(prompt_text)
+    if configured_source is None and migrated:
+        settings.prompt_notice = (
+            "Migrated a legacy prompt: its retired fenced-command section was "
+            "removed; the current runtime command protocol is active."
+        )
     if base_url:
         settings.base_url = base_url
     if model:
@@ -78,10 +115,12 @@ def build_settings(
     return settings
 
 
-def apply_default_prompt(settings: Settings) -> Settings:
-    """Fill an empty startup prompt without persisting it."""
-    if not settings.system_prompt:
-        settings.system_prompt = DEFAULT_SYSTEM_PROMPT
+def resolve_prompt_source(settings: Settings) -> Settings:
+    """Resolve the selected prompt source before the first model request."""
+    if settings.prompt_source == "file" and not settings.system_prompt:
+        settings.reload_prompt()
+    elif settings.prompt_source == "default":
+        settings.reset_prompt()
     return settings
 
 
@@ -115,6 +154,10 @@ def load_cmd_policy(path: Path = CONFIG_PATH) -> CmdPolicy:
 
 def save_settings(settings: Settings, path: Path = CONFIG_PATH, *, cmd: CmdPolicy) -> None:
     """Persist [server] settings and the complete [cmd] policy."""
+    if settings.prompt_source not in VALID_PROMPT_SOURCES:
+        raise ValueError(
+            f"prompt_source must be one of: {', '.join(VALID_PROMPT_SOURCES)}"
+        )
     lines = ["[server]"]
     lines.append(f"base_url = {_toml_str(settings.base_url)}")
     if settings.model:
@@ -126,8 +169,16 @@ def save_settings(settings: Settings, path: Path = CONFIG_PATH, *, cmd: CmdPolic
         lines.append(f"reasoning = {_toml_str(settings.reasoning)}")
     if settings.debug_level and settings.debug_level != DEFAULT_DEBUG_LEVEL:
         lines.append(f"debug_level = {_toml_str(settings.debug_level)}")
-    if settings.system_prompt:
-        lines.append(f"system_prompt = {_toml_str(settings.system_prompt)}")
+    if settings.prompt_source != DEFAULT_PROMPT_SOURCE:
+        lines.append(f"prompt_source = {_toml_str(settings.prompt_source)}")
+        if settings.prompt_source == "file":
+            if not settings.prompt_file:
+                raise ValueError("prompt_file is required when prompt_source is file")
+            lines.append(f"prompt_file = {_toml_str(settings.prompt_file)}")
+        elif settings.prompt_source == "inline":
+            if not settings.system_prompt:
+                raise ValueError("system_prompt is required when prompt_source is inline")
+            lines.append(f"system_prompt = {_toml_str(settings.system_prompt)}")
     lines.extend(
         [
             "",

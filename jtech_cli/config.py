@@ -12,11 +12,11 @@ from jtech_cli.configuration import (
     VALID_REASONING_MODES,
     Settings,
     SettingSpec,
-    apply_default_prompt,
     build_settings,
     home_dir,
     load_cmd_policy,
     load_config_overrides,
+    resolve_prompt_source,
     save_settings,
 )
 
@@ -32,10 +32,10 @@ __all__ = [
     "VALID_REASONING_MODES",
     "SettingSpec",
     "Settings",
-    "apply_default_prompt",
     "build_settings",
     "home_dir",
     "load_cmd_policy",
     "load_config_overrides",
+    "resolve_prompt_source",
     "save_settings",
 ]

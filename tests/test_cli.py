@@ -26,7 +26,8 @@ def test_make_app_applies_default_prompt(tmp_path, monkeypatch):
         "jtech_cli.cli.resolve_settings", lambda args, console: Settings(base_url="http://x/v1")
     )
     app = make_app(parse_args(["--no-persist", "--no-discover"]))
-    assert app.settings.system_prompt == DEFAULT_SYSTEM_PROMPT
+    assert app.settings.prompt_source == "default"
+    assert app.settings.effective_system_prompt() == DEFAULT_SYSTEM_PROMPT
 
 
 def test_make_app_keeps_configured_prompt(tmp_path, monkeypatch):
@@ -37,6 +38,25 @@ def test_make_app_keeps_configured_prompt(tmp_path, monkeypatch):
     )
     app = make_app(parse_args(["--no-persist", "--no-discover"]))
     assert app.settings.system_prompt == "custom prompt"
+    assert "custom prompt" in app.settings.effective_system_prompt()
+    assert app.settings.effective_system_prompt().endswith(DEFAULT_SYSTEM_PROMPT)
+
+
+def test_make_app_loads_instruction_file_as_a_source(tmp_path, monkeypatch):
+    prompt = tmp_path / "instructions.md"
+    prompt.write_text("file instructions")
+    def resolve(args, console):
+        settings = Settings(base_url="http://x/v1")
+        settings.set_prompt_file(args.instructions)
+        return settings
+
+    monkeypatch.setattr("jtech_cli.cli.resolve_settings", resolve)
+    app = make_app(
+        parse_args(["--instructions", str(prompt), "--no-persist", "--no-discover"])
+    )
+    assert app.settings.prompt_source == "file"
+    assert app.settings.prompt_file == str(prompt)
+    assert app.settings.system_prompt == "file instructions"
 
 
 def test_make_app_wires_cmd_policy(tmp_path, monkeypatch):

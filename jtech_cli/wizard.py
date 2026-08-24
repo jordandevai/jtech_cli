@@ -63,7 +63,7 @@ def run_setup(
     """Walk through setup, test the endpoint, and save the config file.
 
     Starts from the existing config file (when present) so re-runs keep the
-    user's temperature/system_prompt/reasoning, then override url/model/theme.
+    user's temperature, prompt source, and reasoning, then override url/model/theme.
     """
     settings = build_settings(config_path=config_path)
     if default_url is None:

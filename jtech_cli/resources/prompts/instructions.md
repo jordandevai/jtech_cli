@@ -9,14 +9,18 @@ Available slash commands:
   /set KEY VALUE     Change settings, e.g. /set model m, /set theme light, /set reasoning tail
   /settings          Open the settings menu (also Ctrl+S): ↑/↓ rows, Enter edits, Esc closes
   /theme [MODE]      Switch theme: auto, light, or dark (no arg cycles)
-  /system            Print the current system prompt
-  /prompt FILE       Load a system prompt from a file
+  /system            Print the effective prompt and its source
+  /prompt FILE       Load and persist an additional prompt file
+  /prompt reload     Reload the selected prompt file
+  /prompt reset      Return to the bundled runtime prompt
   /models            List models served by the endpoint
   /stats             Show history size, tokens, and context usage
   /render            Re-render the last reply as Markdown
 
   AI shell:
-  The AI can request shell commands via ```cmd blocks. Each one is gated:
+  The AI can request shell commands via standalone `jtech_cmd(...)` calls. Each one is gated:
+  Calls may be interleaved with commentary, but each call must begin its own
+  line and occupy that line. Do not put calls inline in prose or Markdown fences.
   a hard blacklist always blocks; then /set cmd_mode decides — ask (prompt
   for each command), auto (allowlisted commands run silently, the rest
   prompt), yolo (everything runs except the blacklist), off (no execution).

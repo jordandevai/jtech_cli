@@ -12,7 +12,6 @@ from jtech_cli.server_info import ServerInfo
 from jtech_cli.session import Session
 from jtech_cli.tui import (
     MAX_BLOCKS_PER_REPLY,
-    MAX_TOOL_ROUNDS,
     ChatApp,
     CommandPrompt,
     SettingsScreen,
@@ -196,7 +195,7 @@ async def test_settings_screen_opens_and_lists_rows(tmp_path):
         rows = settings_rows_text(app)
         assert "Model" in rows
         assert "Base URL" in rows
-        assert "System prompt" in rows
+        assert "Additional instructions" in rows
         assert "qwen3" in rows  # current model value shown on its row
 
         await pilot.press("escape")
@@ -326,6 +325,7 @@ async def test_settings_system_prompt_edits_multiline(tmp_path):
         await pilot.press("enter")
         await pilot.pause()
         assert app.settings.system_prompt == "line one\nline two"
+        assert app.settings.prompt_source == "inline"
         assert not app.screen.query_one("#settings-editor", Vertical).children
 
 
@@ -1061,10 +1061,21 @@ async def test_up_with_suggestions_open_prefers_suggestions(tmp_path, monkeypatc
         await pilot.pause()
         assert inp.value == "/"  # suggestion cycled, input untouched
         assert len(app._queue) == 1  # queue untouched
-
         gate.set()
         await _wait_until(app, pilot, lambda: not app._generating)
         assert not any("Queued" in b for b in bubbles(app))  # line cleared on drain
+
+
+async def test_slash_menu_shows_prompt_commands(tmp_path):
+    """The initial slash menu exposes both prompt inspection commands."""
+    app = make_app(tmp_path)
+    async with app.run_test() as pilot:
+        inp = app.query_one("#input", Input)
+        inp.value = "/"
+        await pilot.pause()
+
+        assert "/system" in str(suggestions_box(app).render())
+        assert "/prompt" in str(suggestions_box(app).render())
 
 
 async def test_queue_drains_in_order(tmp_path, monkeypatch):
@@ -1114,7 +1125,7 @@ def make_app_with_cmd(tmp_path, cmd: CmdPolicy, settings=None, session=None):
 
 
 def cmd_stream(first: str, second: str):
-    """A stream fake: first call yields a reply with a cmd block, next yields the final."""
+    """A stream fake: first call yields commands, next yields the final."""
     calls = {"n": 0}
 
     def fake(settings, messages):
@@ -1124,10 +1135,22 @@ def cmd_stream(first: str, second: str):
     return fake, calls
 
 
+def command_call(command: str) -> str:
+    """Format a test command using the production command-only protocol."""
+    return f"jtech_cmd({command!r})"
+
+
 async def test_cmd_auto_allowlist_runs_silently(tmp_path, monkeypatch):
     """auto mode: an allowlisted command runs without a prompt; output feeds back."""
     app = make_app_with_cmd(tmp_path, CmdPolicy(mode="auto", allow=["echo:*"]))
-    fake, calls = cmd_stream("here\n```cmd\necho hello-out\n```", "done")
+    calls = {"n": 0}
+    requests = []
+
+    def fake(settings, messages):
+        calls["n"] += 1
+        requests.append(messages)
+        yield command_call("echo hello-out") if calls["n"] == 1 else "done"
+
     monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
     async with app.run_test() as pilot:
         inp = app.query_one("#input", Input)
@@ -1142,12 +1165,16 @@ async def test_cmd_auto_allowlist_runs_silently(tmp_path, monkeypatch):
         assert "system" in roles
         sys_msgs = [m["content"] for m in app.session.messages if m["role"] == "system"]
         assert any("hello-out" in m and "exit 0" in m for m in sys_msgs)
+        assert requests[1][-1] == {
+            "role": "user",
+            "content": "[JTECH runtime event]\n$ echo hello-out\nexit 0\nhello-out",
+        }
 
 
 async def test_cmd_ask_prompts_then_allow_runs(tmp_path, monkeypatch):
     """ask mode: a non-allowlisted command prompts; 'y' allows and runs it."""
     app = make_app_with_cmd(tmp_path, CmdPolicy(mode="ask", allow=[]))
-    fake, calls = cmd_stream("```cmd\necho prompt-out\n```", "done")
+    fake, calls = cmd_stream(command_call("echo prompt-out"), "done")
     monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
     async with app.run_test() as pilot:
         inp = app.query_one("#input", Input)
@@ -1165,7 +1192,7 @@ async def test_cmd_ask_prompts_then_allow_runs(tmp_path, monkeypatch):
 async def test_cmd_ask_decline_feeds_back(tmp_path, monkeypatch):
     """ask mode: 'n' declines; the command does not run but the model still reacts."""
     app = make_app_with_cmd(tmp_path, CmdPolicy(mode="ask", allow=[]))
-    fake, calls = cmd_stream("```cmd\necho never-runs\n```", "done")
+    fake, calls = cmd_stream(command_call("echo never-runs"), "done")
     monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
     async with app.run_test() as pilot:
         inp = app.query_one("#input", Input)
@@ -1186,7 +1213,7 @@ async def test_cmd_ask_decline_feeds_back(tmp_path, monkeypatch):
 async def test_cmd_blacklist_blocked_even_in_yolo(tmp_path, monkeypatch):
     """The blacklist is absolute: even yolo blocks sudo, and no prompt is shown."""
     app = make_app_with_cmd(tmp_path, CmdPolicy(mode="yolo"))
-    fake, calls = cmd_stream("```cmd\nsudo ls\n```", "done")
+    fake, calls = cmd_stream(command_call("sudo ls"), "done")
     monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
     async with app.run_test() as pilot:
         inp = app.query_one("#input", Input)
@@ -1203,7 +1230,7 @@ async def test_cmd_blacklist_blocked_even_in_yolo(tmp_path, monkeypatch):
 async def test_cmd_off_mode_disables_execution(tmp_path, monkeypatch):
     """off mode: requested commands are not run; a disabled note is fed back."""
     app = make_app_with_cmd(tmp_path, CmdPolicy(mode="off"))
-    fake, calls = cmd_stream("```cmd\necho should-not-run\n```", "done")
+    fake, calls = cmd_stream(command_call("echo should-not-run"), "done")
     monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
     async with app.run_test() as pilot:
         inp = app.query_one("#input", Input)
@@ -1219,7 +1246,7 @@ async def test_cmd_off_mode_disables_execution(tmp_path, monkeypatch):
 async def test_cmd_always_allow_saves_rule(tmp_path, monkeypatch):
     """'a' in the prompt persists a prefix rule to config and runs the command."""
     app = make_app_with_cmd(tmp_path, CmdPolicy(mode="ask", allow=[]))
-    fake, calls = cmd_stream("```cmd\ngit status\n```", "done")
+    fake, calls = cmd_stream(command_call("git status"), "done")
     monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
     async with app.run_test() as pilot:
         inp = app.query_one("#input", Input)
@@ -1247,7 +1274,7 @@ async def test_blocks_over_cap_are_reported_to_the_model(tmp_path, monkeypatch):
     def fake(settings, messages):
         calls["n"] += 1
         if calls["n"] == 1:
-            yield "\n".join(f"```cmd\necho blk-{i}\n```" for i in range(over))
+            yield "\n".join(command_call(f"echo blk-{i}") for i in range(over))
         else:
             yield "stopped"
 
@@ -1260,7 +1287,7 @@ async def test_blocks_over_cap_are_reported_to_the_model(tmp_path, monkeypatch):
         await _wait_until(app, pilot, lambda: not app._tool_rounds_active, tries=100)
         await pilot.pause()
 
-        assert any("2 extra command block(s) ignored" in b for b in bubbles(app))
+        assert any("2 extra command call(s) ignored" in b for b in bubbles(app))
 
     fed = "\n".join(m["content"] for m in app.session.messages if m["role"] == "system")
     assert "were ignored and produced no output" in fed
@@ -1268,108 +1295,276 @@ async def test_blocks_over_cap_are_reported_to_the_model(tmp_path, monkeypatch):
     assert f"blk-{MAX_BLOCKS_PER_REPLY}" not in fed  # first dropped one did not
 
 
-async def test_round_limit_is_reported_to_user_and_model(tmp_path, monkeypatch):
-    """Exhausting the round budget ends the turn loudly, not silently."""
+async def test_different_command_rounds_are_not_limited(tmp_path, monkeypatch):
+    """Distinct command results can continue without an arbitrary round cap."""
     app = make_app_with_cmd(tmp_path, CmdPolicy(mode="auto", allow=["echo:*"]))
     calls = {"n": 0}
 
     def fake(settings, messages):
         calls["n"] += 1
-        yield f"```cmd\necho round-{calls['n']}\n```"  # never stops asking
+        if calls["n"] <= 6:
+            yield command_call(f"echo round-{calls['n']}")
+        else:
+            yield "finished"
 
     monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
     async with app.run_test() as pilot:
         inp = app.query_one("#input", Input)
         inp.value = "go"
         await pilot.press("enter")
-        await _wait_until(
-            app, pilot, lambda: calls["n"] >= MAX_TOOL_ROUNDS + 1, tries=200
-        )
+        await _wait_until(app, pilot, lambda: calls["n"] >= 7, tries=200)
         await _wait_until(app, pilot, lambda: not app._tool_rounds_active, tries=100)
-        for _ in range(10):  # nothing further may stream once the budget is gone
+        for _ in range(10):
             await pilot.pause()
 
-        assert calls["n"] == MAX_TOOL_ROUNDS + 1
-        assert any("Command round limit reached" in b for b in bubbles(app))
-        # the final reply's block never ran, and the notice says so
-        assert any("1 command block(s) were not run" in b for b in bubbles(app))
+        assert calls["n"] == 7
+        assert any("finished" in b for b in bubbles(app))
+        assert not any("round limit" in b.lower() for b in bubbles(app))
 
     fed = [m for m in app.session.messages if m["role"] == "system"]
-    assert len(fed) == MAX_TOOL_ROUNDS + 1  # one result per round, plus the notice
-    assert "command round limit for this turn has been reached" in fed[-1]["content"]
-    assert f"round-{MAX_TOOL_ROUNDS + 1}" not in "\n".join(m["content"] for m in fed)
+    assert len(fed) == 6  # one result for each distinct command round
+    assert "round-6" in "\n".join(m["content"] for m in fed)
 
 
-async def test_nudge_fires_after_tool_stop(tmp_path, monkeypatch):
-    """A model that stops acting after a tool call is nudged once to continue."""
+async def test_repeated_command_results_stop_a_no_progress_loop(tmp_path, monkeypatch):
+    """Identical command results stop the loop without a fixed round budget."""
+    app = make_app_with_cmd(tmp_path, CmdPolicy(mode="auto", allow=["echo:*"]))
+    calls = {"n": 0}
+
+    def fake(settings, messages):
+        calls["n"] += 1
+        yield command_call("echo unchanged")
+
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    async with app.run_test() as pilot:
+        inp = app.query_one("#input", Input)
+        inp.value = "go"
+        await pilot.press("enter")
+        await _wait_until(app, pilot, lambda: calls["n"] >= 2, tries=100)
+        await _wait_until(app, pilot, lambda: not app._tool_rounds_active, tries=100)
+
+        assert calls["n"] == 2
+        assert any("no-progress loop" in b for b in bubbles(app))
+
+    fed = [m["content"] for m in app.session.messages if m["role"] == "system"]
+    assert "same command round produced the same tool results" in fed[-1]
+
+
+async def test_empty_reply_after_tool_is_nudged_once(tmp_path, monkeypatch):
+    """An empty model reply after a tool call gets one bounded recovery nudge."""
     app = make_app_with_cmd(tmp_path, CmdPolicy(mode="auto", allow=["echo:*"]))
     calls = {"n": 0}
 
     def fake(settings, messages):
         calls["n"] += 1
         if calls["n"] == 1:
-            yield "```cmd\necho nudge-out\n```"
+            yield command_call("echo tool-out")
         else:
-            yield "stopped"
+            yield ""
 
     monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
     async with app.run_test() as pilot:
         inp = app.query_one("#input", Input)
         inp.value = "go"
         await pilot.press("enter")
-        # 1 initial + 1 post-tool + 1 nudge. The reply to the nudge follows a
-        # nudge, not a command, so it ends the turn instead of nudging again.
+        # 1 initial + 1 post-tool reply + 1 bounded recovery nudge.
         await _wait_until(app, pilot, lambda: calls["n"] >= 3, tries=100)
-        # the turn must be fully quiescent: the nudge is stripped and the
-        # loop exits before teardown (a live stream races _render_status).
         await _wait_until(app, pilot, lambda: not app._tool_rounds_active, tries=100)
-        for _ in range(10):  # a would-be second nudge would fire in this window
+        for _ in range(10):  # no second nudge may be scheduled
             await pilot.pause()
 
         assert calls["n"] == 3
         roles = [m["role"] for m in app.session.messages]
-        assert roles == [
-            "user", "assistant", "system", "assistant", "assistant",
+        assert roles == ["user", "assistant", "system"]
+
+
+async def test_nudge_is_shown_in_system_debug_mode(tmp_path, monkeypatch):
+    """Debug system mode exposes the ephemeral nudge in the live chat."""
+    settings = Settings(
+        base_url="http://host:9000/v1", model="qwen3", debug_level="system"
+    )
+    app = make_app_with_cmd(
+        tmp_path, CmdPolicy(mode="auto", allow=["echo:*"]), settings=settings
+    )
+    calls = {"n": 0}
+
+    def fake(settings, messages):
+        calls["n"] += 1
+        yield command_call("echo debug-nudge") if calls["n"] == 1 else ""
+
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    async with app.run_test() as pilot:
+        inp = app.query_one("#input", Input)
+        inp.value = "go"
+        await pilot.press("enter")
+        await _wait_until(app, pilot, lambda: calls["n"] >= 3, tries=100)
+        await _wait_until(app, pilot, lambda: not app._tool_rounds_active, tries=100)
+
+        assert any("Continue your task" in bubble for bubble in bubbles(app))
+        nudges = [
+            message
+            for message in app.session.messages
+            if "Continue your task" in message["content"]
         ]
-        assert not any(
-            "Continue your task" in m["content"] for m in app.session.messages
-        )
+        assert len(nudges) == 1
+        assert nudges[0]["_include_in_context"] is False
 
 
-async def test_nudge_budget_is_per_round_not_per_turn(tmp_path, monkeypatch):
-    """Every round that runs a command earns its own nudge, however many rounds."""
+async def test_nudge_can_continue_with_an_explicit_command(tmp_path, monkeypatch):
+    """A nudge may recover a command-only stop, but prose still ends the turn."""
     app = make_app_with_cmd(tmp_path, CmdPolicy(mode="auto", allow=["echo:*"]))
     calls = {"n": 0}
 
     def fake(settings, messages):
         calls["n"] += 1
-        # act, stall, act, stall, act, stall — three command rounds, each
-        # followed by a stop that has to be nudged (a flat two-per-turn cap
-        # would starve the third and stop the turn a stream early).
-        if calls["n"] in (1, 3, 5):
-            yield f"```cmd\necho round-{calls['n']}\n```"
-        else:
-            yield "stopped"
+        replies = {
+            1: command_call("echo first"),
+            2: "",
+            3: command_call("echo second"),
+            4: "finished",
+        }
+        yield replies[calls["n"]]
 
     monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
     async with app.run_test() as pilot:
         inp = app.query_one("#input", Input)
         inp.value = "go"
         await pilot.press("enter")
-        await _wait_until(app, pilot, lambda: calls["n"] >= 7, tries=150)
+        await _wait_until(app, pilot, lambda: calls["n"] >= 4, tries=100)
         await _wait_until(app, pilot, lambda: not app._tool_rounds_active, tries=100)
-        await pilot.pause()
 
-        assert calls["n"] == 7  # 3 rounds x (act + stall) + the final stop
-        results = [m for m in app.session.messages if m["role"] == "system"]
-        assert len(results) == 3
-        assert not any(
-            "Continue your task" in m["content"] for m in app.session.messages
-        )
+        assert calls["n"] == 4
+        system_messages = [
+            m["content"] for m in app.session.messages if m["role"] == "system"
+        ]
+        assert any("first" in message for message in system_messages)
+        assert any("second" in message for message in system_messages)
 
 
-async def test_clear_during_nudge_does_not_crash(tmp_path, monkeypatch):
-    """/clear can empty history mid-nudge: stripping the nudge must not raise."""
+async def test_final_answer_after_tool_ends_turn_without_repeat(tmp_path, monkeypatch):
+    """A final answer after ``pwd`` ends the turn without rerunning the command."""
+    app = make_app_with_cmd(tmp_path, CmdPolicy(mode="auto", allow=["pwd:*"]))
+    calls = {"n": 0}
+
+    def fake(settings, messages):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            yield command_call("pwd")
+        else:
+            yield "The cwd is /the/project.\n\n```cmd\npwd\n```"
+
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    async with app.run_test() as pilot:
+        inp = app.query_one("#input", Input)
+        inp.value = "whats the cwd?"
+        await pilot.press("enter")
+        await _wait_until(app, pilot, lambda: calls["n"] >= 2, tries=100)
+        await _wait_until(app, pilot, lambda: not app._tool_rounds_active, tries=100)
+        for _ in range(10):
+            await pilot.pause()
+
+        assert calls["n"] == 2
+        assert any("The cwd is /the/project." in b for b in bubbles(app))
+
+    sys_msgs = [m["content"] for m in app.session.messages if m["role"] == "system"]
+    assert len([m for m in sys_msgs if "pwd" in m and "exit 0" in m]) == 1
+
+
+async def test_command_prefix_commentary_is_preserved_and_tool_round_continues(
+    tmp_path, monkeypatch
+):
+    """Prefix commentary is visible, while the command still starts a tool round."""
+    app = make_app_with_cmd(tmp_path, CmdPolicy(mode="auto", allow=["pwd:*"]))
+    calls = {"n": 0}
+
+    def fake(settings, messages):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            yield command_call("pwd") + "\n\nLet me inspect the project structure next."
+        else:
+            yield "The cwd is /the/project."
+
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    async with app.run_test() as pilot:
+        inp = app.query_one("#input", Input)
+        inp.value = "audit this project"
+        await pilot.press("enter")
+        await _wait_until(app, pilot, lambda: calls["n"] >= 2, tries=100)
+        await _wait_until(app, pilot, lambda: not app._tool_rounds_active, tries=100)
+
+        assert calls["n"] == 2
+        assert any("Let me inspect the project structure next." in b for b in bubbles(app))
+        assert any("The cwd is /the/project." in b for b in bubbles(app))
+
+    sys_msgs = [m["content"] for m in app.session.messages if m["role"] == "system"]
+    assert len([m for m in sys_msgs if "pwd" in m and "exit 0" in m]) == 1
+
+
+async def test_interleaved_commentary_commands_start_one_tool_round(
+    tmp_path, monkeypatch
+):
+    """Commentary between standalone calls does not suppress later commands."""
+    app = make_app_with_cmd(tmp_path, CmdPolicy(mode="auto", allow=["echo:*"]))
+    calls = {"n": 0}
+
+    def fake(settings, messages):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            yield (
+                "I'll audit the project.\n\n"
+                f'{command_call("echo first")}\n'
+                "Let me inspect the first result.\n"
+                f'{command_call("echo second")}\n'
+                "Let me finish the audit."
+            )
+        else:
+            yield "The audit is complete."
+
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    async with app.run_test() as pilot:
+        inp = app.query_one("#input", Input)
+        inp.value = "audit this project"
+        await pilot.press("enter")
+        await _wait_until(app, pilot, lambda: calls["n"] >= 2, tries=100)
+        await _wait_until(app, pilot, lambda: not app._tool_rounds_active, tries=100)
+
+        assert calls["n"] == 2
+        assert any("I'll audit the project." in b for b in bubbles(app))
+        assert any("Let me inspect the first result." in b for b in bubbles(app))
+        assert any("The audit is complete." in b for b in bubbles(app))
+
+    sys_msgs = [m["content"] for m in app.session.messages if m["role"] == "system"]
+    assert sum("exit 0" in message for message in sys_msgs) == 2
+
+
+async def test_html_wrapped_command_executes_once(tmp_path, monkeypatch):
+    """A whole-response HTML wrapper does not disable the command protocol."""
+    app = make_app_with_cmd(tmp_path, CmdPolicy(mode="auto", allow=["pwd:*"]))
+    calls = {"n": 0}
+
+    def fake(settings, messages):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            yield '<code>\njtech_cmd("pwd")\n</code>'
+        else:
+            yield "done"
+
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    async with app.run_test() as pilot:
+        inp = app.query_one("#input", Input)
+        inp.value = "whats the cwd?"
+        await pilot.press("enter")
+        await _wait_until(app, pilot, lambda: calls["n"] >= 2, tries=100)
+        await _wait_until(app, pilot, lambda: not app._tool_rounds_active, tries=100)
+
+        assert calls["n"] == 2
+
+    sys_msgs = [m["content"] for m in app.session.messages if m["role"] == "system"]
+    assert len([m for m in sys_msgs if "pwd" in m and "exit 0" in m]) == 1
+
+
+async def test_clear_during_tool_followup_does_not_crash(tmp_path, monkeypatch):
+    """/clear can empty history while the post-command reply is in flight."""
     app = make_app_with_cmd(tmp_path, CmdPolicy(mode="auto", allow=["echo:*"]))
     gate = threading.Event()
     calls = {"n": 0}
@@ -1377,22 +1572,22 @@ async def test_clear_during_nudge_does_not_crash(tmp_path, monkeypatch):
     def fake(settings, messages):
         calls["n"] += 1
         if calls["n"] == 1:
-            yield "```cmd\necho clear-out\n```"
-        elif calls["n"] == 3:
-            gate.wait(5)  # hold the nudge stream open across the /clear
+            yield command_call("echo clear-out")
+        elif calls["n"] == 2:
+            gate.wait(5)  # hold the post-command stream open across the /clear
             yield "after clear"
         else:
-            yield "stopped"
+            yield "unexpected extra request"
 
     monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
     async with app.run_test() as pilot:
         inp = app.query_one("#input", Input)
         inp.value = "go"
         await pilot.press("enter")
-        await _wait_until(app, pilot, lambda: calls["n"] >= 3, tries=100)
+        await _wait_until(app, pilot, lambda: calls["n"] >= 2, tries=100)
 
         # /clear is dispatched straight from the input, bypassing the
-        # tool-rounds queue guard, so it lands while the nudge is in flight.
+        # tool-rounds queue guard, so it lands while the follow-up is in flight.
         inp.value = "/clear"
         await pilot.press("enter")
         await _wait_until(app, pilot, lambda: app.session.messages == [], tries=50)
@@ -1402,14 +1597,11 @@ async def test_clear_during_nudge_does_not_crash(tmp_path, monkeypatch):
         await pilot.pause()
 
         assert app._exception is None
-        assert calls["n"] == 3
-        assert not any(
-            "Continue your task" in m["content"] for m in app.session.messages
-        )
+        assert calls["n"] == 2
 
 
-async def test_no_nudge_on_final_answer(tmp_path, monkeypatch):
-    """A plain final answer (no tool rounds yet) is never nudged."""
+async def test_plain_final_answer_ends_turn(tmp_path, monkeypatch):
+    """A plain final answer (no tool rounds yet) ends the turn."""
     app = make_app(tmp_path)
     calls = {"n": 0}
 
@@ -1423,7 +1615,7 @@ async def test_no_nudge_on_final_answer(tmp_path, monkeypatch):
         inp.value = "hello"
         await pilot.press("enter")
         await _wait_until(app, pilot, lambda: calls["n"] >= 1)
-        # give a would-be (incorrect) nudge stream time to fire
+        # give a would-be extra stream time to fire
         for _ in range(10):
             await pilot.pause()
 
@@ -1434,46 +1626,15 @@ async def test_no_nudge_on_final_answer(tmp_path, monkeypatch):
     ]
 
 
-async def test_nudge_not_persisted_to_disk(tmp_path, monkeypatch):
-    """The ephemeral nudge is stripped from the JSONL file, not just memory."""
-    session = Session(tmp_path / "s.jsonl", persist=True)
-    app = make_app_with_cmd(
-        tmp_path, CmdPolicy(mode="auto", allow=["echo:*"]), session=session
-    )
-    calls = {"n": 0}
-
-    def fake(settings, messages):
-        calls["n"] += 1
-        if calls["n"] == 1:
-            yield "```cmd\necho disk-out\n```"
-        else:
-            yield "stopped"
-
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
-    async with app.run_test() as pilot:
-        inp = app.query_one("#input", Input)
-        inp.value = "go"
-        await pilot.press("enter")
-        await _wait_until(app, pilot, lambda: calls["n"] >= 3, tries=100)
-        # quiescent before reading the file: the final _save (post-nudge-strip)
-        # must have landed
-        await _wait_until(app, pilot, lambda: not app._tool_rounds_active, tries=100)
-        await pilot.pause()
-
-    on_disk = (tmp_path / "s.jsonl").read_text()
-    assert "Continue your task" not in on_disk
-    assert "disk-out" in on_disk  # the real result was persisted
-
-
-async def test_no_nudge_after_declined_command(tmp_path, monkeypatch):
-    """A decline is user input: a stop after it is a response, not a stall."""
+async def test_declined_command_ends_tool_turn(tmp_path, monkeypatch):
+    """A decline is user input: the next model reply ends the tool turn."""
     app = make_app_with_cmd(tmp_path, CmdPolicy(mode="ask", allow=[]))
     calls = {"n": 0}
 
     def fake(settings, messages):
         calls["n"] += 1
         if calls["n"] == 1:
-            yield "```cmd\necho declined-out\n```"
+            yield command_call("echo declined-out")
         else:
             yield "stopped"
 
@@ -1485,7 +1646,7 @@ async def test_no_nudge_after_declined_command(tmp_path, monkeypatch):
         await _wait_until(app, pilot, lambda: isinstance(app.screen, CommandPrompt), tries=50)
         await pilot.press("n")
         await _wait_until(app, pilot, lambda: calls["n"] >= 2)
-        # give a would-be (incorrect) nudge stream time to fire
+        # give a would-be extra stream time to fire
         for _ in range(10):
             await pilot.pause()
 
@@ -1495,18 +1656,17 @@ async def test_no_nudge_after_declined_command(tmp_path, monkeypatch):
     ]
     # the model is told to ask the user, not to silently adapt
     assert any("ask the user" in m["content"] for m in app.session.messages)
-    assert not any("Continue your task" in m["content"] for m in app.session.messages)
 
 
-async def test_no_nudge_after_blocked_command(tmp_path, monkeypatch):
-    """A block is guardrail input: a stop after it is not a stall either."""
+async def test_blocked_command_ends_tool_turn(tmp_path, monkeypatch):
+    """A blocked command is guardrail input; the next reply ends the turn."""
     app = make_app_with_cmd(tmp_path, CmdPolicy(mode="yolo"))
     calls = {"n": 0}
 
     def fake(settings, messages):
         calls["n"] += 1
         if calls["n"] == 1:
-            yield "```cmd\nsudo ls\n```"
+            yield command_call("sudo ls")
         else:
             yield "stopped"
 
@@ -1516,13 +1676,12 @@ async def test_no_nudge_after_blocked_command(tmp_path, monkeypatch):
         inp.value = "go"
         await pilot.press("enter")
         await _wait_until(app, pilot, lambda: calls["n"] >= 2)
-        # give a would-be (incorrect) nudge stream time to fire
+        # give a would-be extra stream time to fire
         for _ in range(10):
             await pilot.pause()
         assert not isinstance(app.screen, CommandPrompt)
 
     assert calls["n"] == 2
-    assert not any("Continue your task" in m["content"] for m in app.session.messages)
 
 
 async def test_cmd_timeout_feeds_partial_output(tmp_path, monkeypatch):
@@ -1533,7 +1692,7 @@ async def test_cmd_timeout_feeds_partial_output(tmp_path, monkeypatch):
     def fake(settings, messages):
         calls["n"] += 1
         if calls["n"] == 1:
-            yield "```cmd\necho got-far; sleep 5\n```"
+            yield command_call("echo got-far; sleep 5")
         else:
             yield "final"
 
@@ -1548,7 +1707,7 @@ async def test_cmd_timeout_feeds_partial_output(tmp_path, monkeypatch):
         assert any("timed out" in m and "got-far" in m for m in sys_msgs)
         assert any("timed out" in b for b in bubbles(app))
 
-        # let the turn (nudges included) finish before teardown: a still-live
+        # let the tool turn finish before teardown: a still-live
         # stream would race _render_status against the unmounting widgets
         await _wait_until(app, pilot, lambda: not app._tool_rounds_active, tries=100)
         await pilot.pause()

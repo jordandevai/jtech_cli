@@ -66,6 +66,50 @@ def test_messages_with_system():
     assert s.messages == [{"role": "user", "content": "hi"}]
 
 
+def test_runtime_event_can_use_model_observation_role_without_changing_display_role():
+    s = Session()
+    s.add(
+        "system",
+        "$ pwd\nexit 0\n/project",
+        model_role="user",
+        model_content="[JTECH runtime event]\n$ pwd\nexit 0\n/project",
+    )
+
+    assert s.messages == [
+        {
+            "role": "system",
+            "content": "$ pwd\nexit 0\n/project",
+            "_model_role": "user",
+            "_model_content": "[JTECH runtime event]\n$ pwd\nexit 0\n/project",
+        }
+    ]
+    assert s.messages_with_system("") == [
+        {
+            "role": "user",
+            "content": "[JTECH runtime event]\n$ pwd\nexit 0\n/project",
+        }
+    ]
+
+
+def test_context_excluded_message_is_persisted_but_not_sent_to_model(tmp_path):
+    path = tmp_path / "session.jsonl"
+    s = Session(path)
+    s.add("system", "Continue your task", include_in_context=False, debug_only=True)
+    s.save()
+
+    loaded = Session(path)
+    loaded.load()
+    assert loaded.messages == [
+        {
+            "role": "system",
+            "content": "Continue your task",
+            "_include_in_context": False,
+            "_debug_only": True,
+        }
+    ]
+    assert loaded.messages_with_system("") == []
+
+
 def test_ephemeral_adds_then_strips():
     s = Session(persist=False)
     s.add("user", "hi")

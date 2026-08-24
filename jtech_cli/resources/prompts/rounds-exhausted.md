@@ -1,1 +1,1 @@
-The command round limit for this turn has been reached, so nothing further will run and any command blocks in your last reply were not executed. Summarise what you did and what is left; the user has to reply before you can run another command.
+The same command round produced the same tool results more than once. This is a no-progress loop. Do not issue that command sequence again; provide a final response based on the results already available.

@@ -14,6 +14,7 @@ from pathlib import Path
 from jtech_cli.configuration.paths import home_dir
 
 DEFAULT_DIR = home_dir()
+MODEL_ROLES = frozenset({"system", "user", "assistant"})
 
 
 def default_history_path() -> Path:
@@ -43,8 +44,39 @@ class Session:
             if isinstance(msg, dict) and "role" in msg and "content" in msg:
                 self.messages.append(msg)
 
-    def add(self, role: str, content: str) -> None:
-        self.messages.append({"role": role, "content": content})
+    def add(
+        self,
+        role: str,
+        content: str,
+        *,
+        include_in_context: bool = True,
+        debug_only: bool = False,
+        model_role: str | None = None,
+        model_content: str | None = None,
+    ) -> None:
+        """Append a message with optional model-facing role/content overrides.
+
+        The stored role/content control CLI presentation and diagnostics. The
+        optional model fields allow runtime events to remain visible as
+        ``system`` messages in the UI while using a model-compatible role and
+        framing in the next request. Context-excluded messages remain in
+        history but are filtered before requests are sent to the model.
+        """
+        if model_role is not None and model_role not in MODEL_ROLES:
+            raise ValueError(f"unsupported model role: {model_role}")
+        if model_role is not None and model_content is None:
+            raise ValueError("model_role requires model_content")
+        if model_content is not None and model_role is None:
+            raise ValueError("model_content requires model_role")
+        msg = {"role": role, "content": content}
+        if not include_in_context:
+            msg["_include_in_context"] = False
+        if debug_only:
+            msg["_debug_only"] = True
+        if model_role is not None:
+            msg["_model_role"] = model_role
+            msg["_model_content"] = model_content
+        self.messages.append(msg)
 
     @contextmanager
     def ephemeral(self, role: str, content: str) -> Iterator[None]:
@@ -93,10 +125,18 @@ class Session:
             self.path.unlink()
 
     def messages_with_system(self, system_prompt: str) -> list[dict]:
-        """Return history prefixed with the system prompt (if any)."""
+        """Return model-visible history prefixed with the system prompt."""
+        history = [
+            {
+                "role": message.get("_model_role", message["role"]),
+                "content": message.get("_model_content", message["content"]),
+            }
+            for message in self.messages
+            if message.get("_include_in_context", True)
+        ]
         if not system_prompt:
-            return list(self.messages)
-        return [{"role": "system", "content": system_prompt}, *self.messages]
+            return history
+        return [{"role": "system", "content": system_prompt}, *history]
 
     def stats(self) -> dict:
         chars = sum(len(m["content"]) for m in self.messages)

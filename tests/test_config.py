@@ -6,13 +6,13 @@ from jtech_cli.cmd_tools import DEFAULT_ALLOW, CmdPolicy
 from jtech_cli.config import (
     DEFAULT_TEMPERATURE,
     Settings,
-    apply_default_prompt,
     build_settings,
     load_cmd_policy,
     load_config_overrides,
+    resolve_prompt_source,
     save_settings,
 )
-from jtech_cli.prompts import DEFAULT_SYSTEM_PROMPT
+from jtech_cli.prompts import DEFAULT_SYSTEM_PROMPT, PromptSourceError
 
 
 def test_defaults():
@@ -21,6 +21,8 @@ def test_defaults():
     assert s.model == ""
     assert s.temperature == 0.7
     assert s.system_prompt == ""
+    assert s.prompt_source == "default"
+    assert s.prompt_file == ""
     assert s.theme == "auto"
     assert s.reasoning == "transient"
     assert s.cmd_mode == "ask"
@@ -100,17 +102,21 @@ def test_build_settings_precedence(tmp_path):
     assert s2.model == "cli-model"
 
 
-def test_apply_default_prompt_when_empty():
+def test_resolve_default_prompt_keeps_runtime_prompt_out_of_saved_settings():
     s = Settings()
-    result = apply_default_prompt(s)
+    result = resolve_prompt_source(s)
     assert result is s  # mutates and returns the same object
-    assert s.system_prompt == DEFAULT_SYSTEM_PROMPT
+    assert s.system_prompt == ""
+    assert s.effective_system_prompt() == DEFAULT_SYSTEM_PROMPT
 
 
-def test_apply_default_prompt_keeps_custom():
+def test_resolve_inline_prompt_keeps_custom_instructions():
     s = Settings(system_prompt="my custom prompt")
-    apply_default_prompt(s)
+    resolve_prompt_source(s)
     assert s.system_prompt == "my custom prompt"
+    assert s.prompt_source == "inline"
+    assert "my custom prompt" in s.effective_system_prompt()
+    assert s.effective_system_prompt().endswith(DEFAULT_SYSTEM_PROMPT)
 
 
 def test_messages_with_system_empty_prompt_sends_none():
@@ -141,7 +147,69 @@ def test_save_settings_roundtrip(tmp_path):
     assert loaded.model == s.model
     assert loaded.temperature == s.temperature
     assert loaded.system_prompt == s.system_prompt
+    assert loaded.prompt_source == "inline"
     assert loaded.theme == "auto"
+
+
+def test_legacy_prompt_without_source_is_preserved_as_inline(tmp_path):
+    path = tmp_path / "config.toml"
+    path.write_text('[server]\nsystem_prompt = "legacy instructions"\n')
+    loaded = build_settings(config_path=path)
+    assert loaded.prompt_source == "inline"
+    assert loaded.system_prompt == "legacy instructions"
+    assert DEFAULT_SYSTEM_PROMPT in loaded.effective_system_prompt()
+
+
+def test_legacy_command_section_is_migrated_without_discarding_other_text(tmp_path):
+    path = tmp_path / "config.toml"
+    path.write_text(
+        '[server]\nsystem_prompt = """custom rules\n\nShell commands:\n'
+        '- emit a fenced code block with language `cmd`\n```cmd\npwd\n```\n"""\n'
+    )
+    loaded = build_settings(config_path=path)
+    assert loaded.prompt_source == "inline"
+    assert loaded.system_prompt == "custom rules"
+    assert loaded.prompt_notice.startswith("Migrated a legacy prompt")
+    assert "```cmd" not in loaded.effective_system_prompt()
+    assert DEFAULT_SYSTEM_PROMPT in loaded.effective_system_prompt()
+
+
+def test_custom_prompt_cannot_replace_runtime_contract():
+    settings = Settings(system_prompt="legacy custom instructions")
+    effective = settings.effective_system_prompt()
+    assert effective.startswith("legacy custom instructions")
+    assert effective.endswith(DEFAULT_SYSTEM_PROMPT)
+
+
+def test_prompt_file_source_reloads_from_path(tmp_path):
+    config = tmp_path / "config.toml"
+    prompt = tmp_path / "instructions.md"
+    prompt.write_text("first version")
+    settings = Settings()
+    settings.set_prompt_file(prompt)
+    save_settings(settings, config, cmd=CmdPolicy())
+
+    prompt.write_text("second version")
+    loaded = build_settings(config_path=config)
+    assert loaded.prompt_source == "file"
+    assert loaded.prompt_file == str(prompt)
+    assert loaded.system_prompt == "second version"
+
+
+def test_prompt_file_selection_surfaces_missing_file(tmp_path):
+    settings = Settings()
+    with pytest.raises(PromptSourceError, match="could not be read"):
+        settings.set_prompt_file(tmp_path / "missing.md")
+
+
+def test_reset_prompt_returns_to_bundled_runtime(tmp_path):
+    settings = Settings(system_prompt="custom")
+    settings.reset_prompt()
+    save_settings(settings, tmp_path / "config.toml", cmd=CmdPolicy())
+    loaded = build_settings(config_path=tmp_path / "config.toml")
+    assert loaded.prompt_source == "default"
+    assert loaded.system_prompt == ""
+    assert loaded.effective_system_prompt() == DEFAULT_SYSTEM_PROMPT
 
 
 def test_save_settings_theme_roundtrip(tmp_path):

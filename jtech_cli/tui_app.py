@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import subprocess
 import threading
 import time
 from collections.abc import Callable, Iterator
+from dataclasses import dataclass
 from pathlib import Path
 from typing import ClassVar
 
@@ -21,8 +23,8 @@ from jtech_cli.cmd_tools import (
     ExecResult,
     allow_rule_for,
     decide,
-    extract_cmd_blocks,
     format_result,
+    parse_jtech_reply,
     timeout_partial_output,
     truncate_output,
 )
@@ -33,7 +35,7 @@ from jtech_cli.prompts import (
     BLOCKS_DROPPED_PROMPT,
     COMMAND_DECLINED_PROMPT,
     NUDGE_PROMPT,
-    ROUNDS_EXHAUSTED_PROMPT,
+    REPEATED_COMMAND_PROMPT,
 )
 from jtech_cli.server_info import ServerInfo, fetch_server_info
 from jtech_cli.session import Session
@@ -52,11 +54,18 @@ from jtech_cli.tui_widgets import (
 CONNECTION_ERROR = "Connection failed — check base_url in /settings"
 SPINNER_FRAMES = "-\\|/"
 MAX_BLOCKS_PER_REPLY = 5
-MAX_TOOL_ROUNDS = 5
 
 StreamReply = Callable[[Settings, list[dict]], Iterator[StreamItem]]
 FetchServerInfo = Callable[[Settings], ServerInfo]
 FetchTokenCount = Callable[[Settings, str], int | None]
+
+
+@dataclass(frozen=True)
+class CommandBatch:
+    """Execution count and outcome signature for one model command response."""
+
+    executed: int
+    signature: tuple[tuple[str, str], ...]
 
 
 class ChatApp(App):
@@ -151,11 +160,15 @@ class ChatApp(App):
         self.register_theme(JTECH_LIGHT)
         self.theme = textual_theme_name(self.settings.theme)
         for msg in self.session.messages:
+            if msg.get("_debug_only") and self.settings.debug_level != "system":
+                continue
             self._append(msg["role"], msg["content"])
         if not self.settings.base_url:
             self.push_message(
                 "system", "No server configured — run /settings to set base_url and model."
             )
+        if self.settings.prompt_notice:
+            self.push_message("system", self.settings.prompt_notice)
         self.query_one("#suggestions", Static).display = False
         self._render_status()
         self._focus_input()
@@ -216,7 +229,8 @@ class ChatApp(App):
 
     async def _init_token_count(self) -> None:
         """Count session tokens on startup so the footer is accurate."""
-        text = " ".join(message["content"] for message in self.session.messages)
+        history = self.session.messages_with_system("")
+        text = " ".join(message["content"] for message in history)
         if not text:
             return
         count = await asyncio.to_thread(self._fetch_token_count_fn, self.settings, text)
@@ -232,7 +246,7 @@ class ChatApp(App):
         if not value.startswith("/") or " " in value:
             self._hide_suggestions()
             return
-        matches = self.commands.completions(value)[:10]
+        matches = self.commands.completions(value)
         if not matches:
             self._hide_suggestions()
             return
@@ -524,7 +538,9 @@ class ChatApp(App):
         def consume() -> None:
             nonlocal error, got_token, timings
             try:
-                messages = self.session.messages_with_system(self.settings.system_prompt)
+                messages = self.session.messages_with_system(
+                    self.settings.effective_system_prompt()
+                )
                 for item in self._stream_reply_fn(self.settings, messages):
                     if isinstance(item, tuple):
                         kind, payload = item
@@ -585,27 +601,36 @@ class ChatApp(App):
             self._render_status()
 
     async def _tool_rounds(self, reply: str) -> None:
-        """Process command blocks and re-stream within bounded tool rounds."""
+        """Process standalone command calls until the model stops or repeats a result.
+
+        The model may add commentary after a command prefix. A prose-only reply
+        is terminal. An empty reply after a command is the one explicit recovery
+        case: nudge once, then require another command call or finish the turn.
+        Repeating a command batch with identical outcomes is a no-progress loop.
+        """
         self._tool_rounds_active = True
         try:
-            rounds = 0
-            executed = 0
-            while rounds < MAX_TOOL_ROUNDS:
-                blocks = extract_cmd_blocks(reply)
-                if not blocks:
-                    if not executed:
-                        return
-                    executed = 0
-                    reply = await self._nudge()
-                else:
-                    if len(blocks) > MAX_BLOCKS_PER_REPLY:
-                        self._report_blocks_dropped(len(blocks))
-                    executed = await self._process_blocks(blocks[:MAX_BLOCKS_PER_REPLY])
-                    rounds += 1
-                    reply = await self._stream_once()
+            seen_batches: set[tuple[tuple[str, str], ...]] = set()
+            while True:
+                commands = parse_jtech_reply(reply).commands
+                if not commands:
+                    return
+                if len(commands) > MAX_BLOCKS_PER_REPLY:
+                    self._report_blocks_dropped(len(commands))
+                batch = await self._process_commands(
+                    commands[:MAX_BLOCKS_PER_REPLY]
+                )
+                if batch.signature in seen_batches:
+                    self._report_no_progress()
+                    return
+                seen_batches.add(batch.signature)
+                reply = await self._stream_once()
                 if reply is None:
                     return
-            self._report_rounds_exhausted(len(extract_cmd_blocks(reply)))
+                if batch.executed and not reply.strip():
+                    reply = await self._nudge()
+                    if reply is None:
+                        return
         finally:
             self._tool_rounds_active = False
 
@@ -613,52 +638,80 @@ class ChatApp(App):
         dropped = total - MAX_BLOCKS_PER_REPLY
         self.push_message(
             "system",
-            f"{dropped} extra command block(s) ignored "
+            f"{dropped} extra command call(s) ignored "
             f"(max {MAX_BLOCKS_PER_REPLY} per reply).",
         )
         self._add_system(
             BLOCKS_DROPPED_PROMPT.format(kept=MAX_BLOCKS_PER_REPLY, dropped=dropped)
         )
 
-    def _report_rounds_exhausted(self, dropped: int) -> None:
-        detail = f" {dropped} command block(s) were not run." if dropped else ""
+    def _report_no_progress(self) -> None:
         self.push_message(
             "system",
-            f"Command round limit reached "
-            f"(max {MAX_TOOL_ROUNDS} per turn).{detail}",
+            "Repeated command round detected with identical tool results; "
+            "stopping to prevent a no-progress loop.",
         )
-        self._add_system(ROUNDS_EXHAUSTED_PROMPT)
+        self._add_system(REPEATED_COMMAND_PROMPT)
 
     async def _nudge(self) -> str | None:
+        """Request one continuation after a command round ended empty."""
+        if self.settings.debug_level == "system":
+            # Keep an auditable event without feeding it into future prompts.
+            self.session.add(
+                "system",
+                NUDGE_PROMPT,
+                include_in_context=False,
+                debug_only=True,
+            )
+            self._save()
+            self.push_message("system", NUDGE_PROMPT)
         try:
             with self.session.ephemeral("system", NUDGE_PROMPT):
                 return await self._stream_once()
         finally:
             self._save()
 
-    async def _process_blocks(self, blocks: list[str]) -> int:
+    async def _process_commands(self, commands: list[str]) -> CommandBatch:
         executed = 0
-        for block in blocks:
-            if not block.strip():
-                self._note_command(block, "empty command — not run")
+        outcomes: list[tuple[str, str]] = []
+        for command in commands:
+            if not command.strip():
+                note = "empty command — not run"
+                self._note_command(command, note)
+                outcomes.append((command, f"note:{note}"))
                 continue
-            decision = decide(block, self.cmd, self._project_root)
+            decision = decide(command, self.cmd, self._project_root)
             if decision.action == "blocked":
-                self._note_command(block, f"blocked — {decision.reason}")
+                note = f"blocked — {decision.reason}"
+                self._note_command(command, note)
+                outcomes.append((command, f"note:{note}"))
                 continue
             if decision.action == "ask":
-                choice = await self._prompt_for_command(block, decision.reason)
+                choice = await self._prompt_for_command(command, decision.reason)
                 if choice is CmdChoice.DECLINE:
-                    self._note_command(block, "declined by the user")
+                    note = "declined by the user"
+                    self._note_command(command, note)
                     self._add_system(COMMAND_DECLINED_PROMPT)
+                    outcomes.append((command, f"note:{note}"))
                     continue
                 if choice is CmdChoice.ALWAYS:
-                    self._add_allow_rule(allow_rule_for(block, self.cmd.allow))
-            result = await self._exec_command(block)
+                    self._add_allow_rule(allow_rule_for(command, self.cmd.allow))
+            result = await self._exec_command(command)
             executed += 1
-            self.push_message("system", self._cmd_bubble(block, result))
-            self._add_system(format_result(block, result=result))
-        return executed
+            self.push_message("system", self._cmd_bubble(command, result))
+            self._add_system(format_result(command, result=result))
+            outcomes.append((command, self._result_signature(result)))
+        return CommandBatch(executed, tuple(outcomes))
+
+    @staticmethod
+    def _result_signature(result: ExecResult) -> str:
+        """Fingerprint a tool result without retaining its potentially large output."""
+        output_hash = hashlib.sha256(result.output.encode("utf-8")).hexdigest()
+        return (
+            f"exit={result.exit_code};timed_out={result.timed_out};"
+            f"interrupted={result.interrupted};truncated={result.truncated};"
+            f"output_sha256={output_hash}"
+        )
 
     def _note_command(self, command: str, note: str) -> None:
         self.push_message("system", f"$ {command}\n→ {note}")
@@ -765,8 +818,13 @@ class ChatApp(App):
         self._render_status()
 
     def _add_system(self, content: str) -> None:
-        """Persist a system message and optionally show it in debug mode."""
-        self.session.add("system", content)
+        """Persist a visible runtime event with model-facing observation framing."""
+        self.session.add(
+            "system",
+            content,
+            model_role="user",
+            model_content=f"[JTECH runtime event]\n{content}",
+        )
         self._save()
         if self.settings.debug_level == "system":
             self.push_message("system", content)
