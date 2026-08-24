@@ -8,14 +8,10 @@ from textual.widgets import Input, Markdown, Static, TextArea
 
 from jtech_cli.cmd_tools import CmdPolicy
 from jtech_cli.config import Settings, load_cmd_policy
+from jtech_cli.prompts import NUDGE_PROMPT
 from jtech_cli.server_info import ServerInfo
 from jtech_cli.session import Session
-from jtech_cli.tui import (
-    MAX_BLOCKS_PER_REPLY,
-    ChatApp,
-    CommandPrompt,
-    SettingsScreen,
-)
+from jtech_cli.tui import ChatApp, CommandPrompt, SettingsScreen
 
 
 def make_app(tmp_path, settings=None, session=None, server=None, no_discover=True):
@@ -1261,20 +1257,20 @@ async def test_cmd_always_allow_saves_rule(tmp_path, monkeypatch):
         assert any("git status:*" in b for b in bubbles(app))
 
 
-async def test_blocks_over_cap_are_reported_to_the_model(tmp_path, monkeypatch):
-    """Blocks past the per-reply cap are dropped — the model has to be told.
+async def test_every_command_in_one_reply_runs_in_source_order(tmp_path, monkeypatch):
+    """A reply may carry any number of calls; all of them run, in order.
 
-    Silence would read as success: the model sees results for the blocks that
-    ran and no sign the rest were discarded.
+    With no per-reply cap nothing is dropped, so there is nothing to report as
+    dropped: the model gets exactly one result per call it emitted.
     """
     app = make_app_with_cmd(tmp_path, CmdPolicy(mode="auto", allow=["echo:*"]))
-    over = MAX_BLOCKS_PER_REPLY + 2
+    total = 7  # more than the retired five-call cap
     calls = {"n": 0}
 
     def fake(settings, messages):
         calls["n"] += 1
         if calls["n"] == 1:
-            yield "\n".join(command_call(f"echo blk-{i}") for i in range(over))
+            yield "\n".join(command_call(f"echo blk-{i}") for i in range(total))
         else:
             yield "stopped"
 
@@ -1285,14 +1281,16 @@ async def test_blocks_over_cap_are_reported_to_the_model(tmp_path, monkeypatch):
         await pilot.press("enter")
         await _wait_until(app, pilot, lambda: calls["n"] >= 2, tries=150)
         await _wait_until(app, pilot, lambda: not app._tool_rounds_active, tries=100)
-        await pilot.pause()
+        for _ in range(10):
+            await pilot.pause()
 
-        assert any("2 extra command call(s) ignored" in b for b in bubbles(app))
+        assert calls["n"] == 2  # every call ran, then exactly one more round
+        assert not any("ignored" in b for b in bubbles(app))
 
-    fed = "\n".join(m["content"] for m in app.session.messages if m["role"] == "system")
-    assert "were ignored and produced no output" in fed
-    assert f"blk-{MAX_BLOCKS_PER_REPLY - 1}" in fed  # last kept block ran
-    assert f"blk-{MAX_BLOCKS_PER_REPLY}" not in fed  # first dropped one did not
+    fed = [m["content"] for m in app.session.messages if m["role"] == "system"]
+    assert len(fed) == total  # nothing dropped
+    for index, result in enumerate(fed):
+        assert f"blk-{index}" in result  # and nothing reordered
 
 
 async def test_different_command_rounds_are_not_limited(tmp_path, monkeypatch):
@@ -1326,56 +1324,91 @@ async def test_different_command_rounds_are_not_limited(tmp_path, monkeypatch):
     assert "round-6" in "\n".join(m["content"] for m in fed)
 
 
-async def test_repeated_command_results_stop_a_no_progress_loop(tmp_path, monkeypatch):
-    """Identical command results stop the loop without a fixed round budget."""
+async def test_repeated_commands_and_results_do_not_stop_the_loop(
+    tmp_path, monkeypatch
+):
+    """The same command with the same result keeps the turn running.
+
+    Repetition is the model's business, not the loop's: only prose without a
+    call ends the turn, so four identical rounds all execute and feed back.
+    """
     app = make_app_with_cmd(tmp_path, CmdPolicy(mode="auto", allow=["echo:*"]))
+    repeats = 4
     calls = {"n": 0}
 
     def fake(settings, messages):
         calls["n"] += 1
-        yield command_call("echo unchanged")
-
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
-    async with app.run_test() as pilot:
-        inp = app.query_one("#input", Input)
-        inp.value = "go"
-        await pilot.press("enter")
-        await _wait_until(app, pilot, lambda: calls["n"] >= 2, tries=100)
-        await _wait_until(app, pilot, lambda: not app._tool_rounds_active, tries=100)
-
-        assert calls["n"] == 2
-        assert any("no-progress loop" in b for b in bubbles(app))
-
-    fed = [m["content"] for m in app.session.messages if m["role"] == "system"]
-    assert "same command round produced the same tool results" in fed[-1]
-
-
-async def test_empty_reply_after_tool_is_nudged_once(tmp_path, monkeypatch):
-    """An empty model reply after a tool call gets one bounded recovery nudge."""
-    app = make_app_with_cmd(tmp_path, CmdPolicy(mode="auto", allow=["echo:*"]))
-    calls = {"n": 0}
-
-    def fake(settings, messages):
-        calls["n"] += 1
-        if calls["n"] == 1:
-            yield command_call("echo tool-out")
+        if calls["n"] <= repeats:
+            yield command_call("echo unchanged")
         else:
-            yield ""
+            yield "done"
 
     monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
     async with app.run_test() as pilot:
         inp = app.query_one("#input", Input)
         inp.value = "go"
         await pilot.press("enter")
-        # 1 initial + 1 post-tool reply + 1 bounded recovery nudge.
-        await _wait_until(app, pilot, lambda: calls["n"] >= 3, tries=100)
+        await _wait_until(app, pilot, lambda: calls["n"] >= repeats + 1, tries=200)
         await _wait_until(app, pilot, lambda: not app._tool_rounds_active, tries=100)
-        for _ in range(10):  # no second nudge may be scheduled
+        for _ in range(10):
             await pilot.pause()
 
-        assert calls["n"] == 3
-        roles = [m["role"] for m in app.session.messages]
-        assert roles == ["user", "assistant", "system"]
+        assert calls["n"] == repeats + 1
+        assert not any("no-progress" in b for b in bubbles(app))
+        assert any("done" in b for b in bubbles(app))
+
+    fed = [m["content"] for m in app.session.messages if m["role"] == "system"]
+    assert len(fed) == repeats
+    assert all("unchanged" in message and "exit 0" in message for message in fed)
+
+
+async def test_consecutive_empty_replies_are_each_nudged(tmp_path, monkeypatch):
+    """Every empty reply earns another nudge; there is no recovery budget.
+
+    An empty reply is not an answer, so the turn ends only once the model
+    produces prose — here after three consecutive empty streams.
+    """
+    app = make_app_with_cmd(tmp_path, CmdPolicy(mode="auto", allow=["echo:*"]))
+    calls = {"n": 0}
+    requests = []
+
+    def fake(settings, messages):
+        calls["n"] += 1
+        requests.append(messages)
+        if calls["n"] == 1:
+            yield command_call("echo tool-out")
+        elif calls["n"] <= 4:
+            yield ""
+        else:
+            yield "recovered"
+
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    async with app.run_test() as pilot:
+        inp = app.query_one("#input", Input)
+        inp.value = "go"
+        await pilot.press("enter")
+        await _wait_until(app, pilot, lambda: calls["n"] >= 5, tries=200)
+        await _wait_until(app, pilot, lambda: not app._tool_rounds_active, tries=100)
+        for _ in range(10):
+            await pilot.pause()
+
+        assert calls["n"] == 5
+        assert any("recovered" in b for b in bubbles(app))
+
+    # request 0 is the user turn and 1 follows the tool result; 2-4 are nudges
+    nudged = [
+        index
+        for index, messages in enumerate(requests)
+        if messages[-1] == {"role": "system", "content": NUDGE_PROMPT}
+    ]
+    assert nudged == [2, 3, 4]
+    # empty replies are never stored, and the nudge stays out of the history
+    assert [m["role"] for m in app.session.messages] == [
+        "user",
+        "assistant",
+        "system",
+        "assistant",
+    ]
 
 
 async def test_nudge_is_shown_in_system_debug_mode(tmp_path, monkeypatch):
@@ -1390,7 +1423,12 @@ async def test_nudge_is_shown_in_system_debug_mode(tmp_path, monkeypatch):
 
     def fake(settings, messages):
         calls["n"] += 1
-        yield command_call("echo debug-nudge") if calls["n"] == 1 else ""
+        if calls["n"] == 1:
+            yield command_call("echo debug-nudge")
+        elif calls["n"] == 2:
+            yield ""
+        else:
+            yield "done"
 
     monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
     async with app.run_test() as pilot:
@@ -1682,6 +1720,38 @@ async def test_blocked_command_ends_tool_turn(tmp_path, monkeypatch):
         assert not isinstance(app.screen, CommandPrompt)
 
     assert calls["n"] == 2
+
+
+async def test_failed_command_result_continues_the_loop(tmp_path, monkeypatch):
+    """A non-zero exit is a result, not a stop: the model gets it and continues."""
+    app = make_app_with_cmd(tmp_path, CmdPolicy(mode="yolo"))
+    calls = {"n": 0}
+
+    def fake(settings, messages):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            yield command_call("echo failing-out; exit 3")
+        elif calls["n"] == 2:
+            yield command_call("echo recovered-out")
+        else:
+            yield "handled"
+
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    async with app.run_test() as pilot:
+        inp = app.query_one("#input", Input)
+        inp.value = "go"
+        await pilot.press("enter")
+        await _wait_until(app, pilot, lambda: calls["n"] >= 3, tries=150)
+        await _wait_until(app, pilot, lambda: not app._tool_rounds_active, tries=100)
+        for _ in range(10):
+            await pilot.pause()
+
+        assert calls["n"] == 3
+        assert any("handled" in b for b in bubbles(app))
+
+    sys_msgs = [m["content"] for m in app.session.messages if m["role"] == "system"]
+    assert any("exit 3" in m and "failing-out" in m for m in sys_msgs)
+    assert any("recovered-out" in m for m in sys_msgs)
 
 
 async def test_cmd_timeout_feeds_partial_output(tmp_path, monkeypatch):

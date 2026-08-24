@@ -3,12 +3,10 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import subprocess
 import threading
 import time
 from collections.abc import Callable, Iterator
-from dataclasses import dataclass
 from pathlib import Path
 from typing import ClassVar
 
@@ -31,12 +29,7 @@ from jtech_cli.cmd_tools import (
 from jtech_cli.commands import CommandContext, build_registry
 from jtech_cli.config import CONFIG_PATH, Settings, save_settings
 from jtech_cli.llm_client import StreamItem, stream_reply
-from jtech_cli.prompts import (
-    BLOCKS_DROPPED_PROMPT,
-    COMMAND_DECLINED_PROMPT,
-    NUDGE_PROMPT,
-    REPEATED_COMMAND_PROMPT,
-)
+from jtech_cli.prompts import COMMAND_DECLINED_PROMPT, NUDGE_PROMPT
 from jtech_cli.server_info import ServerInfo, fetch_server_info
 from jtech_cli.session import Session
 from jtech_cli.theme import JTECH_DARK, JTECH_LIGHT, textual_theme_name
@@ -53,19 +46,10 @@ from jtech_cli.tui_widgets import (
 
 CONNECTION_ERROR = "Connection failed — check base_url in /settings"
 SPINNER_FRAMES = "-\\|/"
-MAX_BLOCKS_PER_REPLY = 5
 
 StreamReply = Callable[[Settings, list[dict]], Iterator[StreamItem]]
 FetchServerInfo = Callable[[Settings], ServerInfo]
 FetchTokenCount = Callable[[Settings, str], int | None]
-
-
-@dataclass(frozen=True)
-class CommandBatch:
-    """Execution count and outcome signature for one model command response."""
-
-    executed: int
-    signature: tuple[tuple[str, str], ...]
 
 
 class ChatApp(App):
@@ -601,60 +585,32 @@ class ChatApp(App):
             self._render_status()
 
     async def _tool_rounds(self, reply: str) -> None:
-        """Process standalone command calls until the model stops or repeats a result.
+        """Run model rounds until one reply carries prose and no command calls.
 
-        The model may add commentary after a command prefix. A prose-only reply
-        is terminal. An empty reply after a command is the one explicit recovery
-        case: nudge once, then require another command call or finish the turn.
-        Repeating a command batch with identical outcomes is a no-progress loop.
+        Command output must reach the model before the next completion decision,
+        so this loop owns the only normal exit: a reply with non-whitespace text
+        and no parsed commands. Any command call — however often it repeats, and
+        whatever result it produced — costs another model round, and an empty
+        reply is nudged rather than treated as an answer. There is no command,
+        round, repetition, or retry budget. ``None`` is a cancellation or a
+        provider failure that ``_stream_once`` has already reported.
         """
         self._tool_rounds_active = True
         try:
-            seen_batches: set[tuple[tuple[str, str], ...]] = set()
-            while True:
+            while reply is not None:
                 commands = parse_jtech_reply(reply).commands
-                if not commands:
+                if commands:
+                    await self._process_commands(commands)
+                    reply = await self._stream_once()
+                    continue
+                if reply.strip():
                     return
-                if len(commands) > MAX_BLOCKS_PER_REPLY:
-                    self._report_blocks_dropped(len(commands))
-                batch = await self._process_commands(
-                    commands[:MAX_BLOCKS_PER_REPLY]
-                )
-                if batch.signature in seen_batches:
-                    self._report_no_progress()
-                    return
-                seen_batches.add(batch.signature)
-                reply = await self._stream_once()
-                if reply is None:
-                    return
-                if batch.executed and not reply.strip():
-                    reply = await self._nudge()
-                    if reply is None:
-                        return
+                reply = await self._nudge()
         finally:
             self._tool_rounds_active = False
 
-    def _report_blocks_dropped(self, total: int) -> None:
-        dropped = total - MAX_BLOCKS_PER_REPLY
-        self.push_message(
-            "system",
-            f"{dropped} extra command call(s) ignored "
-            f"(max {MAX_BLOCKS_PER_REPLY} per reply).",
-        )
-        self._add_system(
-            BLOCKS_DROPPED_PROMPT.format(kept=MAX_BLOCKS_PER_REPLY, dropped=dropped)
-        )
-
-    def _report_no_progress(self) -> None:
-        self.push_message(
-            "system",
-            "Repeated command round detected with identical tool results; "
-            "stopping to prevent a no-progress loop.",
-        )
-        self._add_system(REPEATED_COMMAND_PROMPT)
-
     async def _nudge(self) -> str | None:
-        """Request one continuation after a command round ended empty."""
+        """Request a continuation after the model returned an empty reply."""
         if self.settings.debug_level == "system":
             # Keep an auditable event without feeding it into future prompts.
             self.session.add(
@@ -671,47 +627,27 @@ class ChatApp(App):
         finally:
             self._save()
 
-    async def _process_commands(self, commands: list[str]) -> CommandBatch:
-        executed = 0
-        outcomes: list[tuple[str, str]] = []
+    async def _process_commands(self, commands: list[str]) -> None:
+        """Run every parsed command in source order, feeding each result back."""
         for command in commands:
             if not command.strip():
-                note = "empty command — not run"
-                self._note_command(command, note)
-                outcomes.append((command, f"note:{note}"))
+                self._note_command(command, "empty command — not run")
                 continue
             decision = decide(command, self.cmd, self._project_root)
             if decision.action == "blocked":
-                note = f"blocked — {decision.reason}"
-                self._note_command(command, note)
-                outcomes.append((command, f"note:{note}"))
+                self._note_command(command, f"blocked — {decision.reason}")
                 continue
             if decision.action == "ask":
                 choice = await self._prompt_for_command(command, decision.reason)
                 if choice is CmdChoice.DECLINE:
-                    note = "declined by the user"
-                    self._note_command(command, note)
+                    self._note_command(command, "declined by the user")
                     self._add_system(COMMAND_DECLINED_PROMPT)
-                    outcomes.append((command, f"note:{note}"))
                     continue
                 if choice is CmdChoice.ALWAYS:
                     self._add_allow_rule(allow_rule_for(command, self.cmd.allow))
             result = await self._exec_command(command)
-            executed += 1
             self.push_message("system", self._cmd_bubble(command, result))
             self._add_system(format_result(command, result=result))
-            outcomes.append((command, self._result_signature(result)))
-        return CommandBatch(executed, tuple(outcomes))
-
-    @staticmethod
-    def _result_signature(result: ExecResult) -> str:
-        """Fingerprint a tool result without retaining its potentially large output."""
-        output_hash = hashlib.sha256(result.output.encode("utf-8")).hexdigest()
-        return (
-            f"exit={result.exit_code};timed_out={result.timed_out};"
-            f"interrupted={result.interrupted};truncated={result.truncated};"
-            f"output_sha256={output_hash}"
-        )
 
     def _note_command(self, command: str, note: str) -> None:
         self.push_message("system", f"$ {command}\n→ {note}")

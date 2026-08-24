@@ -1,1 +1,0 @@
-The same command round produced the same tool results more than once. This is a no-progress loop. Do not issue that command sequence again; provide a final response based on the results already available.

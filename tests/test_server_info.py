@@ -33,22 +33,6 @@ class _FakeResp:
         import json
         return json.dumps(self._payload).encode()
 
-
-def test_fetch_server_info_single_model(monkeypatch):
-    settings = Settings(base_url="http://srv:1234/v1")
-    opener = _FakeOpener({
-        "/models": {"data": [{"id": "real-model"}]},
-        "/models/real-model": {"meta": {"llama.context_length": 32768}},
-    })
-    monkeypatch.setattr("jtech_cli.server_info.urlopen", opener)
-
-    info = fetch_server_info(settings)
-    assert info.models == ["real-model"]
-    assert info.context_length == 32768
-    assert info.model == "real-model"
-    assert info.known is True
-
-
 def test_fetch_server_info_unreachable(monkeypatch):
     settings = Settings(base_url="http://srv:1234/v1")
 

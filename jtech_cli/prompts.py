@@ -68,16 +68,12 @@ DEFAULT_SYSTEM_PROMPT = load_prompt("system.md")
 INSTRUCTIONS_HELP = load_prompt("instructions.md")
 NUDGE_PROMPT = load_prompt("nudge.md")
 COMMAND_DECLINED_PROMPT = load_prompt("command-declined.md")
-BLOCKS_DROPPED_PROMPT = load_prompt("blocks-dropped.md")
-REPEATED_COMMAND_PROMPT = load_prompt("rounds-exhausted.md")
 
 __all__ = [
-    "BLOCKS_DROPPED_PROMPT",
     "COMMAND_DECLINED_PROMPT",
     "DEFAULT_SYSTEM_PROMPT",
     "INSTRUCTIONS_HELP",
     "NUDGE_PROMPT",
-    "REPEATED_COMMAND_PROMPT",
     "PromptResourceError",
     "PromptSourceError",
     "compose_system_prompt",
