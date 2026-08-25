@@ -1,7 +1,8 @@
 """Conversation history persistence as JSONL.
 
-History is written to ~/.mycli/session.jsonl after every exchange so the CLI
-survives crashes, detaches from tmux, and process kills.
+Every message is appended to ~/.mycli/session.jsonl as its own record the
+moment it is added, so the CLI survives crashes, detaches from tmux, and
+process kills without ever rewriting the history it already stored.
 """
 
 from __future__ import annotations
@@ -61,6 +62,11 @@ class Session:
         ``system`` messages in the UI while using a model-compatible role and
         framing in the next request. Context-excluded messages remain in
         history but are filtered before requests are sent to the model.
+
+        Persisting sessions append this one message to the JSONL file; earlier
+        records are never re-read or rewritten. ``OSError`` propagates so the
+        caller can report the failure, and the message stays in memory either
+        way: a failed write is not a reason to lose the live conversation.
         """
         if model_role is not None and model_role not in MODEL_ROLES:
             raise ValueError(f"unsupported model role: {model_role}")
@@ -77,6 +83,12 @@ class Session:
             msg["_model_role"] = model_role
             msg["_model_content"] = model_content
         self.messages.append(msg)
+        if not self.persist:
+            return
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        record = json.dumps(msg, ensure_ascii=False)
+        with self.path.open("a", encoding="utf-8") as fh:
+            fh.write(record + "\n")
 
     @contextmanager
     def ephemeral(self, role: str, content: str) -> Iterator[None]:
@@ -88,8 +100,9 @@ class Session:
         and the list can be emptied concurrently (``/clear``), which would make
         ``list.remove`` raise.
 
-        Persistence stays the caller's job — a save inside the block writes the
-        message out with everything else, so the caller re-saves afterwards.
+        The held message bypasses ``add()``, so it is never written to disk: an
+        ephemeral prompt joins one request and nothing else. Messages added
+        normally inside the block are persisted normally.
         """
         msg = {"role": role, "content": content}
         self.messages.append(msg)
@@ -100,16 +113,6 @@ class Session:
                 if held is msg:
                     del self.messages[i]
                     break
-
-    def save(self) -> None:
-        if not self.persist:
-            return
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_suffix(".jsonl.tmp")
-        with tmp.open("w") as fh:
-            for msg in self.messages:
-                fh.write(json.dumps(msg, ensure_ascii=False) + "\n")
-        tmp.replace(self.path)
 
     def clear(self) -> None:
         """Drop the in-memory history, and the file too when persisting.

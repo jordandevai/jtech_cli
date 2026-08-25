@@ -6,10 +6,13 @@ import asyncio
 import subprocess
 import threading
 import time
+from collections import deque
 from collections.abc import Callable, Iterator
+from dataclasses import dataclass
 from pathlib import Path
 from typing import ClassVar
 
+from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical, VerticalScroll
@@ -45,11 +48,72 @@ from jtech_cli.tui_widgets import (
 )
 
 CONNECTION_ERROR = "Connection failed — check base_url in /settings"
+RENDER_ERROR = "Could not render the reply — it was not added to the conversation"
 SPINNER_FRAMES = "-\\|/"
 
 StreamReply = Callable[[Settings, list[dict]], Iterator[StreamItem]]
 FetchServerInfo = Callable[[Settings], ServerInfo]
 FetchTokenCount = Callable[[Settings, str], int | None]
+
+
+@dataclass(frozen=True)
+class _StreamEnd:
+    """Terminal marker the provider thread enqueues exactly once."""
+
+    error: Exception | None = None
+
+
+_QueuedStreamItem = StreamItem | _StreamEnd
+
+
+class _StreamInbox:
+    """Ordered handoff from the provider thread to the Textual event loop.
+
+    The provider iterator is synchronous and runs off the event loop, so it may
+    not touch widgets or stream state. It only appends here. Every event is
+    enqueued once, drained once in source order, and at most one wake-up is
+    outstanding for a non-empty queue: the idle-to-pending transition and the
+    drain that clears it share one lock, so an item can neither slip into the
+    gap between draining and clearing nor schedule a redundant callback.
+    """
+
+    def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
+        self._loop = loop
+        self._items: deque[_QueuedStreamItem] = deque()
+        self._lock = threading.Lock()
+        self._ready = asyncio.Event()
+        self._notified = False
+
+    def put(self, item: _QueuedStreamItem) -> None:
+        """Enqueue one event from any thread, waking the consumer if idle."""
+        with self._lock:
+            self._items.append(item)
+            notify = not self._notified
+            self._notified = True
+        if notify:
+            self._loop.call_soon_threadsafe(self._ready.set)
+
+    async def get_batch(self) -> list[_QueuedStreamItem]:
+        """Await and return every event queued since the last drain, in order."""
+        await self._ready.wait()
+        with self._lock:
+            self._ready.clear()
+            batch = list(self._items)
+            self._items.clear()
+            self._notified = False
+        return batch
+
+
+def _message_widgets(role: str, text: str) -> tuple[Static, Markdown]:
+    """Build the label/body pair for one transcript message.
+
+    Construction only — mounting, scrolling, and persistence stay with the
+    caller, so replayed history can be mounted in one batch while a live
+    message still follows the transcript on its own.
+    """
+    label = Static(role.upper(), classes=f"bubble-label {role}")
+    markdown = Markdown(text or "", classes=f"bubble {role}")
+    return label, markdown
 
 
 class ChatApp(App):
@@ -143,10 +207,17 @@ class ChatApp(App):
         self.register_theme(JTECH_DARK)
         self.register_theme(JTECH_LIGHT)
         self.theme = textual_theme_name(self.settings.theme)
+        # Replayed history is mounted as one batch and scrolled once: going
+        # through _append() would mount and scroll per stored message.
+        history: list[Static | Markdown] = []
         for msg in self.session.messages:
             if msg.get("_debug_only") and self.settings.debug_level != "system":
                 continue
-            self._append(msg["role"], msg["content"])
+            history.extend(_message_widgets(msg["role"], msg["content"]))
+        if history:
+            chat = self.query_one("#chat", VerticalScroll)
+            await chat.mount(*history)
+            chat.scroll_end(animate=False)
         if not self.settings.base_url:
             self.push_message(
                 "system", "No server configured — run /settings to set base_url and model."
@@ -184,10 +255,8 @@ class ChatApp(App):
 
     def _append(self, role: str, text: str) -> tuple[Static, Markdown]:
         chat = self.query_one("#chat", VerticalScroll)
-        label = Static(role.upper(), classes=f"bubble-label {role}")
-        chat.mount(label)
-        markdown = Markdown(text or "", classes=f"bubble {role}")
-        chat.mount(markdown)
+        label, markdown = _message_widgets(role, text)
+        chat.mount(label, markdown)
         chat.scroll_end(animate=False)
         return label, markdown
 
@@ -321,9 +390,34 @@ class ChatApp(App):
             parts.append(f"queue: {len(self._queue)}")
         self.query_one("#status", Static).update("  ·  ".join(parts))
 
-    def _save(self) -> None:
-        if self.session.persist:
-            self.ctx.save()
+    def _record_message(
+        self,
+        role: str,
+        content: str,
+        *,
+        include_in_context: bool = True,
+        debug_only: bool = False,
+        model_role: str | None = None,
+        model_content: str | None = None,
+    ) -> None:
+        """Persist one message, surfacing an I/O failure in the transcript.
+
+        Presenting the failure is UI work, so it lives here rather than in
+        ``Session``. The message stays in memory when the append fails — a
+        save failure is worth saying out loud, but it is not a reason to drop
+        the live conversation — and the warning never joins model context.
+        """
+        try:
+            self.session.add(
+                role,
+                content,
+                include_in_context=include_in_context,
+                debug_only=debug_only,
+                model_role=model_role,
+                model_content=model_content,
+            )
+        except OSError as error:
+            self.push_message("system", f"Could not save history: {error}")
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         value = event.value.strip()
@@ -422,8 +516,7 @@ class ChatApp(App):
         if self._generating or self._tool_rounds_active:
             self._enqueue(content)
             return
-        self.session.add("user", content)
-        self._save()
+        self._record_message("user", content)
         self._append("user", content)
         await self._stream_reply()
 
@@ -439,29 +532,32 @@ class ChatApp(App):
     async def _stream_once(self) -> str | None:
         """Consume one stream and return its answer, or ``None`` on failure."""
         parts: list[str] = []
-        reason_parts: list[str] = []
         timings: dict | None = None
-        error: BaseException | None = None
-        done = asyncio.Event()
+        error: Exception | None = None
         started = time.monotonic()
         mode = self.settings.reasoning
-        got_token = False
+        content_chars = 0
+        reasoning_chars = 0
+        got_item = False
+        got_content = False
         tick_count = 0
         reason_visible = False
-        last_content = ""
-        last_reason = ""
+        reason_dropped = False
+        reason_tail = ""
+        reason_text = Text()
         self._stop_event.clear()
         self._generating = True
 
-        def reason_display(reason: str) -> str:
-            return ("…" + reason[-500:]) if mode == "tail" else reason
-
+        chat = self.query_one("#chat", VerticalScroll)
         reason_pair: tuple[Static, Static] | None = None
         if mode != "hide":
             reason_pair = self._append_plain("reasoning", "", hidden=True)
         label, ai_md = self._append("ai", "")
         ai_stream = Markdown.get_stream(ai_md)
-        stream_closed = False
+        # Anchoring lets Textual keep the newest output in view by itself and
+        # release that hold the moment the user scrolls, so the stream never
+        # has to issue a scroll request of its own per chunk.
+        chat.anchor()
 
         def drop_reason_bubble() -> None:
             if reason_pair is None:
@@ -470,90 +566,140 @@ class ChatApp(App):
                 if widget.is_mounted:
                     widget.remove()
 
-        def paint() -> None:
-            nonlocal reason_visible, last_content, last_reason, stream_closed
+        def render_reasoning() -> None:
+            """Push the accumulated reasoning body into its bubble.
+
+            ``tail`` renders a bounded string; the retaining modes hand over one
+            mutable ``Text`` that grows by append, so no mode re-joins every
+            fragment received so far.
+            """
+            assert reason_pair is not None
+            if mode == "tail":
+                reason_pair[1].update("…" + reason_tail)
+            else:
+                reason_pair[1].update(reason_text)
+
+        def apply_reasoning(delta: str) -> None:
+            """Fold one batch of reasoning deltas into the reasoning bubble."""
+            nonlocal reason_visible, reason_dropped, reason_tail
+            if reason_pair is None:
+                return
+            if delta:
+                if mode == "tail":
+                    reason_tail = (reason_tail + delta)[-500:]
+                else:
+                    reason_text.append(delta)
+            if reasoning_chars and not reason_visible and not reason_dropped:
+                reason_pair[0].display = True
+                reason_pair[1].display = True
+                reason_visible = True
+            if not reason_visible:
+                return
+            if got_content and mode == "transient":
+                drop_reason_bubble()
+                reason_visible = False
+                reason_dropped = True
+            elif delta:
+                render_reasoning()
+
+        def update_label() -> None:
+            """Repaint the AI status line from the running counters only."""
             if not label.is_mounted:
                 return
-            reason = "".join(reason_parts)
-            content = "".join(parts)
-            moved = False
-            if reason_pair is not None:
-                if reason and not reason_visible:
-                    reason_pair[0].display = True
-                    reason_pair[1].display = True
-                    reason_visible = True
-                    last_reason = reason_display(reason)
-                    reason_pair[1].update(last_reason)
-                    moved = True
-                if reason_visible:
-                    if content and mode == "transient":
-                        drop_reason_bubble()
-                        reason_visible = False
-                        moved = True
-                    else:
-                        shown = reason_display(reason)
-                        if shown != last_reason:
-                            reason_pair[1].update(shown)
-                            last_reason = shown
-                            moved = True
-            if not stream_closed and content and content != last_content:
-                delta = content[len(last_content) :]
-                last_content = content
-                asyncio.ensure_future(ai_stream.write(delta))
-                moved = True
             elapsed = int(time.monotonic() - started)
             frame = SPINNER_FRAMES[tick_count % len(SPINNER_FRAMES)]
-            if not got_token:
+            if not got_item:
                 label.update(f"AI  ·  waiting {elapsed}s")
-            elif not content:
-                label.update(f"AI  ·  {frame}  thinking… {len(reason)}")
+            elif not got_content:
+                label.update(f"AI  ·  {frame}  thinking… {reasoning_chars}")
             else:
-                label.update(f"AI  ·  {frame}  {len(content)}")
-            if moved:
-                self.query_one("#chat", VerticalScroll).scroll_end(animate=False)
+                label.update(f"AI  ·  {frame}  {content_chars}")
 
         def tick() -> None:
             nonlocal tick_count
             tick_count += 1
-            paint()
+            update_label()
 
         timer = self.set_interval(1.0, tick)
+        inbox = _StreamInbox(asyncio.get_running_loop())
+        # This stream's own stop signal, separate from the app-wide Escape
+        # flag: it says "nobody is reading the inbox any more", which is true
+        # on every exit, not only the ones the user asked for.
+        abandoned = threading.Event()
 
         def consume() -> None:
-            nonlocal error, got_token, timings
+            """Provider thread: enqueue every event, then one end marker."""
+            producer_error: Exception | None = None
             try:
                 messages = self.session.messages_with_system(
                     self.settings.effective_system_prompt()
                 )
                 for item in self._stream_reply_fn(self.settings, messages):
-                    if isinstance(item, tuple):
-                        kind, payload = item
-                        if kind == "reasoning":
-                            reason_parts.append(payload)
-                        elif kind == "usage":
-                            self._prompt_tokens = payload["prompt_tokens"]
-                        elif kind == "timings":
-                            timings = payload
-                            prompt_n = payload.get("prompt_n")
-                            if prompt_n:
-                                self._prompt_tokens = int(prompt_n)
-                    else:
-                        parts.append(item)
-                    got_token = True
-                    self.call_from_thread(paint)
-                    if self._stop_event.is_set():
+                    inbox.put(item)
+                    if abandoned.is_set() or self._stop_event.is_set():
                         break
             except Exception as exc:  # noqa: BLE001 - report connection failures cleanly
-                error = exc
+                producer_error = exc
             finally:
-                self.call_from_thread(done.set)
+                inbox.put(_StreamEnd(producer_error))
 
-        threading.Thread(target=consume, daemon=True).start()
-        await done.wait()
+        producer = threading.Thread(target=consume, daemon=True)
+        producer.start()
 
+        render_error: Exception | None = None
         try:
-            timer.stop()
-            stream_closed = True
+            try:
+                ended = False
+                while not ended:
+                    batch = await inbox.get_batch()
+                    content_deltas: list[str] = []
+                    reason_deltas: list[str] = []
+                    for item in batch:
+                        if isinstance(item, _StreamEnd):
+                            error = item.error
+                            ended = True
+                            break
+                        got_item = True
+                        if isinstance(item, tuple):
+                            kind, payload = item
+                            if kind == "reasoning":
+                                reasoning_chars += len(payload)
+                                reason_deltas.append(payload)
+                            elif kind == "usage":
+                                self._prompt_tokens = payload["prompt_tokens"]
+                            elif kind == "timings":
+                                timings = payload
+                                prompt_n = payload.get("prompt_n")
+                                if prompt_n:
+                                    self._prompt_tokens = int(prompt_n)
+                        else:
+                            parts.append(item)
+                            content_chars += len(item)
+                            if item:
+                                got_content = True
+                                content_deltas.append(item)
+                    # /clear can unmount the live bubbles mid-stream; the answer
+                    # keeps accumulating for the model, but there is nothing
+                    # left to paint.
+                    if label.is_mounted:
+                        apply_reasoning("".join(reason_deltas))
+                        combined_delta = "".join(content_deltas)
+                        if combined_delta:
+                            # Awaited, not detached: the next batch cannot be
+                            # drained — and the stream cannot be finalized —
+                            # until this lands.
+                            await ai_stream.write(combined_delta)
+                    update_label()
+            except Exception as exc:  # noqa: BLE001 - a broken renderer ends the turn
+                # Rendering happens on the event loop now, so a failure here has
+                # no provider thread to surface it. Leaving it to propagate
+                # would latch _generating and queue every later message behind
+                # a turn that can never finish, so it is reported like any
+                # other stream failure and the turn ends.
+                render_error = exc
+            finally:
+                timer.stop()
+
             await ai_stream.stop()
             async with ai_md.lock:
                 pass
@@ -563,26 +709,37 @@ class ChatApp(App):
                 ai_md.remove()
                 self.push_message("system", "Generation stopped.")
                 return None
-            if error is not None:
+            failure = error if render_error is None else render_error
+            if failure is not None:
                 if mode == "transient":
                     drop_reason_bubble()
                 label.update("AI")
                 ai_md.add_class("error")
-                await ai_md.update(f"{CONNECTION_ERROR}\n\n{error}")
-                self.query_one("#chat", VerticalScroll).scroll_end(animate=False)
+                headline = CONNECTION_ERROR if render_error is None else RENDER_ERROR
+                await ai_md.update(f"{headline}\n\n{failure}")
+                chat.scroll_end(animate=False)
                 return None
             if mode == "transient":
                 drop_reason_bubble()
             label.update(self._done_label(timings))
             reply = "".join(parts)
             if reply.strip():
-                self.session.add("assistant", reply)
-                self._save()
+                self._record_message("assistant", reply)
             self.ctx.last_reply = reply
             return reply
         finally:
-            self._generating = False
-            self._render_status()
+            abandoned.set()
+            try:
+                # Every path but a render failure has already seen _StreamEnd,
+                # so the producer is done. That one has not: releasing the turn
+                # with it still running would let the next request overlap it
+                # and grow an inbox nobody drains. Join off the event loop —
+                # Escape already makes a turn wait for its provider this way.
+                if producer.is_alive():
+                    await asyncio.to_thread(producer.join)
+            finally:
+                self._generating = False
+                self._render_status()
 
     async def _tool_rounds(self, reply: str) -> None:
         """Run model rounds until one reply carries prose and no command calls.
@@ -613,19 +770,15 @@ class ChatApp(App):
         """Request a continuation after the model returned an empty reply."""
         if self.settings.debug_level == "system":
             # Keep an auditable event without feeding it into future prompts.
-            self.session.add(
+            self._record_message(
                 "system",
                 NUDGE_PROMPT,
                 include_in_context=False,
                 debug_only=True,
             )
-            self._save()
             self.push_message("system", NUDGE_PROMPT)
-        try:
-            with self.session.ephemeral("system", NUDGE_PROMPT):
-                return await self._stream_once()
-        finally:
-            self._save()
+        with self.session.ephemeral("system", NUDGE_PROMPT):
+            return await self._stream_once()
 
     async def _process_commands(self, commands: list[str]) -> None:
         """Run every parsed command in source order, feeding each result back."""
@@ -755,13 +908,12 @@ class ChatApp(App):
 
     def _add_system(self, content: str) -> None:
         """Persist a visible runtime event with model-facing observation framing."""
-        self.session.add(
+        self._record_message(
             "system",
             content,
             model_role="user",
             model_content=f"[JTECH runtime event]\n{content}",
         )
-        self._save()
         if self.settings.debug_level == "system":
             self.push_message("system", content)
 

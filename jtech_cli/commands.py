@@ -56,12 +56,6 @@ class CommandContext:
     clear_chat: Callable[[], None] = field(default=lambda: None)
     switch_theme: Callable[[], None] = field(default=lambda: None)
 
-    def save(self) -> None:
-        try:
-            self.session.save()
-        except OSError as e:
-            self.console.print(f"[yellow]Could not save history:[/yellow] {e}")
-
     def persist_settings(self) -> None:
         try:
             cmd = self.cmd

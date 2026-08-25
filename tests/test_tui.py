@@ -1,25 +1,37 @@
 """Tests for the Textual TUI: bubbles, status bar, notices, settings, and /clear."""
 
+import asyncio
 import threading
 import time
 
-from textual.containers import Vertical
+from textual.containers import Vertical, VerticalScroll
 from textual.widgets import Input, Markdown, Static, TextArea
+from textual.widgets.markdown import MarkdownStream
 
 from jtech_cli.cmd_tools import CmdPolicy
 from jtech_cli.config import Settings, load_cmd_policy
 from jtech_cli.prompts import NUDGE_PROMPT
 from jtech_cli.server_info import ServerInfo
 from jtech_cli.session import Session
-from jtech_cli.tui import ChatApp, CommandPrompt, SettingsScreen
+from jtech_cli.tui import CONNECTION_ERROR, ChatApp, CommandPrompt, SettingsScreen
+from jtech_cli.tui_app import RENDER_ERROR, _StreamEnd, _StreamInbox
 
 
-def make_app(tmp_path, settings=None, session=None, server=None, no_discover=True):
+def make_app(
+    tmp_path,
+    settings=None,
+    session=None,
+    server=None,
+    no_discover=True,
+    fetch_token_count_fn=None,
+):
     """A ChatApp for tests. Discovery is off unless a test opts in.
 
     Left on, every app here fires a real HTTP request at host:9000 and waits
     out the 5s timeout — network I/O in a unit test, and a failure notice in
-    the chat that tests asserting on bubbles have to know to ignore.
+    the chat that tests asserting on bubbles have to know to ignore. A session
+    that starts with history triggers the same thing through the startup token
+    count, so those tests inject ``fetch_token_count_fn``.
     """
     settings = settings or Settings(base_url="http://host:9000/v1", model="qwen3")
     session = session or Session(tmp_path / "s.jsonl", persist=False)
@@ -30,6 +42,7 @@ def make_app(tmp_path, settings=None, session=None, server=None, no_discover=Tru
         server=server,
         config_path=tmp_path / "config.toml",
         no_discover=no_discover,
+        fetch_token_count_fn=fetch_token_count_fn,
     )
 
 
@@ -1979,3 +1992,629 @@ async def test_discovery_does_not_overwrite_an_explicit_model(tmp_path, monkeypa
     async with app.run_test() as pilot:
         await _wait_until(app, pilot, lambda: bool(app.server.models), tries=50)
         assert app.settings.model == "explicit"
+
+
+# --- streaming handoff, batching, and follow-scroll ------------------------
+
+
+def record_markdown_writes(monkeypatch, gate: asyncio.Event | None = None) -> list[str]:
+    """Record every fragment handed to the Markdown stream, newest last.
+
+    With ``gate``, the first write blocks until the gate is set, so a test can
+    hold the consumer open and observe what the provider produces meanwhile.
+    """
+    writes: list[str] = []
+    real_write = MarkdownStream.write
+
+    async def write(self, markdown_fragment: str) -> None:
+        writes.append(markdown_fragment)
+        if gate is not None and len(writes) == 1:
+            await gate.wait()
+        await real_write(self, markdown_fragment)
+
+    monkeypatch.setattr(MarkdownStream, "write", write)
+    return writes
+
+
+def record_static_updates(monkeypatch) -> list[tuple[Static, object]]:
+    """Record (widget, content) for every Static.update in the app."""
+    calls: list[tuple[Static, object]] = []
+    real_update = Static.update
+
+    def update(self, content="", *, layout: bool = True) -> None:
+        calls.append((self, content))
+        real_update(self, content, layout=layout)
+
+    monkeypatch.setattr(Static, "update", update)
+    return calls
+
+
+def reasoning_updates(calls: list[tuple[Static, object]]) -> list[str]:
+    return [
+        str(content)
+        for widget, content in calls
+        if "bubble" in widget.classes and "reasoning" in widget.classes
+    ]
+
+
+def ai_label_updates(calls: list[tuple[Static, object]]) -> list[str]:
+    return [
+        str(content)
+        for widget, content in calls
+        if "bubble-label" in widget.classes and "ai" in widget.classes
+    ]
+
+
+def burst_stream(*items):
+    """A provider parked until released, then emitting ``items`` in one burst.
+
+    Returned alongside the gates a test needs to land the whole burst in a
+    single inbox batch: wait for ``entered`` (producer thread parked, consumer
+    parked on an empty inbox), set ``release``, then block the event loop on
+    ``emitted`` so nothing can be drained until every item is queued.
+    """
+    entered = threading.Event()
+    release = threading.Event()
+    emitted = threading.Event()
+
+    def fake(settings, messages):
+        entered.set()
+        release.wait(5)
+        yield from items
+        emitted.set()
+
+    return fake, entered, release, emitted
+
+
+async def _run_one_batch(app, pilot, gates, text: str = "go") -> None:
+    """Submit ``text`` and let the parked provider deliver one whole batch."""
+    entered, release, emitted = gates
+    app.query_one("#input", Input).value = text
+    await pilot.press("enter")
+    await _wait_until(app, pilot, entered.is_set, tries=100)
+    release.set()
+    # Blocking on purpose: while the test holds the loop the consumer cannot
+    # drain, so every queued item is still there when it finally wakes.
+    assert emitted.wait(5)
+    await _wait_until(app, pilot, lambda: not app._generating, tries=100)
+
+
+class _RecordingLoop:
+    """Stand-in event loop that records cross-thread wake-up callbacks."""
+
+    def __init__(self) -> None:
+        self.callbacks: list = []
+
+    def call_soon_threadsafe(self, callback, *args) -> None:
+        self.callbacks.append((callback, args))
+
+    def run_pending(self) -> None:
+        pending, self.callbacks = self.callbacks, []
+        for callback, args in pending:
+            callback(*args)
+
+
+async def test_stream_inbox_batches_a_burst_behind_one_wakeup():
+    """A producer burst costs one notification and arrives in source order."""
+    loop = _RecordingLoop()
+    inbox = _StreamInbox(loop)
+
+    for item in ["a", ("reasoning", "r"), "b", _StreamEnd()]:
+        inbox.put(item)
+
+    assert len(loop.callbacks) == 1  # only the idle -> pending transition woke it
+    loop.run_pending()
+    assert await inbox.get_batch() == ["a", ("reasoning", "r"), "b", _StreamEnd()]
+
+
+async def test_stream_inbox_reschedules_a_wakeup_after_a_drain():
+    """An item queued after a drain gets its own notification and batch."""
+    loop = _RecordingLoop()
+    inbox = _StreamInbox(loop)
+
+    inbox.put("first")
+    loop.run_pending()
+    assert await inbox.get_batch() == ["first"]
+    assert loop.callbacks == []
+
+    inbox.put("second")
+    assert len(loop.callbacks) == 1
+    loop.run_pending()
+    assert await inbox.get_batch() == ["second"]
+
+
+async def test_chunks_produced_during_a_blocked_write_are_combined(tmp_path, monkeypatch):
+    """Backlog is coalesced into the next awaited write, not one task per chunk."""
+    app = make_app(tmp_path)
+    release = asyncio.Event()
+    writes = record_markdown_writes(monkeypatch, gate=release)
+    produced = threading.Event()
+    finished = threading.Event()
+
+    def fake(settings, messages):
+        yield "A"
+        produced.wait(5)  # hold until the first write is in flight
+        yield "B"
+        yield "C"
+        yield "D"
+        finished.set()
+
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    async with app.run_test() as pilot:
+        app.query_one("#input", Input).value = "go"
+        await pilot.press("enter")
+        await _wait_until(app, pilot, lambda: writes == ["A"], tries=100)
+
+        produced.set()
+        assert finished.wait(5)  # B, C and D are queued while the write blocks
+        release.set()
+        await _wait_until(app, pilot, lambda: not app._generating, tries=100)
+
+        assert writes == ["A", "BCD"]
+        assert app.session.messages[-1] == {"role": "assistant", "content": "ABCD"}
+
+
+async def test_markdown_writes_reproduce_the_provider_content(tmp_path, monkeypatch):
+    """Whatever the batching, the writes concatenate back to the source text."""
+    app = make_app(tmp_path)
+    chunks = [f"chunk-{index} " for index in range(60)]
+    writes = record_markdown_writes(monkeypatch)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", lambda s, m: iter(chunks))
+    async with app.run_test() as pilot:
+        app.query_one("#input", Input).value = "go"
+        await pilot.press("enter")
+        await _wait_until(app, pilot, lambda: not app._generating, tries=100)
+
+        assert "".join(writes) == "".join(chunks)
+        assert app.session.messages[-1]["content"] == "".join(chunks)
+
+
+async def test_finalization_waits_for_a_blocked_markdown_write(tmp_path, monkeypatch):
+    """Nothing is finalized or persisted while a Markdown write is outstanding."""
+    app = make_app(tmp_path)
+    release = asyncio.Event()
+    writes = record_markdown_writes(monkeypatch, gate=release)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", lambda s, m: iter(["held"]))
+    async with app.run_test() as pilot:
+        app.query_one("#input", Input).value = "go"
+        await pilot.press("enter")
+        await _wait_until(app, pilot, lambda: writes == ["held"], tries=100)
+        for _ in range(5):
+            await pilot.pause()
+
+        assert app._generating
+        assert app.session.messages == [{"role": "user", "content": "go"}]
+
+        release.set()
+        await _wait_until(app, pilot, lambda: not app._generating, tries=100)
+        assert app.session.messages[-1] == {"role": "assistant", "content": "held"}
+
+
+async def test_waiting_timer_repaints_only_the_label(tmp_path, monkeypatch):
+    """The 1s timer owns the label alone: no Markdown, no reasoning repaint."""
+    app = make_app(tmp_path)
+    writes = record_markdown_writes(monkeypatch)
+    updates = record_static_updates(monkeypatch)
+    gate = threading.Event()
+
+    def silent(settings, messages):
+        gate.wait(5)
+        yield "spoke at last"
+
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", silent)
+    async with app.run_test() as pilot:
+        app.query_one("#input", Input).value = "go"
+        await pilot.press("enter")
+        await _wait_until(
+            app,
+            pilot,
+            lambda: len({t for t in ai_label_updates(updates) if "waiting" in t}) >= 2,
+            tries=100,
+        )
+        # The timer has repainted the label more than once and nothing else
+        # has been touched, because nothing else has arrived yet.
+        assert writes == []
+        assert reasoning_updates(updates) == []
+
+        gate.set()
+        await _wait_until(app, pilot, lambda: not app._generating, tries=100)
+        assert writes == ["spoke at last"]
+
+
+async def test_batched_reasoning_hide_counts_without_mounting_a_bubble(
+    tmp_path, monkeypatch
+):
+    app = make_app(tmp_path, settings=make_settings("hide"))
+    fake, *gates = burst_stream(("reasoning", "hmm "), ("reasoning", "ok"), "4")
+    updates = record_static_updates(monkeypatch)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    async with app.run_test() as pilot:
+        await _run_one_batch(app, pilot, gates, "what is 2+2")
+
+        assert reasoning_updates(updates) == []
+        assert not reasoning_bodies(app)
+        assert any("4" in b for b in bubbles(app))
+
+
+async def test_batched_reasoning_always_renders_the_batch_once(tmp_path, monkeypatch):
+    app = make_app(tmp_path, settings=make_settings("always"))
+    fake, *gates = burst_stream(("reasoning", "hmm "), ("reasoning", "ok"), "4")
+    updates = record_static_updates(monkeypatch)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    async with app.run_test() as pilot:
+        await _run_one_batch(app, pilot, gates, "what is 2+2")
+
+        assert reasoning_bodies(app) == ["hmm ok"]
+        assert reasoning_updates(updates) == ["hmm ok"]  # two deltas, one repaint
+        assert any("4" in b for b in bubbles(app))
+
+
+async def test_batched_reasoning_tail_renders_the_batch_once(tmp_path, monkeypatch):
+    full = "x" * 300 + "tail-marker" + "y" * 900
+    app = make_app(tmp_path, settings=make_settings("tail"))
+    fake, *gates = burst_stream(("reasoning", full[:600]), ("reasoning", full[600:]), "4")
+    updates = record_static_updates(monkeypatch)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    async with app.run_test() as pilot:
+        await _run_one_batch(app, pilot, gates, "what is 2+2")
+
+        assert reasoning_bodies(app) == ["…" + full[-500:]]
+        assert reasoning_updates(updates) == ["…" + full[-500:]]
+        assert any("4" in b for b in bubbles(app))
+
+
+async def test_batched_reasoning_transient_drops_the_bubble_once(tmp_path, monkeypatch):
+    app = make_app(tmp_path)  # transient is the default
+    fake, *gates = burst_stream(("reasoning", "hmm "), ("reasoning", "ok"), "4")
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    async with app.run_test() as pilot:
+        await _run_one_batch(app, pilot, gates, "what is 2+2")
+
+        assert reasoning_bodies(app) == []
+        assert "REASONING" not in labels(app)
+        text = "\n".join(bubbles(app))
+        assert "4" in text and "hmm" not in text
+
+
+async def test_batched_usage_and_unknown_events_keep_the_usage_count(
+    tmp_path, monkeypatch
+):
+    """One batch carrying usage plus a future event kind still reads as usage."""
+    app = make_app(tmp_path)
+    fake, *gates = burst_stream(
+        ("usage", {"prompt_tokens": 512}),
+        "hi",
+        ("some_future_event", {"whatever": True}),
+    )
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    async with app.run_test() as pilot:
+        await _run_one_batch(app, pilot, gates)
+
+        assert app._prompt_tokens == 512
+        assert "AI" in labels(app)  # no timings -> the plain done label
+
+
+async def test_batched_timings_still_reach_the_done_label(tmp_path, monkeypatch):
+    app = make_app(tmp_path)
+    fake, *gates = burst_stream(
+        "hi",
+        ("timings", {"prompt_n": 2048, "prompt_ms": 594.8, "prompt_per_second": 285.8}),
+    )
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    async with app.run_test() as pilot:
+        await _run_one_batch(app, pilot, gates)
+
+        assert app._prompt_tokens == 2048
+        assert any("2,048" in l and "286 t/s" in l for l in labels(app))
+
+
+async def test_batched_provider_error_is_reported_after_its_content(tmp_path, monkeypatch):
+    """A failure enqueued behind content still lands last and still reports."""
+    app = make_app(tmp_path)
+    writes = record_markdown_writes(monkeypatch)
+
+    def failing(settings, messages):
+        yield "partial "
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", failing)
+    async with app.run_test() as pilot:
+        app.query_one("#input", Input).value = "go"
+        await pilot.press("enter")
+        await _wait_until(app, pilot, lambda: not app._generating, tries=100)
+
+        assert writes == ["partial "]
+        assert any(CONNECTION_ERROR in b and "boom" in b for b in bubbles(app))
+        assert app.session.messages == [{"role": "user", "content": "go"}]
+
+
+async def test_manual_scroll_during_a_stream_is_not_overridden(tmp_path, monkeypatch):
+    """Scrolling up mid-stream releases the follow; later chunks stay put."""
+    app = make_app(tmp_path)
+    gate = threading.Event()
+
+    def fake(settings, messages):
+        yield "first paragraph\n\n" * 30
+        gate.wait(5)
+        yield "second paragraph\n\n" * 30
+
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    async with app.run_test(size=(80, 10)) as pilot:
+        app.query_one("#input", Input).value = "go"
+        await pilot.press("enter")
+        chat = app.query_one("#chat")
+        await _wait_until(app, pilot, lambda: chat.max_scroll_y > 5, tries=100)
+
+        chat.scroll_to(y=0, animate=False, immediate=True)
+        await pilot.pause()
+        assert chat.scroll_offset.y == 0
+
+        gate.set()
+        await _wait_until(app, pilot, lambda: not app._generating, tries=100)
+        for _ in range(5):
+            await pilot.pause()
+
+        assert chat.scroll_offset.y == 0
+        assert not at_bottom(chat)
+        assert any("second paragraph" in b for b in bubbles(app))
+
+
+class _UnwritableSession(Session):
+    """A session that keeps messages in memory but always fails to store them."""
+
+    def add(self, role: str, content: str, **kwargs) -> None:
+        super().add(role, content, **kwargs)  # persist=False: memory only
+        raise OSError("disk full")
+
+
+async def test_history_save_failure_is_reported_and_generation_continues(
+    tmp_path, monkeypatch
+):
+    """A failed append warns in the transcript without losing the exchange."""
+    session = _UnwritableSession(tmp_path / "s.jsonl", persist=False)
+    app = make_app(tmp_path, session=session)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", lambda s, m: iter(["ok"]))
+    async with app.run_test() as pilot:
+        app.query_one("#input", Input).value = "hi"
+        await pilot.press("enter")
+        await _wait_until(app, pilot, lambda: not app._generating, tries=100)
+
+        assert any("Could not save history: disk full" in b for b in bubbles(app))
+        assert any("ok" in b for b in bubbles(app))
+        # the exchange is intact for the model, and the warning is not in it
+        assert session.messages_with_system("") == [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "ok"},
+        ]
+
+
+# --- startup transcript mounting -------------------------------------------
+
+
+def history_app(tmp_path, messages, settings=None):
+    """An app whose session already holds ``messages``, with no network I/O."""
+    session = Session(tmp_path / "s.jsonl", persist=False)
+    session.messages = [dict(message) for message in messages]
+    return make_app(
+        tmp_path,
+        settings=settings,
+        session=session,
+        fetch_token_count_fn=lambda s, text: 42,
+    )
+
+
+def record_chat_mounts(monkeypatch) -> tuple[list[int], list[int]]:
+    """Record the widget count of each #chat mount and each #chat scroll_end."""
+    mounts: list[int] = []
+    scrolls: list[int] = []
+    real_mount = VerticalScroll.mount
+    real_scroll_end = VerticalScroll.scroll_end
+
+    def mount(self, *widgets, **kwargs):
+        if self.id == "chat":
+            mounts.append(len(widgets))
+        return real_mount(self, *widgets, **kwargs)
+
+    def scroll_end(self, **kwargs):
+        if self.id == "chat":
+            scrolls.append(len(mounts))
+        return real_scroll_end(self, **kwargs)
+
+    monkeypatch.setattr(VerticalScroll, "mount", mount)
+    monkeypatch.setattr(VerticalScroll, "scroll_end", scroll_end)
+    return mounts, scrolls
+
+
+async def test_startup_renders_every_stored_message_in_order(tmp_path):
+    app = history_app(
+        tmp_path,
+        [
+            {"role": "user", "content": "first"},
+            {"role": "assistant", "content": "second"},
+            {"role": "user", "content": "third"},
+        ],
+    )
+    async with app.run_test() as pilot:
+        await pilot.pause()
+
+        assert bubbles(app) == ["first", "second", "third"]
+        assert labels(app) == ["USER", "ASSISTANT", "USER"]
+
+
+async def test_startup_filters_debug_only_history_unless_debugging(tmp_path):
+    stored = [
+        {"role": "user", "content": "kept"},
+        {"role": "system", "content": "audit", "_debug_only": True},
+        {"role": "assistant", "content": "reply"},
+    ]
+
+    app = history_app(tmp_path, stored)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        assert bubbles(app) == ["kept", "reply"]
+
+    debugging = Settings(
+        base_url="http://host:9000/v1", model="qwen3", debug_level="system"
+    )
+    app = history_app(tmp_path, stored, settings=debugging)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        assert bubbles(app) == ["kept", "audit", "reply"]
+
+
+async def test_startup_mounts_history_once_and_scrolls_once(tmp_path, monkeypatch):
+    """Replaying history costs one mount and one scroll, not one per message."""
+    mounts, scrolls = record_chat_mounts(monkeypatch)
+    app = history_app(
+        tmp_path,
+        [{"role": "user", "content": f"stored {index}"} for index in range(20)],
+    )
+    async with app.run_test() as pilot:
+        await pilot.pause()
+
+        assert mounts == [40]  # 20 labels and 20 bodies, mounted together
+        assert len(scrolls) == 1
+
+        # a live message still gets its own mounted pair and follows the end
+        label, markdown = app.push_message("system", "live")
+        await pilot.pause()
+
+        assert mounts == [40, 2]
+        assert len(scrolls) == 2
+        assert label.is_mounted and markdown.is_mounted
+        assert bubbles(app)[-1] == "live"
+        assert at_bottom(app.query_one("#chat"))
+
+
+async def test_startup_with_no_history_mounts_nothing(tmp_path, monkeypatch):
+    mounts, scrolls = record_chat_mounts(monkeypatch)
+    app = make_app(tmp_path)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+
+        assert mounts == []
+        assert scrolls == []
+
+
+async def test_a_failing_markdown_write_ends_the_turn_instead_of_wedging_it(
+    tmp_path, monkeypatch
+):
+    """A broken renderer must not latch _generating and strand every later send.
+
+    Rendering moved onto the event loop, so there is no longer a provider
+    thread to catch it: without cleanup around the batch loop the spinner keeps
+    ticking, the reply is never recorded, and `_send_message` queues forever.
+    """
+    app = make_app(tmp_path)
+    real_write = MarkdownStream.write
+    calls = {"n": 0}
+
+    async def failing_write(self, markdown_fragment: str) -> None:
+        calls["n"] += 1
+        raise RuntimeError("renderer failed")
+
+    monkeypatch.setattr(MarkdownStream, "write", failing_write)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", lambda s, m: iter(["unrenderable"]))
+    async with app.run_test() as pilot:
+        app.query_one("#input", Input).value = "go"
+        await pilot.press("enter")
+        await _wait_until(app, pilot, lambda: not app._generating, tries=100)
+
+        assert calls["n"] == 1
+        assert app._exception is None
+        assert not app._generating
+        assert not app._tool_rounds_active
+        assert app._queue == []
+        assert any(RENDER_ERROR in b and "renderer failed" in b for b in bubbles(app))
+        # a partially rendered reply is not passed off as the model's turn
+        assert app.session.messages == [{"role": "user", "content": "go"}]
+
+        # the spinner timer is stopped: the final label is not overwritten
+        assert str(ai_label(app).render()) == "AI"
+        for _ in range(15):
+            await pilot.pause(0.1)
+        assert str(ai_label(app).render()) == "AI"
+
+        # and the app is still usable: the next message goes all the way through
+        monkeypatch.setattr(MarkdownStream, "write", real_write)
+        monkeypatch.setattr("jtech_cli.tui.stream_reply", lambda s, m: iter(["ok"]))
+        app.query_one("#input", Input).value = "second"
+        await pilot.press("enter")
+        await _wait_until(
+            app, pilot, lambda: any("ok" in b for b in bubbles(app)), tries=100
+        )
+
+        assert app.session.messages == [
+            {"role": "user", "content": "go"},
+            {"role": "user", "content": "second"},
+            {"role": "assistant", "content": "ok"},
+        ]
+
+
+async def test_a_render_failure_stops_its_provider_before_the_next_turn(
+    tmp_path, monkeypatch
+):
+    """The one exit that never drains _StreamEnd must still end its producer.
+
+    A gated multi-chunk provider keeps running past the render failure. If the
+    turn were released there, the queued message would open a second,
+    overlapping request while the first stream fed an inbox nobody reads.
+    """
+    app = make_app(tmp_path)
+    real_write = MarkdownStream.write
+    released = threading.Event()  # frees the provider parked past the failure
+    entries: list[str] = []
+    generating_while_producing: list[bool] = []
+
+    def provider(settings, messages):
+        entries.append(f"turn-{len(entries) + 1}")
+        if len(entries) > 1:
+            yield "ok"
+            return
+        yield "one"
+        released.wait(5)
+        # read from the provider thread: the turn must still be held here
+        generating_while_producing.append(app._generating)
+        yield "two"
+
+    async def failing_write(self, markdown_fragment: str) -> None:
+        raise RuntimeError("renderer failed")
+
+    monkeypatch.setattr(MarkdownStream, "write", failing_write)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", provider)
+    async with app.run_test() as pilot:
+        app.query_one("#input", Input).value = "go"
+        await pilot.press("enter")
+        await _wait_until(
+            app, pilot, lambda: any(RENDER_ERROR in b for b in bubbles(app)), tries=100
+        )
+
+        # the failure is already reported, but the turn is still held because
+        # its provider is parked mid-stream
+        for _ in range(5):
+            await pilot.pause()
+        assert app._generating
+        assert entries == ["turn-1"]
+
+        # so the next message queues instead of racing the abandoned provider
+        app.query_one("#input", Input).value = "second"
+        await pilot.press("enter")
+        await pilot.pause()
+        assert app._queue == ["second"]
+        assert entries == ["turn-1"]
+
+        monkeypatch.setattr(MarkdownStream, "write", real_write)
+        released.set()
+        await _wait_until(
+            app, pilot, lambda: any("ok" in b for b in bubbles(app)), tries=100
+        )
+
+        assert generating_while_producing == [True]  # never released early
+        assert entries == ["turn-1", "turn-2"]  # the requests never overlapped
+        assert not app._generating
+        assert app._queue == []
+        assert app.session.messages == [
+            {"role": "user", "content": "go"},
+            {"role": "user", "content": "second"},
+            {"role": "assistant", "content": "ok"},
+        ]
