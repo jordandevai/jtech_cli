@@ -10,6 +10,8 @@ from rich.console import Console
 
 from jtech_cli import __version__
 from jtech_cli.config import (
+    ConfigurationError,
+    ProfileError,
     Settings,
     build_settings,
     load_cmd_policy,
@@ -42,6 +44,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def make_settings(args: argparse.Namespace) -> Settings:
+    """Load settings and the profile catalog, applying session-only CLI overrides.
+
+    ``--base-url``/``--model`` become ``Settings.profile_override``: they change
+    what this run talks to without touching the persisted active profile.
+    """
     settings = build_settings(base_url=args.base_url, model=args.model)
     if args.instructions:
         settings.set_prompt_file(args.instructions)
@@ -49,11 +56,11 @@ def make_settings(args: argparse.Namespace) -> Settings:
 
 
 def resolve_settings(args: argparse.Namespace, console: Console) -> Settings:
-    """Return Settings, running the setup wizard when no base_url resolves (or --setup)."""
+    """Return Settings, running the setup wizard when no profile resolves (or --setup)."""
     settings = make_settings(args)
     if args.theme != "auto":
         settings.theme = args.theme
-    if args.setup or not settings.base_url:
+    if args.setup or settings.active_profile is None:
         return run_setup(console, default_url=settings.base_url or None, theme=settings.theme)
     return settings
 
@@ -99,4 +106,11 @@ def main(argv: list[str] | None = None) -> None:
             file=sys.stderr,
         )
         sys.exit(1)
-    make_app(args).run()
+    try:
+        app = make_app(args)
+    except (ConfigurationError, ProfileError) as error:
+        # A bad config is the user's to fix: say what is wrong and stop, rather
+        # than launching against defaults or printing a traceback at them.
+        print(f"jtech-cli: {error}", file=sys.stderr)
+        sys.exit(1)
+    app.run()

@@ -27,16 +27,42 @@ On first launch (no `~/.mycli/config.toml` yet) a setup wizard runs:
 
 ```
 Welcome to JTech CLI! Let's set up your LLM.
-Provider: OpenAI-compatible API (OpenAPI) — the only supported option.
+Provider: OpenAI-compatible API (e.g. llama-server) — the only supported option.
+The URL should look like: http://127.0.0.1:8080/v1
+Configuring profile: default
+Environment variable holding the API key (blank for a local server with no auth):
 Enter server URL: <your url>
 Testing connection...
 Success! Model found: <real model>
 Configuration saved to ~/.mycli/config.toml
 ```
 
-The wizard tests the endpoint by querying `/v1/models`; if it fails it loops back
-to the URL prompt. On success it saves the config. Re-run it anytime with
-`./run.sh --setup`.
+The three fields are the API-key environment variable name, the base URL, and
+the model. The wizard tests the endpoint by querying `/v1/models`; a credential
+failure returns to the API-key field and a connection failure returns to the URL
+field, and nothing is written until one complete, reachable profile has been
+collected. It edits the active profile, or creates `default` on first run.
+Re-run it anytime with `./run.sh --setup`.
+
+The API **key value is never requested, stored, displayed, or logged** — only
+the name of the environment variable that supplies it.
+
+## Profiles
+
+A profile is one OpenAI-compatible endpoint identity:
+
+```text
+name + base_url + model + api_key_env
+```
+
+One installation can keep several and switch between them while running, with
+`/profile NAME` or the `/profiles` manager. The selection persists for the next
+launch. Everything else — theme, temperature, reasoning display, prompt, shell
+policy — stays global.
+
+Switching is only allowed while idle. One user turn (its first reply, every
+command result, and every nudge) always runs against a single endpoint, model,
+and credential, so a mid-turn switch is refused rather than half-applied.
 
 ## Configuration
 
@@ -44,17 +70,46 @@ Defaults come from `~/.mycli/config.toml`, overridden by CLI flags:
 
 ```toml
 [server]
-base_url = "http://your-host:port/v1"
-model = "the-real-model-name"   # optional; auto-discovered if unset
+active_profile = "local"
 temperature = 0.7
 theme = "auto"                  # auto / light / dark; optional
 reasoning = "transient"         # hide / transient / tail / always; optional
 system_prompt = "You are a helpful assistant."   # optional
+
+[profiles.local]
+base_url = "http://127.0.0.1:8080/v1"
+model = "qwen3"                 # optional; auto-discovered if unset
+
+[profiles.cloud]
+base_url = "https://api.example.com/v1"
+model = "cloud-model"
+api_key_env = "CLOUD_API_KEY"   # names the variable, never the key itself
 ```
 
+`api_key_env` names an environment variable that must be set and non-empty when
+that profile is used; requests then carry `Authorization: Bearer <value>`. A
+profile with no `api_key_env` is treated as a local server needing no
+authentication and sends no authorization header. A missing or empty variable is
+reported before any request is made — it is never silently skipped.
+
 If `model` is not set, the CLI queries the endpoint at startup and uses the
-actual served model — no hardcoded/mock names. If the server is unreachable it
-shows no model info rather than a fake one.
+actual served model — no hardcoded/mock names. If the server serves more than
+one model and none is configured, the turn stops with an explicit error instead
+of guessing. If the server is unreachable it shows no model info rather than a
+fake one.
+
+`--base-url` and `--model` override the selected profile **for that run only**;
+they are never written back to the config file, and the status line marks the
+run as `(override)`. Activating a profile with `/profile NAME` clears the
+override.
+
+### Migrating an older config
+
+A pre-profile config — `base_url` and `model` directly under `[server]` — still
+loads: it becomes one profile named `default`, in memory. The file is not
+rewritten until the next intentional settings or profile save, which writes the
+new format. Mixing the two layouts in one file is refused with an explicit
+error rather than resolved by guessing which endpoint was meant.
 
 ## The TUI
 
@@ -84,17 +139,25 @@ shows no model info rather than a fake one.
   queued messages send in order once the reply finishes or is stopped. Press
   `Up` (with an empty input) to pull the next queued message back into the
   input for editing, or clear it to cancel it.
-- **Status bar**: the bottom row of the app (below the input) shows the base
-  URL (no `base_url=` prefix), the active model, context length, and the
-  history file path. It re-renders immediately after settings change.
+- **Status bar**: the bottom row of the app (below the input) shows the active
+  profile name, its base URL (no `base_url=` prefix), the configured or
+  uniquely discovered model, and context length. A `--base-url`/`--model` run
+  is marked `profile: NAME (override)`. It re-renders immediately after
+  settings or profile changes.
 - **Themes**: calm-blue custom themes (`jtech-dark` / `jtech-light`) are
   auto-detected from your terminal's light/dark background (the `COLORFGBG`
   env var), with a single calm blue for primary highlights (input, dialogs,
   links), neutral grays for bubbles and system text, and red only for errors.
   Override with `--theme light|dark`, `/theme`, or the settings dialog.
-- **Connection errors**: an empty or unreachable `base_url` renders a clear
-  notice in the chat (and a startup hint to open `/settings`) instead of a raw
-  stack trace.
+- **Profile manager**: `/profiles` opens a modal to list, add, edit, rename,
+  activate, and delete profiles. Arrow keys move, Enter selects, Esc backs out
+  one step. Deleting the active profile is refused — activate another first, so
+  no endpoint is ever chosen for you. Nothing is probed here: a local server may
+  legitimately be stopped while its profile is edited.
+- **Connection errors**: a missing profile or an unreachable endpoint renders a
+  clear notice in the chat (and a startup hint to open `/profiles`) instead of a
+  raw stack trace. An invalid config file stops startup with one actionable
+  line on stderr rather than launching against defaults.
 
 ## Keys
 
@@ -118,12 +181,14 @@ shows no model info rather than a fake one.
 | `/read PATH[:LINE]` | Print a file with line numbers (`main.py:10-40`) |
 | `/write PATH` | Write content to a file |
 | `/diff PATH` | Create a temp copy of a file to diff against |
-| `/set KEY VALUE` | Change model / base_url / temperature / theme / reasoning |
+| `/set KEY VALUE` | Change a global setting: temperature / theme / reasoning / cmd_mode / debug_level |
 | `/settings` | Open the settings dialog (also Ctrl+S) |
+| `/profiles` | Manage API profiles: list, add, edit, rename, activate, delete |
+| `/profile NAME` | Activate a named API profile (persists for the next launch) |
 | `/theme [MODE]` | Switch theme: auto / light / dark |
 | `/system` | Show current system prompt |
 | `/prompt FILE` | Load a system prompt from a file |
-| `/models` | List models served by the endpoint |
+| `/models` | List models served by the active profile's endpoint |
 | `/stats` | Show history size, tokens, and context usage |
 | `/render` | Re-render the last reply as Markdown |
 
@@ -139,8 +204,9 @@ as globals.
 ```
 jtech_cli/
   cli.py          # composition root: arg parsing + dependency wiring + entry point
-  configuration/  # settings schema, paths, and TOML persistence
+  configuration/  # settings schema, profiles, paths, and TOML persistence
     paths.py
+    profiles.py   # profile identity, catalog rules, credential resolution
     settings.py
     storage.py
   resources/      # static-only package data; no Python modules

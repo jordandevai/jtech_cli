@@ -5,9 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from openai import OpenAI
-
 from jtech_cli.cmd_tools import VALID_CMD_MODES
+from jtech_cli.configuration.profiles import Profile, Profiles
 from jtech_cli.prompts import PromptSourceError, compose_system_prompt, load_prompt_file
 from jtech_cli.resource_loader import load_toml_resource
 from jtech_cli.theme import VALID_THEMES, resolve_theme
@@ -55,14 +54,6 @@ class SettingSpec:
 
 SETTINGS: tuple[SettingSpec, ...] = (
     SettingSpec(
-        "model", "Model",
-        "Name of the model to chat with (see /models for what the server offers)",
-    ),
-    SettingSpec(
-        "base_url", "Base URL",
-        "OpenAI-compatible endpoint, e.g. http://127.0.0.1:8080/v1 (llama-server)",
-    ),
-    SettingSpec(
         "temperature", "Temperature",
         "Sampling randomness, 0.0-2.0. Lower = focused, higher = varied",
     ),
@@ -100,8 +91,17 @@ SETTING_KEYS: tuple[str, ...] = tuple(setting.name for setting in SETTINGS) + (
 
 @dataclass
 class Settings:
-    base_url: str = field(default="")
-    model: str = field(default="")
+    """Global, profile-independent settings plus the profile catalog.
+
+    The endpoint identity lives in :class:`~jtech_cli.configuration.profiles.Profile`
+    values, never in mutable fields here: ``base_url`` and ``model`` are
+    read-only projections of the selected profile, so there is exactly one place
+    an endpoint can be changed.
+    """
+
+    profiles: Profiles = field(default_factory=Profiles)
+    #: A session-only profile from --base-url/--model. Never persisted.
+    profile_override: Profile | None = field(default=None, repr=False)
     temperature: float = DEFAULT_TEMPERATURE
     system_prompt: str = field(default="")
     prompt_source: str = field(default=DEFAULT_PROMPT_SOURCE)
@@ -121,6 +121,30 @@ class Settings:
         # inline instructions; config loading supplies the source explicitly.
         if self.system_prompt and self.prompt_source == DEFAULT_PROMPT_SOURCE:
             self.prompt_source = "inline"
+
+    @property
+    def active_profile(self) -> Profile | None:
+        """The profile this session uses: the CLI override, else the selected one."""
+        if self.profile_override is not None:
+            return self.profile_override
+        return self.profiles.active
+
+    @property
+    def profile_is_overridden(self) -> bool:
+        """True when --base-url/--model replaced the selected profile for this run."""
+        return self.profile_override is not None
+
+    @property
+    def base_url(self) -> str:
+        """Endpoint of the active profile, or ``""`` when none is configured."""
+        profile = self.active_profile
+        return profile.base_url if profile is not None else ""
+
+    @property
+    def model(self) -> str:
+        """Configured model of the active profile (``""`` means auto-discover)."""
+        profile = self.active_profile
+        return profile.model if profile is not None else ""
 
     def set_prompt_inline(self, text: str) -> None:
         """Use ``text`` as extra inline instructions, or reset when empty."""
@@ -162,16 +186,13 @@ class Settings:
             raise PromptSourceError("The selected prompt file has not been loaded")
         return compose_system_prompt(self.system_prompt)
 
-    def make_client(self) -> OpenAI:
-        return OpenAI(base_url=self.base_url, api_key="none", timeout=30, max_retries=0)
-
     def set(self, key: str, value: str) -> None:
-        """Update a setting by name, validating the value."""
-        if key == "model":
-            self.model = value
-        elif key == "base_url":
-            self.base_url = value
-        elif key == "temperature":
+        """Update a global setting by name, validating the value.
+
+        Endpoint and model are not settable here: they belong to a profile and
+        are edited through ``/profiles``.
+        """
+        if key == "temperature":
             try:
                 self.temperature = float(value)
             except ValueError:

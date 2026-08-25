@@ -67,6 +67,7 @@
 }
 
 #settings-dialog,
+#profiles-dialog,
 #cmd-dialog {
     width: 72;
     height: auto;
@@ -76,7 +77,8 @@
     margin: 1 4;
 }
 
-#settings-dialog {
+#settings-dialog,
+#profiles-dialog {
     border: round $primary;
 }
 
@@ -85,6 +87,7 @@
 }
 
 #settings-dialog .dialog-title,
+#profiles-dialog .dialog-title,
 #cmd-dialog .dialog-title {
     text-style: bold;
     text-align: center;
@@ -92,11 +95,14 @@
 }
 
 #settings-rows,
-#settings-editor {
+#settings-editor,
+#profiles-rows,
+#profiles-editor {
     padding: 0 1;
 }
 
-#settings-editor {
+#settings-editor,
+#profiles-editor {
     height: auto;
 }
 
@@ -104,13 +110,15 @@
     height: 5;
 }
 
-#settings-help {
+#settings-help,
+#profiles-help {
     color: $text-muted;
     padding: 0 1;
     margin-top: 1;
 }
 
-#settings-hint {
+#settings-hint,
+#profiles-hint {
     color: $text-muted;
     margin-top: 1;
     text-align: center;

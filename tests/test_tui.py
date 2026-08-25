@@ -4,17 +4,43 @@ import asyncio
 import threading
 import time
 
+import pytest
 from textual.containers import Vertical, VerticalScroll
 from textual.widgets import Input, Markdown, Static, TextArea
 from textual.widgets.markdown import MarkdownStream
 
 from jtech_cli.cmd_tools import CmdPolicy
-from jtech_cli.config import Settings, load_cmd_policy
+from jtech_cli.config import (
+    Profile,
+    ProfileError,
+    Profiles,
+    Settings,
+    load_cmd_policy,
+)
 from jtech_cli.prompts import NUDGE_PROMPT
 from jtech_cli.server_info import ServerInfo
 from jtech_cli.session import Session
-from jtech_cli.tui import CONNECTION_ERROR, ChatApp, CommandPrompt, SettingsScreen
+from jtech_cli.tui import (
+    CONNECTION_ERROR,
+    ChatApp,
+    CommandPrompt,
+    ProfilesScreen,
+    SettingsScreen,
+)
 from jtech_cli.tui_app import RENDER_ERROR, _StreamEnd, _StreamInbox
+
+LOCAL = Profile(name="local", base_url="http://host:9000/v1", model="qwen3")
+
+
+def local_settings(**kwargs) -> Settings:
+    """Settings whose active profile is the default test endpoint."""
+    return Settings(profiles=Profiles(items=(LOCAL,), active_name="local"), **kwargs)
+
+
+def local_settings_with_model(model: str) -> Settings:
+    """Settings whose active profile pins ``model`` explicitly."""
+    profile = Profile(name="local", base_url="http://host:9000/v1", model=model)
+    return Settings(profiles=Profiles(items=(profile,), active_name="local"))
 
 
 def make_app(
@@ -33,7 +59,7 @@ def make_app(
     that starts with history triggers the same thing through the startup token
     count, so those tests inject ``fetch_token_count_fn``.
     """
-    settings = settings or Settings(base_url="http://host:9000/v1", model="qwen3")
+    settings = settings or local_settings()
     session = session or Session(tmp_path / "s.jsonl", persist=False)
     server = server or ServerInfo(models=["qwen3"], context_length=4096)
     return ChatApp(
@@ -47,7 +73,7 @@ def make_app(
 
 
 def make_settings(reasoning: str) -> Settings:
-    return Settings(base_url="http://host:9000/v1", model="qwen3", reasoning=reasoning)
+    return local_settings(reasoning=reasoning)
 
 
 def bubbles(app: ChatApp) -> list[str]:
@@ -83,7 +109,7 @@ def at_bottom(chat) -> bool:
 async def test_submit_shows_user_and_ai_bubble(tmp_path, monkeypatch):
     app = make_app(tmp_path)
     monkeypatch.setattr(
-        "jtech_cli.tui.stream_reply", lambda settings, messages: iter(["hi ", "there"])
+        "jtech_cli.tui.stream_reply", lambda profile, temperature, messages: iter(["hi ", "there"])
     )
     async with app.run_test() as pilot:
         inp = app.query_one("#input", Input)
@@ -116,7 +142,7 @@ async def test_long_code_line_wraps_in_fence(tmp_path, monkeypatch):
     long_word = "z" * 300
     reply = f"```\n{long_word}\nafter-line\n```\n"
     monkeypatch.setattr(
-        "jtech_cli.tui.stream_reply", lambda settings, messages: iter([reply])
+        "jtech_cli.tui.stream_reply", lambda profile, temperature, messages: iter([reply])
     )
     app = make_app(tmp_path)
     async with app.run_test() as pilot:
@@ -139,14 +165,41 @@ async def test_long_code_line_wraps_in_fence(tmp_path, monkeypatch):
         assert visible == len(long_word)
 
 
-async def test_status_bar_omits_base_url_prefix(tmp_path):
+async def test_status_bar_shows_the_profile_url_and_model(tmp_path):
     app = make_app(tmp_path)
     async with app.run_test():
         status = app.query_one("#status", Static).content
     assert "base_url=" not in status
+    assert "profile: local" in status
+    assert "(override)" not in status
     assert "http://host:9000/v1" in status
     assert "model: qwen3" in status
     assert "ctx 4096" in status
+
+
+async def test_status_bar_marks_a_cli_override(tmp_path):
+    settings = local_settings()
+    settings.profile_override = Profile(
+        name="local", base_url="http://override:1/v1", model="override-model"
+    )
+    app = make_app(tmp_path, settings=settings)
+    async with app.run_test():
+        status = app.query_one("#status", Static).content
+    assert "profile: local (override)" in status
+    assert "http://override:1/v1" in status
+    assert "model: override-model" in status
+
+
+async def test_status_bar_shows_a_uniquely_discovered_model(tmp_path):
+    """An empty configured model displays what the server actually serves."""
+    settings = local_settings()
+    settings.profiles = Profiles(
+        items=(Profile(name="local", base_url="http://host:9000/v1"),),
+        active_name="local",
+    )
+    app = make_app(tmp_path, settings=settings)
+    async with app.run_test():
+        assert "model: qwen3" in app.query_one("#status", Static).content
 
 
 async def test_status_bar_empty_base_url(tmp_path):
@@ -160,7 +213,7 @@ async def test_input_responsive_after_connection_error(tmp_path, monkeypatch):
     app = make_app(tmp_path)
     calls = {"n": 0}
 
-    def fake(settings, messages):
+    def fake(profile, temperature, messages):
         calls["n"] += 1
         if calls["n"] == 1:
             raise RuntimeError("boom")
@@ -195,17 +248,20 @@ def settings_help_text(app: ChatApp) -> str:
     return str(app.screen.query_one("#settings-help", Static).render())
 
 
-async def test_settings_screen_opens_and_lists_rows(tmp_path):
+async def test_settings_screen_lists_only_global_settings(tmp_path):
+    """Endpoint and model moved to /profiles; /settings must not offer them."""
     app = make_app(tmp_path)
     async with app.run_test(size=(80, 24)) as pilot:
         app.action_settings()
         await pilot.pause()
         assert isinstance(app.screen, SettingsScreen)
         rows = settings_rows_text(app)
-        assert "Model" in rows
-        assert "Base URL" in rows
+        assert "Temperature" in rows
+        assert "Theme" in rows
         assert "Additional instructions" in rows
-        assert "qwen3" in rows  # current model value shown on its row
+        assert "Model" not in rows
+        assert "Base URL" not in rows
+        assert "qwen3" not in rows
 
         await pilot.press("escape")
         await pilot.pause()
@@ -217,18 +273,18 @@ async def test_settings_description_follows_highlighted_row(tmp_path):
     async with app.run_test(size=(80, 24)) as pilot:
         app.action_settings()
         await pilot.pause()
-        assert "model" in settings_help_text(app).lower()  # Model is row 0
+        assert "0.0-2.0" in settings_help_text(app)  # Temperature is row 0
 
-        await pilot.press("down")  # Base URL
-        await pilot.pause()
-        assert "endpoint" in settings_help_text(app)
-
-        await pilot.press("down", "down")  # Theme
+        await pilot.press("down")  # Theme
         await pilot.pause()
         help_text = settings_help_text(app)
         assert "terminal" in help_text and "light/dark" in help_text
 
-        await pilot.press("up")  # back to Temperature
+        await pilot.press("down")  # Reasoning
+        await pilot.pause()
+        assert "thinking tokens" in settings_help_text(app)
+
+        await pilot.press("up", "up")  # back to Temperature
         await pilot.pause()
         assert "0.0-2.0" in settings_help_text(app)
 
@@ -239,22 +295,22 @@ async def test_settings_enter_edits_row_and_commits(tmp_path):
         app.action_settings()
         await pilot.pause()
 
-        # cursor starts on Model; Enter opens the in-place editor
+        # cursor starts on Temperature; Enter opens the in-place editor
         await pilot.press("enter")
         await pilot.pause()
         field = app.screen.query_one("#settings-field", Input)
-        assert field.value == "qwen3"
+        assert field.value == "0.7"
 
         # the highlighted row's description stays while editing
-        assert "model" in settings_help_text(app).lower()
+        assert "0.0-2.0" in settings_help_text(app)
 
-        field.value = "qwen9"
+        field.value = "0.42"
         await pilot.press("enter")
         await pilot.pause()
-        assert app.settings.model == "qwen9"
+        assert app.settings.temperature == 0.42
         assert (tmp_path / "config.toml").exists()
         assert not app.screen.query_one("#settings-editor", Vertical).children
-        assert "qwen9" in settings_rows_text(app)
+        assert "0.42" in settings_rows_text(app)
 
 
 async def test_settings_invalid_value_keeps_editor_open(tmp_path):
@@ -263,8 +319,7 @@ async def test_settings_invalid_value_keeps_editor_open(tmp_path):
         app.action_settings()
         await pilot.pause()
 
-        await pilot.press("down", "down")  # Temperature is row 2
-        await pilot.pause()
+        # Temperature is row 0
         await pilot.press("enter")
         await pilot.pause()
         field = app.screen.query_one("#settings-field", Input)
@@ -287,7 +342,7 @@ async def test_settings_theme_row_applies_theme_live(tmp_path):
         app.action_settings()
         await pilot.pause()
 
-        await pilot.press("down", "down", "down")  # Theme is row 3
+        await pilot.press("down")  # Theme is row 1
         await pilot.pause()
         await pilot.press("enter")
         await pilot.pause()
@@ -305,13 +360,13 @@ async def test_settings_esc_cancels_edit_then_closes(tmp_path):
         app.action_settings()
         await pilot.pause()
 
-        await pilot.press("enter")  # start editing Model
+        await pilot.press("enter")  # start editing Temperature
         await pilot.pause()
         field = app.screen.query_one("#settings-field", Input)
-        field.value = "changed"
+        field.value = "0.9"
         await pilot.press("escape")  # cancel the edit
         await pilot.pause()
-        assert app.settings.model == "qwen3"
+        assert app.settings.temperature == 0.7
         assert not app.screen.query_one("#settings-editor", Vertical).children
 
         await pilot.press("escape")  # close the menu
@@ -325,7 +380,7 @@ async def test_settings_system_prompt_edits_multiline(tmp_path):
         app.action_settings()
         await pilot.pause()
 
-        await pilot.press("down", "down", "down", "down", "down")  # System prompt is row 5
+        await pilot.press("down", "down", "down")  # System prompt is row 3
         await pilot.pause()
         await pilot.press("enter")
         await pilot.pause()
@@ -340,7 +395,7 @@ async def test_settings_system_prompt_edits_multiline(tmp_path):
 
 async def test_input_works_after_opening_and_closing_settings(tmp_path, monkeypatch):
     app = make_app(tmp_path)
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", lambda settings, messages: iter(["ok"]))
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", lambda profile, temperature, messages: iter(["ok"]))
     async with app.run_test() as pilot:
         app.action_settings()
         await pilot.pause()
@@ -359,10 +414,11 @@ async def test_input_works_after_opening_and_closing_settings(tmp_path, monkeypa
         ]
 
 
-async def test_empty_base_url_shows_notice(tmp_path):
+async def test_no_profile_shows_a_notice_pointing_at_profiles(tmp_path):
     app = make_app(tmp_path, settings=Settings())
     async with app.run_test():
-        assert any("No server configured" in b for b in bubbles(app))
+        assert any("No API profile is configured" in b for b in bubbles(app))
+        assert any("/profiles" in b for b in bubbles(app))
 
 
 async def test_theme_command_applies_theme_live(tmp_path):
@@ -387,7 +443,7 @@ async def test_status_is_last_row_of_root(tmp_path):
 
 async def test_clear_empties_chat(tmp_path, monkeypatch):
     app = make_app(tmp_path)
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", lambda settings, messages: iter(["ok"]))
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", lambda profile, temperature, messages: iter(["ok"]))
     async with app.run_test() as pilot:
         inp = app.query_one("#input", Input)
         inp.value = "hello"
@@ -420,7 +476,7 @@ async def _enter_multiline(app, pilot, trigger: str) -> "TextArea":
 
 async def test_heredoc_multiline_sends_message(tmp_path, monkeypatch):
     app = make_app(tmp_path)
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", lambda s, m: iter(["ok"]))
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", lambda profile, temperature, messages: iter(["ok"]))
     async with app.run_test() as pilot:
         ta = await _enter_multiline(app, pilot, "'''")
         ta.text = "line one\nline two\n'''"
@@ -465,7 +521,7 @@ async def test_multiline_cancel_restores_input(tmp_path):
 
 async def test_shift_enter_opens_prefilled_multiline(tmp_path, monkeypatch):
     app = make_app(tmp_path)
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", lambda s, m: iter(["ok"]))
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", lambda profile, temperature, messages: iter(["ok"]))
     async with app.run_test() as pilot:
         inp = app.query_one("#input", Input)
         inp.value = "first line"
@@ -497,7 +553,7 @@ async def _send_and_drain(app: ChatApp, pilot, text: str) -> None:
         await pilot.pause()
 
 
-def reason_stream(s, m):
+def reason_stream(profile, temperature, messages):
     return iter([("reasoning", "hmm "), ("reasoning", "ok"), "4"])
 
 
@@ -555,7 +611,7 @@ async def test_reasoning_tail_caps_at_500_chars(tmp_path, monkeypatch):
     full = "x" * 300 + "tail-marker" + "y" * 900  # 1213 chars
     app = make_app(tmp_path, settings=make_settings("tail"))
     monkeypatch.setattr(
-        "jtech_cli.tui.stream_reply", lambda s, m: iter([("reasoning", full), "4"])
+        "jtech_cli.tui.stream_reply", lambda profile, temperature, messages: iter([("reasoning", full), "4"])
     )
     async with app.run_test() as pilot:
         await _send_and_drain(app, pilot, "what is 2+2")
@@ -568,7 +624,7 @@ async def test_waiting_label_ticks_without_tokens(tmp_path, monkeypatch):
     """The 1s timer repaints the label in real time even with a silent stream."""
     app = make_app(tmp_path)
 
-    def fake(settings, messages):
+    def fake(profile, temperature, messages):
         time.sleep(1.5)
         yield "ok"
 
@@ -613,7 +669,7 @@ async def test_chat_follows_streaming_reasoning(tmp_path, monkeypatch):
     app = make_app(tmp_path)
     gate = threading.Event()
 
-    def slow_reason(settings, messages):
+    def slow_reason(profile, temperature, messages):
         time.sleep(0.4)  # let the mount-time scroll settle before content arrives
         yield ("reasoning", "thinking out loud " * 20)  # ~320 chars -> several lines
         gate.wait(5)
@@ -665,7 +721,7 @@ async def test_prompt_timings_shown_in_ai_label(tmp_path, monkeypatch):
     app = make_app(tmp_path)
     monkeypatch.setattr(
         "jtech_cli.tui.stream_reply",
-        lambda s, m: iter(
+        lambda profile, temperature, messages: iter(
             ["ok", ("timings", {"prompt_n": 170, "prompt_ms": 594.8, "prompt_per_second": 285.8})]
         ),
     )
@@ -698,7 +754,7 @@ async def test_esc_stops_stream_and_discards_partial(tmp_path, monkeypatch):
     app = make_app(tmp_path)
     gate = threading.Event()
 
-    def fake(settings, messages):
+    def fake(profile, temperature, messages):
         yield "partial "
         gate.wait(5)
         yield "never"
@@ -925,7 +981,7 @@ async def test_enter_while_streaming_queues_then_drains(tmp_path, monkeypatch):
     gate = threading.Event()
     calls = {"n": 0}
 
-    def fake(settings, messages):
+    def fake(profile, temperature, messages):
         calls["n"] += 1
         if calls["n"] == 1:
             yield "r1 "
@@ -979,7 +1035,7 @@ async def test_up_recalls_queued_message_for_editing(tmp_path, monkeypatch):
     gate = threading.Event()
     calls = {"n": 0}
 
-    def fake(settings, messages):
+    def fake(profile, temperature, messages):
         calls["n"] += 1
         if calls["n"] == 1:
             yield "r1 "
@@ -1047,7 +1103,7 @@ async def test_up_with_suggestions_open_prefers_suggestions(tmp_path, monkeypatc
     app = make_app(tmp_path)
     gate = threading.Event()
 
-    def fake(settings, messages):
+    def fake(profile, temperature, messages):
         yield "r1 "
         gate.wait(5)
         yield "r1b"
@@ -1092,7 +1148,7 @@ async def test_queue_drains_in_order(tmp_path, monkeypatch):
     gate = threading.Event()
     calls = {"n": 0}
 
-    def fake(settings, messages):
+    def fake(profile, temperature, messages):
         calls["n"] += 1
         if calls["n"] == 1:
             yield "r1 "
@@ -1137,7 +1193,7 @@ def cmd_stream(first: str, second: str):
     """A stream fake: first call yields commands, next yields the final."""
     calls = {"n": 0}
 
-    def fake(settings, messages):
+    def fake(profile, temperature, messages):
         calls["n"] += 1
         yield (first if calls["n"] == 1 else second)
 
@@ -1155,7 +1211,7 @@ async def test_cmd_auto_allowlist_runs_silently(tmp_path, monkeypatch):
     calls = {"n": 0}
     requests = []
 
-    def fake(settings, messages):
+    def fake(profile, temperature, messages):
         calls["n"] += 1
         requests.append(messages)
         yield command_call("echo hello-out") if calls["n"] == 1 else "done"
@@ -1280,7 +1336,7 @@ async def test_every_command_in_one_reply_runs_in_source_order(tmp_path, monkeyp
     total = 7  # more than the retired five-call cap
     calls = {"n": 0}
 
-    def fake(settings, messages):
+    def fake(profile, temperature, messages):
         calls["n"] += 1
         if calls["n"] == 1:
             yield "\n".join(command_call(f"echo blk-{i}") for i in range(total))
@@ -1311,7 +1367,7 @@ async def test_different_command_rounds_are_not_limited(tmp_path, monkeypatch):
     app = make_app_with_cmd(tmp_path, CmdPolicy(mode="auto", allow=["echo:*"]))
     calls = {"n": 0}
 
-    def fake(settings, messages):
+    def fake(profile, temperature, messages):
         calls["n"] += 1
         if calls["n"] <= 6:
             yield command_call(f"echo round-{calls['n']}")
@@ -1349,7 +1405,7 @@ async def test_repeated_commands_and_results_do_not_stop_the_loop(
     repeats = 4
     calls = {"n": 0}
 
-    def fake(settings, messages):
+    def fake(profile, temperature, messages):
         calls["n"] += 1
         if calls["n"] <= repeats:
             yield command_call("echo unchanged")
@@ -1385,7 +1441,7 @@ async def test_consecutive_empty_replies_are_each_nudged(tmp_path, monkeypatch):
     calls = {"n": 0}
     requests = []
 
-    def fake(settings, messages):
+    def fake(profile, temperature, messages):
         calls["n"] += 1
         requests.append(messages)
         if calls["n"] == 1:
@@ -1426,15 +1482,13 @@ async def test_consecutive_empty_replies_are_each_nudged(tmp_path, monkeypatch):
 
 async def test_nudge_is_shown_in_system_debug_mode(tmp_path, monkeypatch):
     """Debug system mode exposes the ephemeral nudge in the live chat."""
-    settings = Settings(
-        base_url="http://host:9000/v1", model="qwen3", debug_level="system"
-    )
+    settings = local_settings(debug_level="system")
     app = make_app_with_cmd(
         tmp_path, CmdPolicy(mode="auto", allow=["echo:*"]), settings=settings
     )
     calls = {"n": 0}
 
-    def fake(settings, messages):
+    def fake(profile, temperature, messages):
         calls["n"] += 1
         if calls["n"] == 1:
             yield command_call("echo debug-nudge")
@@ -1466,7 +1520,7 @@ async def test_nudge_can_continue_with_an_explicit_command(tmp_path, monkeypatch
     app = make_app_with_cmd(tmp_path, CmdPolicy(mode="auto", allow=["echo:*"]))
     calls = {"n": 0}
 
-    def fake(settings, messages):
+    def fake(profile, temperature, messages):
         calls["n"] += 1
         replies = {
             1: command_call("echo first"),
@@ -1497,7 +1551,7 @@ async def test_final_answer_after_tool_ends_turn_without_repeat(tmp_path, monkey
     app = make_app_with_cmd(tmp_path, CmdPolicy(mode="auto", allow=["pwd:*"]))
     calls = {"n": 0}
 
-    def fake(settings, messages):
+    def fake(profile, temperature, messages):
         calls["n"] += 1
         if calls["n"] == 1:
             yield command_call("pwd")
@@ -1528,7 +1582,7 @@ async def test_command_prefix_commentary_is_preserved_and_tool_round_continues(
     app = make_app_with_cmd(tmp_path, CmdPolicy(mode="auto", allow=["pwd:*"]))
     calls = {"n": 0}
 
-    def fake(settings, messages):
+    def fake(profile, temperature, messages):
         calls["n"] += 1
         if calls["n"] == 1:
             yield command_call("pwd") + "\n\nLet me inspect the project structure next."
@@ -1558,7 +1612,7 @@ async def test_interleaved_commentary_commands_start_one_tool_round(
     app = make_app_with_cmd(tmp_path, CmdPolicy(mode="auto", allow=["echo:*"]))
     calls = {"n": 0}
 
-    def fake(settings, messages):
+    def fake(profile, temperature, messages):
         calls["n"] += 1
         if calls["n"] == 1:
             yield (
@@ -1593,7 +1647,7 @@ async def test_html_wrapped_command_executes_once(tmp_path, monkeypatch):
     app = make_app_with_cmd(tmp_path, CmdPolicy(mode="auto", allow=["pwd:*"]))
     calls = {"n": 0}
 
-    def fake(settings, messages):
+    def fake(profile, temperature, messages):
         calls["n"] += 1
         if calls["n"] == 1:
             yield '<code>\njtech_cmd("pwd")\n</code>'
@@ -1620,7 +1674,7 @@ async def test_clear_during_tool_followup_does_not_crash(tmp_path, monkeypatch):
     gate = threading.Event()
     calls = {"n": 0}
 
-    def fake(settings, messages):
+    def fake(profile, temperature, messages):
         calls["n"] += 1
         if calls["n"] == 1:
             yield command_call("echo clear-out")
@@ -1656,7 +1710,7 @@ async def test_plain_final_answer_ends_turn(tmp_path, monkeypatch):
     app = make_app(tmp_path)
     calls = {"n": 0}
 
-    def fake(settings, messages):
+    def fake(profile, temperature, messages):
         calls["n"] += 1
         yield "all done"
 
@@ -1682,7 +1736,7 @@ async def test_declined_command_ends_tool_turn(tmp_path, monkeypatch):
     app = make_app_with_cmd(tmp_path, CmdPolicy(mode="ask", allow=[]))
     calls = {"n": 0}
 
-    def fake(settings, messages):
+    def fake(profile, temperature, messages):
         calls["n"] += 1
         if calls["n"] == 1:
             yield command_call("echo declined-out")
@@ -1714,7 +1768,7 @@ async def test_blocked_command_ends_tool_turn(tmp_path, monkeypatch):
     app = make_app_with_cmd(tmp_path, CmdPolicy(mode="yolo"))
     calls = {"n": 0}
 
-    def fake(settings, messages):
+    def fake(profile, temperature, messages):
         calls["n"] += 1
         if calls["n"] == 1:
             yield command_call("sudo ls")
@@ -1740,7 +1794,7 @@ async def test_failed_command_result_continues_the_loop(tmp_path, monkeypatch):
     app = make_app_with_cmd(tmp_path, CmdPolicy(mode="yolo"))
     calls = {"n": 0}
 
-    def fake(settings, messages):
+    def fake(profile, temperature, messages):
         calls["n"] += 1
         if calls["n"] == 1:
             yield command_call("echo failing-out; exit 3")
@@ -1772,7 +1826,7 @@ async def test_cmd_timeout_feeds_partial_output(tmp_path, monkeypatch):
     app = make_app_with_cmd(tmp_path, CmdPolicy(mode="yolo", timeout=1))
     calls = {"n": 0}
 
-    def fake(settings, messages):
+    def fake(profile, temperature, messages):
         calls["n"] += 1
         if calls["n"] == 1:
             yield command_call("echo got-far; sleep 5")
@@ -1802,7 +1856,7 @@ async def test_queue_drains_after_esc_stop(tmp_path, monkeypatch):
     gate = threading.Event()
     calls = {"n": 0}
 
-    def fake(settings, messages):
+    def fake(profile, temperature, messages):
         calls["n"] += 1
         if calls["n"] == 1:
             yield "partial "
@@ -1876,7 +1930,7 @@ def _event_stream(*items):
     """A stream yielding exactly ``items``, counting invocations."""
     calls = {"n": 0}
 
-    def fake(settings, messages):
+    def fake(profile, temperature, messages):
         calls["n"] += 1
         yield from items
 
@@ -1985,7 +2039,7 @@ async def test_discovery_does_not_overwrite_an_explicit_model(tmp_path, monkeypa
     )
     app = make_app(
         tmp_path,
-        settings=Settings(base_url="http://host:9000/v1", model="explicit"),
+        settings=local_settings_with_model("explicit"),
         server=ServerInfo(),
         no_discover=False,
     )
@@ -2057,7 +2111,7 @@ def burst_stream(*items):
     release = threading.Event()
     emitted = threading.Event()
 
-    def fake(settings, messages):
+    def fake(profile, temperature, messages):
         entered.set()
         release.wait(5)
         yield from items
@@ -2131,7 +2185,7 @@ async def test_chunks_produced_during_a_blocked_write_are_combined(tmp_path, mon
     produced = threading.Event()
     finished = threading.Event()
 
-    def fake(settings, messages):
+    def fake(profile, temperature, messages):
         yield "A"
         produced.wait(5)  # hold until the first write is in flight
         yield "B"
@@ -2159,7 +2213,7 @@ async def test_markdown_writes_reproduce_the_provider_content(tmp_path, monkeypa
     app = make_app(tmp_path)
     chunks = [f"chunk-{index} " for index in range(60)]
     writes = record_markdown_writes(monkeypatch)
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", lambda s, m: iter(chunks))
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", lambda profile, temperature, messages: iter(chunks))
     async with app.run_test() as pilot:
         app.query_one("#input", Input).value = "go"
         await pilot.press("enter")
@@ -2174,7 +2228,7 @@ async def test_finalization_waits_for_a_blocked_markdown_write(tmp_path, monkeyp
     app = make_app(tmp_path)
     release = asyncio.Event()
     writes = record_markdown_writes(monkeypatch, gate=release)
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", lambda s, m: iter(["held"]))
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", lambda profile, temperature, messages: iter(["held"]))
     async with app.run_test() as pilot:
         app.query_one("#input", Input).value = "go"
         await pilot.press("enter")
@@ -2197,7 +2251,7 @@ async def test_waiting_timer_repaints_only_the_label(tmp_path, monkeypatch):
     updates = record_static_updates(monkeypatch)
     gate = threading.Event()
 
-    def silent(settings, messages):
+    def silent(profile, temperature, messages):
         gate.wait(5)
         yield "spoke at last"
 
@@ -2313,7 +2367,7 @@ async def test_batched_provider_error_is_reported_after_its_content(tmp_path, mo
     app = make_app(tmp_path)
     writes = record_markdown_writes(monkeypatch)
 
-    def failing(settings, messages):
+    def failing(profile, temperature, messages):
         yield "partial "
         raise RuntimeError("boom")
 
@@ -2333,7 +2387,7 @@ async def test_manual_scroll_during_a_stream_is_not_overridden(tmp_path, monkeyp
     app = make_app(tmp_path)
     gate = threading.Event()
 
-    def fake(settings, messages):
+    def fake(profile, temperature, messages):
         yield "first paragraph\n\n" * 30
         gate.wait(5)
         yield "second paragraph\n\n" * 30
@@ -2373,7 +2427,7 @@ async def test_history_save_failure_is_reported_and_generation_continues(
     """A failed append warns in the transcript without losing the exchange."""
     session = _UnwritableSession(tmp_path / "s.jsonl", persist=False)
     app = make_app(tmp_path, session=session)
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", lambda s, m: iter(["ok"]))
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", lambda profile, temperature, messages: iter(["ok"]))
     async with app.run_test() as pilot:
         app.query_one("#input", Input).value = "hi"
         await pilot.press("enter")
@@ -2453,9 +2507,7 @@ async def test_startup_filters_debug_only_history_unless_debugging(tmp_path):
         await pilot.pause()
         assert bubbles(app) == ["kept", "reply"]
 
-    debugging = Settings(
-        base_url="http://host:9000/v1", model="qwen3", debug_level="system"
-    )
+    debugging = local_settings(debug_level="system")
     app = history_app(tmp_path, stored, settings=debugging)
     async with app.run_test() as pilot:
         await pilot.pause()
@@ -2514,7 +2566,7 @@ async def test_a_failing_markdown_write_ends_the_turn_instead_of_wedging_it(
         raise RuntimeError("renderer failed")
 
     monkeypatch.setattr(MarkdownStream, "write", failing_write)
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", lambda s, m: iter(["unrenderable"]))
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", lambda profile, temperature, messages: iter(["unrenderable"]))
     async with app.run_test() as pilot:
         app.query_one("#input", Input).value = "go"
         await pilot.press("enter")
@@ -2537,7 +2589,7 @@ async def test_a_failing_markdown_write_ends_the_turn_instead_of_wedging_it(
 
         # and the app is still usable: the next message goes all the way through
         monkeypatch.setattr(MarkdownStream, "write", real_write)
-        monkeypatch.setattr("jtech_cli.tui.stream_reply", lambda s, m: iter(["ok"]))
+        monkeypatch.setattr("jtech_cli.tui.stream_reply", lambda profile, temperature, messages: iter(["ok"]))
         app.query_one("#input", Input).value = "second"
         await pilot.press("enter")
         await _wait_until(
@@ -2566,7 +2618,7 @@ async def test_a_render_failure_stops_its_provider_before_the_next_turn(
     entries: list[str] = []
     generating_while_producing: list[bool] = []
 
-    def provider(settings, messages):
+    def provider(profile, temperature, messages):
         entries.append(f"turn-{len(entries) + 1}")
         if len(entries) > 1:
             yield "ok"
@@ -2618,3 +2670,517 @@ async def test_a_render_failure_stops_its_provider_before_the_next_turn(
             {"role": "user", "content": "second"},
             {"role": "assistant", "content": "ok"},
         ]
+
+
+# --- profile modal, switching, and turn ownership --------------------------
+
+CLOUD = Profile(
+    name="cloud",
+    base_url="https://api.example.com/v1",
+    model="cloud-model",
+    api_key_env="CLOUD_API_KEY",
+)
+
+
+def two_profile_settings(**kwargs) -> Settings:
+    """A local (unauthenticated) profile plus an authenticated cloud one."""
+    return Settings(
+        profiles=Profiles(items=(LOCAL, CLOUD), active_name="local"), **kwargs
+    )
+
+
+def profiles_rows_text(app: ChatApp) -> str:
+    return str(app.screen.query_one("#profiles-rows", Static).render())
+
+
+def profiles_help_text(app: ChatApp) -> str:
+    return str(app.screen.query_one("#profiles-help", Static).render())
+
+
+def notifications(app: ChatApp) -> list[str]:
+    return [notification.message for notification in app._notifications]
+
+
+def set_field(app: ChatApp, widget_id: str, value: str) -> None:
+    app.screen.query_one(f"#{widget_id}", Input).value = value
+
+
+async def settle(pilot, times: int = 6) -> None:
+    for _ in range(times):
+        await pilot.pause()
+
+
+async def open_profiles(app: ChatApp, pilot) -> None:
+    app.query_one("#input", Input).value = "/profiles"
+    await pilot.press("enter")
+    await settle(pilot)
+
+
+async def test_profiles_modal_lists_every_profile_and_the_active_marker(tmp_path):
+    app = make_app(tmp_path, settings=two_profile_settings())
+    async with app.run_test(size=(80, 30)) as pilot:
+        await open_profiles(app, pilot)
+
+        assert isinstance(app.screen, ProfilesScreen)
+        rows = profiles_rows_text(app)
+        assert "local (active)" in rows
+        assert "cloud" in rows and "cloud (active)" not in rows
+        assert "https://api.example.com/v1" in rows
+        assert "$CLOUD_API_KEY" in rows  # the variable name, never a key value
+        assert ProfilesScreen.ADD_ROW in rows
+
+
+async def test_profiles_modal_does_not_probe_any_endpoint(tmp_path, monkeypatch):
+    """Connectivity is transient; a stopped local server is still editable."""
+    probes = []
+    monkeypatch.setattr(
+        "jtech_cli.tui.fetch_server_info",
+        lambda profile: probes.append(profile) or ServerInfo(),
+    )
+    app = make_app(tmp_path, settings=two_profile_settings())
+    async with app.run_test(size=(80, 30)) as pilot:
+        await open_profiles(app, pilot)
+        await pilot.press("down")
+        await settle(pilot)
+        assert probes == []
+
+
+async def test_profiles_modal_activates_and_persists(tmp_path):
+    app = make_app(tmp_path, settings=two_profile_settings())
+    async with app.run_test(size=(80, 30)) as pilot:
+        await open_profiles(app, pilot)
+        await pilot.press("down")  # cloud
+        await pilot.press("enter")  # actions
+        await settle(pilot)
+        assert "Profile: cloud" in profiles_help_text(app)
+        await pilot.press("enter")  # Activate
+        await settle(pilot)
+
+        assert app.settings.profiles.active_name == "cloud"
+        assert 'active_profile = "cloud"' in (tmp_path / "config.toml").read_text()
+        assert "profile: cloud" in app.query_one("#status", Static).content
+        assert "cloud (active)" in profiles_rows_text(app)
+
+
+async def test_profiles_modal_adds_a_profile_without_activating_it(tmp_path):
+    app = make_app(tmp_path, settings=two_profile_settings())
+    async with app.run_test(size=(80, 30)) as pilot:
+        await open_profiles(app, pilot)
+        await pilot.press("down", "down")  # Add profile…
+        await pilot.press("enter")
+        await settle(pilot)
+
+        set_field(app, "profile-name", "staging")
+        set_field(app, "profile-url", "https://staging.example.com/v1")
+        set_field(app, "profile-key", "STAGING_KEY")
+        await pilot.press("enter")
+        await settle(pilot)
+
+        assert app.settings.profiles.names == ("local", "cloud", "staging")
+        assert app.settings.profiles.active_name == "local"
+        added = app.settings.profiles.get("staging")
+        assert added.model == ""  # blank means auto-discover
+        assert added.api_key_env == "STAGING_KEY"
+        assert "[profiles.staging]" in (tmp_path / "config.toml").read_text()
+
+
+async def test_profiles_modal_edits_and_renames_in_place(tmp_path):
+    app = make_app(tmp_path, settings=two_profile_settings())
+    async with app.run_test(size=(80, 30)) as pilot:
+        await open_profiles(app, pilot)
+        await pilot.press("enter")  # local -> actions
+        await pilot.press("down")  # Edit
+        await pilot.press("enter")
+        await settle(pilot)
+        assert app.screen.query_one("#profile-url", Input).value == "http://host:9000/v1"
+
+        set_field(app, "profile-name", "workstation")
+        set_field(app, "profile-url", "http://renamed:1/v1")
+        await pilot.press("enter")
+        await settle(pilot)
+
+        assert app.settings.profiles.names == ("workstation", "cloud")
+        # a renamed profile that was active stays active
+        assert app.settings.profiles.active_name == "workstation"
+        assert app.settings.profiles.get("workstation").base_url == "http://renamed:1/v1"
+        assert "profile: workstation" in app.query_one("#status", Static).content
+
+
+async def test_profiles_modal_keeps_the_editor_open_on_invalid_input(tmp_path):
+    app = make_app(tmp_path, settings=two_profile_settings())
+    async with app.run_test(size=(80, 30)) as pilot:
+        before = app.settings.profiles
+        await open_profiles(app, pilot)
+        await pilot.press("enter", "down", "enter")  # edit local
+        await settle(pilot)
+
+        set_field(app, "profile-url", "not-a-url")
+        await pilot.press("enter")
+        await settle(pilot)
+
+        assert app.screen.query_one("#profile-url", Input).value == "not-a-url"
+        assert app.settings.profiles is before
+        assert any("base_url" in message for message in notifications(app))
+
+        set_field(app, "profile-url", "http://fixed:1/v1")
+        await pilot.press("enter")
+        await settle(pilot)
+        assert app.settings.profiles.get("local").base_url == "http://fixed:1/v1"
+
+
+async def test_profiles_modal_cancels_an_edit_without_saving(tmp_path):
+    app = make_app(tmp_path, settings=two_profile_settings())
+    async with app.run_test(size=(80, 30)) as pilot:
+        before = app.settings.profiles
+        await open_profiles(app, pilot)
+        await pilot.press("enter", "down", "enter")  # edit local
+        await settle(pilot)
+
+        set_field(app, "profile-url", "http://discarded/v1")
+        await pilot.press("escape")
+        await settle(pilot)
+
+        assert app.settings.profiles is before
+        assert not (tmp_path / "config.toml").exists()
+        assert isinstance(app.screen, ProfilesScreen)  # back to the action list
+
+
+async def test_profiles_modal_deletes_an_inactive_profile_after_confirming(tmp_path):
+    app = make_app(tmp_path, settings=two_profile_settings())
+    async with app.run_test(size=(80, 30)) as pilot:
+        await open_profiles(app, pilot)
+        await pilot.press("down")  # cloud
+        await pilot.press("enter")  # actions
+        await pilot.press("down", "down")  # Delete
+        await pilot.press("enter")  # confirm state
+        await settle(pilot)
+        assert "Delete profile cloud?" in profiles_help_text(app)
+
+        await pilot.press("up")  # Confirm delete (the cursor defaults to Cancel)
+        await pilot.press("enter")
+        await settle(pilot)
+
+        assert app.settings.profiles.names == ("local",)
+        assert "[profiles.cloud]" not in (tmp_path / "config.toml").read_text()
+
+
+async def test_profiles_modal_confirm_defaults_to_cancel(tmp_path):
+    app = make_app(tmp_path, settings=two_profile_settings())
+    async with app.run_test(size=(80, 30)) as pilot:
+        await open_profiles(app, pilot)
+        await pilot.press("down", "enter", "down", "down", "enter")  # cloud -> Delete
+        await settle(pilot)
+        await pilot.press("enter")  # take the default choice
+        await settle(pilot)
+
+        assert app.settings.profiles.names == ("local", "cloud")
+        assert not (tmp_path / "config.toml").exists()
+
+
+async def test_profiles_modal_refuses_to_delete_the_active_profile(tmp_path):
+    app = make_app(tmp_path, settings=two_profile_settings())
+    async with app.run_test(size=(80, 30)) as pilot:
+        await open_profiles(app, pilot)
+        await pilot.press("enter")  # local (active) -> actions
+        await pilot.press("down", "down")  # Delete
+        await pilot.press("enter")
+        await pilot.press("up")  # Confirm delete
+        await pilot.press("enter")
+        await settle(pilot)
+
+        assert app.settings.profiles.names == ("local", "cloud")
+        assert any(
+            "activate another profile" in message for message in notifications(app)
+        )
+
+
+async def test_a_failed_profile_save_keeps_the_modal_open_and_the_old_catalog(tmp_path):
+    (tmp_path / "config.toml").mkdir()  # writing here raises OSError
+    app = make_app(tmp_path, settings=two_profile_settings())
+    async with app.run_test(size=(80, 30)) as pilot:
+        before = app.settings.profiles
+        await open_profiles(app, pilot)
+        await pilot.press("down", "enter", "enter")  # activate cloud
+        await settle(pilot)
+
+        assert app.settings.profiles is before
+        assert app.settings.profiles.active_name == "local"
+        assert notifications(app)
+        # the modal is still open, still on the profile whose save failed
+        assert isinstance(app.screen, ProfilesScreen)
+        assert "Profile: cloud" in profiles_help_text(app)
+
+        await pilot.press("escape")  # back to the list
+        await settle(pilot)
+        assert "local (active)" in profiles_rows_text(app)
+
+
+async def test_switching_profiles_clears_stale_endpoint_state(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLOUD_API_KEY", "sk-secret")
+    app = make_app(tmp_path, settings=two_profile_settings())
+    async with app.run_test() as pilot:
+        app._prompt_tokens = 1234
+        app._render_status()
+        assert "ctx" in app.query_one("#status", Static).content
+
+        app.query_one("#input", Input).value = "/profile cloud"
+        await pilot.press("enter")
+        await settle(pilot)
+
+        assert app.settings.profiles.active_name == "cloud"
+        assert app.server.models == []
+        assert app.server.context_length is None
+        assert app.server.error is None
+        assert app._prompt_tokens == 0
+        assert app.ctx.server is app.server  # cleared in place, not rebound
+        status = app.query_one("#status", Static).content
+        assert "profile: cloud" in status
+        assert "https://api.example.com/v1" in status
+        assert "ctx" not in status
+
+
+async def test_a_stale_discovery_result_is_discarded(tmp_path, monkeypatch):
+    """A slow probe of the previous endpoint must not describe the new one."""
+    monkeypatch.setenv("CLOUD_API_KEY", "sk-secret")
+    app = make_app(tmp_path, settings=two_profile_settings())
+    async with app.run_test() as pilot:
+        await app._switch_profile("cloud")
+        await settle(pilot)
+
+        app._fetch_server_info_fn = lambda profile: ServerInfo(
+            models=["stale"], context_length=999
+        )
+        await app._discover_server(LOCAL)  # a probe started before the switch
+
+        assert app.server.models == []
+        assert app.server.context_length is None
+        assert not any("stale" in bubble for bubble in bubbles(app))
+
+
+async def test_an_unknown_profile_name_reports_without_changing_state(tmp_path):
+    app = make_app(tmp_path, settings=two_profile_settings())
+    async with app.run_test() as pilot:
+        before = app.settings.profiles
+        app.query_one("#input", Input).value = "/profile nope"
+        await pilot.press("enter")
+        await settle(pilot)
+
+        assert app.settings.profiles is before
+        assert app.settings.profiles.active_name == "local"
+        assert not (tmp_path / "config.toml").exists()
+        assert any("No profile named 'nope'" in bubble for bubble in bubbles(app))
+
+
+async def test_switching_clears_a_cli_override_once_stored(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLOUD_API_KEY", "sk-secret")
+    settings = two_profile_settings()
+    settings.profile_override = Profile(
+        name="local", base_url="http://override/v1", model="override-model"
+    )
+    app = make_app(tmp_path, settings=settings)
+    async with app.run_test() as pilot:
+        assert "(override)" in app.query_one("#status", Static).content
+
+        await app._switch_profile("cloud")
+        await settle(pilot)
+
+        assert app.settings.profile_override is None
+        assert app.settings.active_profile == CLOUD
+        assert "(override)" not in app.query_one("#status", Static).content
+
+
+async def test_a_failed_switch_keeps_the_override_and_the_catalog(tmp_path):
+    (tmp_path / "config.toml").mkdir()  # writing here raises OSError
+    settings = two_profile_settings()
+    override = Profile(name="local", base_url="http://override/v1", model="override-model")
+    settings.profile_override = override
+    app = make_app(tmp_path, settings=settings)
+    async with app.run_test() as pilot:
+        before = app.settings.profiles
+        await app._switch_profile("cloud")
+        await settle(pilot)
+
+        assert app.settings.profiles is before
+        assert app.settings.profile_override is override
+        assert any(
+            "Could not save profile selection" in bubble for bubble in bubbles(app)
+        )
+
+
+async def test_a_profile_switch_is_refused_while_streaming(tmp_path, monkeypatch):
+    app = make_app(tmp_path, settings=two_profile_settings())
+    gate = threading.Event()
+
+    def fake(profile, temperature, messages):
+        yield "partial "
+        gate.wait(5)
+        yield "done"
+
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    async with app.run_test() as pilot:
+        await _send_and_drain(app, pilot, "go")
+        await _wait_until(app, pilot, lambda: any("partial" in b for b in bubbles(app)))
+        assert app._generating
+
+        app.query_one("#input", Input).value = "/profile cloud"
+        await pilot.press("enter")
+        await settle(pilot)
+        assert app.settings.profiles.active_name == "local"
+        assert any("Esc to stop it" in bubble for bubble in bubbles(app))
+
+        app._open_profiles()
+        await pilot.pause()
+        assert not isinstance(app.screen, ProfilesScreen)
+
+        gate.set()
+        await _wait_until(app, pilot, lambda: not app._generating)
+
+
+async def test_a_profile_change_is_refused_during_a_tool_round(tmp_path):
+    app = make_app(tmp_path, settings=two_profile_settings())
+    async with app.run_test() as pilot:
+        before = app.settings.profiles
+        app._tool_rounds_active = True
+        try:
+            await app._switch_profile("cloud")
+            await pilot.pause()
+            assert app.settings.profiles is before
+
+            app._open_profiles()
+            await pilot.pause()
+            assert not isinstance(app.screen, ProfilesScreen)
+
+            with pytest.raises(ProfileError):
+                await app._commit_profiles(before.activate("cloud"))
+            assert app.settings.profiles is before
+            assert any("tool round" in bubble for bubble in bubbles(app))
+        finally:
+            app._tool_rounds_active = False
+
+
+async def test_one_autonomous_turn_uses_one_resolved_profile(tmp_path, monkeypatch):
+    """First reply, command continuation, and nudge share one immutable profile."""
+    app = make_app_with_cmd(
+        tmp_path, CmdPolicy(mode="auto", allow=["echo:*"]), settings=two_profile_settings()
+    )
+    seen: list[tuple[object, float]] = []
+    calls = {"n": 0}
+
+    def fake(profile, temperature, messages):
+        calls["n"] += 1
+        seen.append((profile, temperature))
+        if calls["n"] == 1:
+            yield command_call("echo turn-out")
+        elif calls["n"] == 2:
+            yield ""  # empty reply -> a nudge round
+        else:
+            yield "done"
+
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    async with app.run_test() as pilot:
+        await _send_and_drain(app, pilot, "go")
+        await _wait_until(app, pilot, lambda: calls["n"] >= 3, tries=150)
+        await _wait_until(app, pilot, lambda: not app._tool_rounds_active, tries=100)
+
+    assert calls["n"] == 3
+    used = [profile for profile, _ in seen]
+    # the same object, not merely an equal one
+    assert all(profile is used[0] for profile in used)
+    assert used[0].base_url == "http://host:9000/v1"
+    assert used[0].model == "qwen3"
+    assert used[0].api_key == "none"
+    assert {temperature for _, temperature in seen} == {0.7}
+
+
+async def test_the_next_idle_turn_uses_the_newly_activated_profile(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLOUD_API_KEY", "sk-secret")
+    app = make_app(tmp_path, settings=two_profile_settings())
+    seen = []
+
+    def fake(profile, temperature, messages):
+        seen.append(profile)
+        yield "ok"
+
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    async with app.run_test() as pilot:
+        await _send_and_drain(app, pilot, "first")
+        await _wait_until(app, pilot, lambda: len(seen) == 1)
+
+        app.query_one("#input", Input).value = "/profile cloud"
+        await pilot.press("enter")
+        await _wait_until(
+            app, pilot, lambda: app.settings.profiles.active_name == "cloud"
+        )
+
+        await _send_and_drain(app, pilot, "second")
+        await _wait_until(app, pilot, lambda: len(seen) == 2)
+
+    assert seen[0].base_url == "http://host:9000/v1"
+    assert seen[0].api_key == "none"
+    assert seen[1].base_url == "https://api.example.com/v1"
+    assert seen[1].model == "cloud-model"
+    assert seen[1].api_key == "sk-secret"
+    # switching profiles does not clear or fork the conversation
+    assert [m["content"] for m in app.session.messages] == [
+        "first", "ok", "second", "ok",
+    ]
+
+
+async def test_a_missing_credential_stops_before_the_provider_thread(tmp_path, monkeypatch):
+    monkeypatch.delenv("CLOUD_API_KEY", raising=False)
+    settings = Settings(profiles=Profiles(items=(CLOUD,), active_name="cloud"))
+    app = make_app(tmp_path, settings=settings)
+    started = []
+
+    def fake(profile, temperature, messages):
+        started.append(profile)
+        yield "never"
+
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    async with app.run_test() as pilot:
+        await _send_and_drain(app, pilot, "go")
+
+        assert started == []
+        assert any("CLOUD_API_KEY" in bubble for bubble in bubbles(app))
+        assert any("unset or empty" in bubble for bubble in bubbles(app))
+        assert app.session.messages == [{"role": "user", "content": "go"}]
+        assert not app._generating
+
+
+async def test_a_missing_model_stops_before_the_provider_thread(tmp_path, monkeypatch):
+    """No configured model and no unique served model is an error, not a guess."""
+    profile = Profile(name="local", base_url="http://host:9000/v1")
+    settings = Settings(profiles=Profiles(items=(profile,), active_name="local"))
+    app = make_app(
+        tmp_path, settings=settings, server=ServerInfo(models=["one", "two"])
+    )
+    started = []
+
+    def fake(profile, temperature, messages):
+        started.append(profile)
+        yield "never"
+
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    async with app.run_test() as pilot:
+        await _send_and_drain(app, pilot, "go")
+
+        assert started == []
+        assert any("no model configured" in bubble for bubble in bubbles(app))
+        assert not app._generating
+
+
+async def test_a_turn_without_a_profile_reports_instead_of_streaming(tmp_path, monkeypatch):
+    app = make_app(tmp_path, settings=Settings())
+    started = []
+
+    def fake(profile, temperature, messages):
+        started.append(profile)
+        yield "never"
+
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    async with app.run_test() as pilot:
+        await _send_and_drain(app, pilot, "go")
+
+        assert started == []
+        assert any("No API profile is configured" in b for b in bubbles(app))
+        assert not app._generating

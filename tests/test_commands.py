@@ -4,8 +4,21 @@ import pytest
 from rich.console import Console
 
 from jtech_cli.commands import CommandContext, build_registry
-from jtech_cli.config import Settings
+from jtech_cli.config import Profile, ProfileError, Profiles, Settings
 from jtech_cli.session import Session
+
+LOCAL = Profile(name="local", base_url="http://x:1/v1", model="m")
+CLOUD = Profile(
+    name="cloud",
+    base_url="https://api.example.com/v1",
+    model="cloud-model",
+    api_key_env="CLOUD_API_KEY",
+)
+
+
+def local_settings(**kwargs) -> Settings:
+    """Settings with one active local profile."""
+    return Settings(profiles=Profiles(items=(LOCAL,), active_name="local"), **kwargs)
 
 
 async def _multiline_stub(_terminator: str) -> str:
@@ -16,7 +29,7 @@ def make_ctx(tmp_path, multiline=None, settings=None, session=None):
     console = Console(record=True, width=100)
     ctx = CommandContext(
         session=session or Session(tmp_path / "s.jsonl"),
-        settings=settings or Settings(),
+        settings=settings if settings is not None else local_settings(),
         console=console,
         enter_multiline=multiline or _multiline_stub,
         config_path=tmp_path / "config.toml",
@@ -54,17 +67,30 @@ def test_clear_empties_session(tmp_path):
     assert "cleared" in output(console).lower()
 
 
-def test_set_model(tmp_path):
-    settings = Settings()
+@pytest.mark.parametrize("key", ["model", "base_url"])
+def test_set_refuses_endpoint_keys(tmp_path, key):
+    """The endpoint has one route: a profile. /set is not a second one."""
+    settings = local_settings()
     ctx, console = make_ctx(tmp_path, settings=settings)
     reg = build_registry(ctx)
-    reg.handle("/set model qwen3")
-    assert settings.model == "qwen3"
-    assert "model = qwen3" in output(console)
+    reg.handle(f"/set {key} something")
+    assert settings.base_url == "http://x:1/v1"
+    assert settings.model == "m"
+    assert "Unknown setting" in output(console)
+
+
+def test_set_help_no_longer_advertises_endpoint_keys(tmp_path):
+    ctx, console = make_ctx(tmp_path)
+    reg = build_registry(ctx)
+    reg.handle("/set")
+    out = output(console)
+    assert "temperature" in out
+    assert "model" not in out
+    assert "base_url" not in out
 
 
 def test_set_invalid_temperature(tmp_path):
-    settings = Settings()
+    settings = local_settings()
     ctx, console = make_ctx(tmp_path, settings=settings)
     reg = build_registry(ctx)
     reg.handle("/set temperature nope")
@@ -73,7 +99,7 @@ def test_set_invalid_temperature(tmp_path):
 
 
 def test_set_theme(tmp_path):
-    settings = Settings()
+    settings = local_settings()
     ctx, console = make_ctx(tmp_path, settings=settings)
     reg = build_registry(ctx)
     reg.handle("/set theme light")
@@ -82,7 +108,7 @@ def test_set_theme(tmp_path):
 
 
 def test_theme_cycles(tmp_path):
-    settings = Settings()
+    settings = local_settings()
     ctx, console = make_ctx(tmp_path, settings=settings)
     reg = build_registry(ctx)
     reg.handle("/theme")
@@ -125,7 +151,7 @@ def test_clear_calls_clear_chat(tmp_path):
 
 
 def test_clear_does_not_reset_prompt_source(tmp_path):
-    settings = Settings(system_prompt="keep these instructions")
+    settings = local_settings(system_prompt="keep these instructions")
     ctx, _console = make_ctx(tmp_path, settings=settings)
     reg = build_registry(ctx)
     reg.handle("/clear")
@@ -156,7 +182,7 @@ def test_prompt_file_reload_and_reset(tmp_path):
 
 
 def test_set_theme_persists(tmp_path):
-    settings = Settings()
+    settings = local_settings()
     ctx, _console = make_ctx(tmp_path, settings=settings)
     reg = build_registry(ctx)
     reg.handle("/set theme light")
@@ -193,7 +219,7 @@ def test_exit_raises_systemexit(tmp_path):
 
 
 async def test_stats(tmp_path, monkeypatch):
-    monkeypatch.setattr("jtech_cli.server_info.fetch_token_count", lambda settings, text: None)
+    monkeypatch.setattr("jtech_cli.server_info.fetch_token_count", lambda profile, text: None)
     session = Session(tmp_path / "s.jsonl")
     session.add("user", "hello")
     ctx, console = make_ctx(tmp_path, session=session)
@@ -208,7 +234,7 @@ async def test_stats_shows_tokens_and_context(tmp_path, monkeypatch):
     session.add("user", "hello world")
     ctx, console = make_ctx(tmp_path, session=session)
     ctx.server = ServerInfo(models=["m"], context_length=100)
-    monkeypatch.setattr("jtech_cli.server_info.fetch_token_count", lambda settings, text: 3)
+    monkeypatch.setattr("jtech_cli.server_info.fetch_token_count", lambda profile, text: 3)
     reg = build_registry(ctx)
     await reg.handle("/stats")
     out = output(console)
@@ -249,3 +275,142 @@ def test_render_without_reply(tmp_path):
     reg = build_registry(ctx)
     reg.handle("/render")
     assert "No reply" in output(console)
+
+
+# --- profile commands ------------------------------------------------------
+
+
+def test_profiles_calls_open_profiles(tmp_path):
+    opened = []
+    ctx, _console = make_ctx(tmp_path)
+    ctx.open_profiles = lambda: opened.append(True)
+    reg = build_registry(ctx)
+    reg.handle("/profiles")
+    assert opened == [True]
+
+
+async def test_profile_delegates_activation_to_the_app(tmp_path):
+    """Dispatch stays free of settings, storage, and widget work."""
+    switched = []
+    settings = Settings(
+        profiles=Profiles(items=(LOCAL, CLOUD), active_name="local")
+    )
+    ctx, _console = make_ctx(tmp_path, settings=settings)
+
+    async def switch(name):
+        switched.append(name)
+
+    ctx.switch_profile = switch
+    reg = build_registry(ctx)
+    await reg.handle("/profile cloud")
+
+    assert switched == ["cloud"]
+    # the handler itself changed nothing
+    assert settings.profiles.active_name == "local"
+    assert not (tmp_path / "config.toml").exists()
+
+
+async def test_profile_without_a_name_prints_usage_and_the_current_profile(tmp_path):
+    settings = Settings(profiles=Profiles(items=(LOCAL, CLOUD), active_name="local"))
+    ctx, console = make_ctx(tmp_path, settings=settings)
+    called = []
+
+    async def switch(name):
+        called.append(name)
+
+    ctx.switch_profile = switch
+    reg = build_registry(ctx)
+    await reg.handle("/profile")
+
+    out = output(console)
+    assert "Usage: /profile NAME" in out
+    assert "local" in out
+    assert "http://x:1/v1" in out
+    assert "cloud" in out
+    assert called == []
+
+
+async def test_profile_without_a_name_and_no_catalog_says_none(tmp_path):
+    ctx, console = make_ctx(tmp_path, settings=Settings())
+    reg = build_registry(ctx)
+    await reg.handle("/profile")
+    assert "current: none" in output(console)
+
+
+async def test_profile_with_an_unknown_name_still_delegates(tmp_path):
+    """The app owns the unknown-name error; dispatch must not second-guess it."""
+    settings = local_settings()
+    ctx, console = make_ctx(tmp_path, settings=settings)
+
+    async def switch(name):
+        ctx.console.print(f"[red]No profile named {name!r}[/red]")
+
+    ctx.switch_profile = switch
+    reg = build_registry(ctx)
+    await reg.handle("/profile nope")
+
+    assert "No profile named 'nope'" in output(console)
+    assert settings.profiles.active_name == "local"
+
+
+def test_profile_commands_appear_in_help(tmp_path):
+    ctx, console = make_ctx(tmp_path)
+    reg = build_registry(ctx)
+    reg.handle("/help")
+    out = output(console)
+    assert "/profiles" in out
+    assert "/profile" in out
+
+
+# --- /stats against the selected profile -----------------------------------
+
+
+async def test_stats_counts_tokens_against_the_selected_profile(tmp_path, monkeypatch):
+    seen = []
+    monkeypatch.setattr(
+        "jtech_cli.server_info.fetch_token_count",
+        lambda profile, text: seen.append(profile) or 5,
+    )
+    session = Session(tmp_path / "s.jsonl")
+    session.add("user", "hello")
+    settings = Settings(profiles=Profiles(items=(LOCAL, CLOUD), active_name="cloud"))
+    ctx, console = make_ctx(tmp_path, session=session, settings=settings)
+    reg = build_registry(ctx)
+    await reg.handle("/stats")
+
+    assert seen == [CLOUD]
+    assert "history_tokens=5" in output(console)
+
+
+async def test_stats_reports_a_missing_profile_instead_of_zero_tokens(tmp_path):
+    session = Session(tmp_path / "s.jsonl")
+    session.add("user", "hello")
+    ctx, console = make_ctx(tmp_path, session=session, settings=Settings())
+    reg = build_registry(ctx)
+    await reg.handle("/stats")
+
+    out = output(console)
+    assert "messages=1" in out
+    assert "No API profile is configured" in out
+    assert "history_tokens" not in out
+
+
+async def test_stats_surfaces_a_credential_error(tmp_path, monkeypatch):
+    def boom(profile, text):
+        raise ProfileError(
+            "Profile 'cloud' reads its API key from $CLOUD_API_KEY, which is "
+            "unset or empty in this environment"
+        )
+
+    monkeypatch.setattr("jtech_cli.server_info.fetch_token_count", boom)
+    session = Session(tmp_path / "s.jsonl")
+    session.add("user", "hello")
+    settings = Settings(profiles=Profiles(items=(CLOUD,), active_name="cloud"))
+    ctx, console = make_ctx(tmp_path, session=session, settings=settings)
+    reg = build_registry(ctx)
+    await reg.handle("/stats")
+
+    out = output(console)
+    assert "messages=1" in out
+    assert "CLOUD_API_KEY" in out
+    assert "history_tokens" not in out

@@ -77,13 +77,14 @@ def test_custom_theme_objects():
 
 
 async def test_custom_themes_registered_and_available(tmp_path):
-    from jtech_cli.config import Settings
+    from jtech_cli.config import Profile, Profiles, Settings
     from jtech_cli.server_info import ServerInfo
     from jtech_cli.session import Session
     from jtech_cli.tui import ChatApp
 
+    profile = Profile(name="local", base_url="http://host:9000/v1", model="qwen3")
     app = ChatApp(
-        settings=Settings(base_url="http://host:9000/v1", model="qwen3"),
+        settings=Settings(profiles=Profiles(items=(profile,), active_name="local")),
         session=Session(tmp_path / "s.jsonl", persist=False),
         server=ServerInfo(models=["qwen3"], context_length=4096),
         config_path=tmp_path / "config.toml",

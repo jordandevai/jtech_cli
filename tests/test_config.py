@@ -5,6 +5,9 @@ import pytest
 from jtech_cli.cmd_tools import DEFAULT_ALLOW, CmdPolicy
 from jtech_cli.config import (
     DEFAULT_TEMPERATURE,
+    ConfigurationError,
+    Profile,
+    Profiles,
     Settings,
     build_settings,
     load_cmd_policy,
@@ -14,10 +17,20 @@ from jtech_cli.config import (
 )
 from jtech_cli.prompts import DEFAULT_SYSTEM_PROMPT, PromptSourceError
 
+LOCAL = Profile(name="local", base_url="http://x:1/v1", model="m")
+
+
+def settings_with(**kwargs) -> Settings:
+    """Settings carrying one active profile, so saves have an endpoint to write."""
+    return Settings(profiles=Profiles(items=(LOCAL,), active_name="local"), **kwargs)
+
 
 def test_defaults():
     s = Settings()
-    assert s.base_url == ""
+    assert s.profiles == Profiles()
+    assert s.active_profile is None
+    assert s.profile_is_overridden is False
+    assert s.base_url == ""  # read-only projection of "no profile"
     assert s.model == ""
     assert s.temperature == 0.7
     assert s.system_prompt == ""
@@ -30,14 +43,10 @@ def test_defaults():
 
 def test_set_valid_keys():
     s = Settings()
-    s.set("model", "my-model")
-    s.set("base_url", "http://host:9000/v1")
     s.set("temperature", "0.1")
     s.set("theme", "light")
     s.set("reasoning", "always")
     s.set("cmd_mode", "yolo")
-    assert s.model == "my-model"
-    assert s.base_url == "http://host:9000/v1"
     assert s.temperature == 0.1
     assert s.theme == "light"
     assert s.reasoning == "always"
@@ -58,6 +67,9 @@ def test_set_cmd_mode_invalid_raises():
         ("bogus", "x"),
         ("theme", "blue"),
         ("reasoning", "sometimes"),
+        # Endpoint and model belong to a profile: /set is not a second route.
+        ("model", "my-model"),
+        ("base_url", "http://host:9000/v1"),
     ],
 )
 def test_set_invalid_raises(key, value):
@@ -66,10 +78,14 @@ def test_set_invalid_raises(key, value):
         s.set(key, value)
 
 
-def test_make_client_uses_base_url():
-    s = Settings(base_url="http://example.com:1234/v1")
-    client = s.make_client()
-    assert str(client.base_url) == "http://example.com:1234/v1/"
+def test_endpoint_projections_are_read_only():
+    """One source of truth: nothing can assign an endpoint onto Settings."""
+    s = settings_with()
+    assert s.base_url == "http://x:1/v1"
+    with pytest.raises(AttributeError):
+        s.base_url = "http://elsewhere/v1"
+    with pytest.raises(AttributeError):
+        s.model = "other"
 
 
 def test_load_config_overrides_missing(tmp_path):
@@ -77,16 +93,17 @@ def test_load_config_overrides_missing(tmp_path):
 
 
 def test_load_config_overrides_valid(tmp_path):
+    """Only global settings live in [server]; the endpoint is not one of them."""
     path = tmp_path / "config.toml"
-    path.write_text('[server]\nbase_url = "http://x:1/v1"\nmodel = "real-model"\ntemperature = 0.2\n')
-    overrides = load_config_overrides(path)
-    assert overrides == {"base_url": "http://x:1/v1", "model": "real-model", "temperature": 0.2}
+    path.write_text('[server]\nbase_url = "http://x:1/v1"\ntemperature = 0.2\ntheme = "light"\n')
+    assert load_config_overrides(path) == {"temperature": 0.2, "theme": "light"}
 
 
-def test_load_config_overrides_ignores_bad_toml(tmp_path):
+def test_load_config_overrides_rejects_bad_toml(tmp_path):
     path = tmp_path / "config.toml"
     path.write_text("not = toml [[")
-    assert load_config_overrides(path) == {}
+    with pytest.raises(ConfigurationError):
+        load_config_overrides(path)
 
 
 def test_build_settings_precedence(tmp_path):
@@ -96,10 +113,11 @@ def test_build_settings_precedence(tmp_path):
     s = build_settings(config_path=path)
     assert s.base_url == "http://cfg:1/v1"
     assert s.model == "cfg-model"
-    # explicit args win over config file
+    # explicit args win over config file, without touching the stored profile
     s2 = build_settings(base_url="http://cli:2/v1", model="cli-model", config_path=path)
     assert s2.base_url == "http://cli:2/v1"
     assert s2.model == "cli-model"
+    assert s2.profiles.get("default").base_url == "http://cfg:1/v1"
 
 
 def test_resolve_default_prompt_keeps_runtime_prompt_out_of_saved_settings():
@@ -134,9 +152,7 @@ def test_messages_with_system_empty_prompt_sends_none():
 
 def test_save_settings_roundtrip(tmp_path):
     path = tmp_path / "config.toml"
-    s = Settings(
-        base_url="http://x:1/v1",
-        model="m",
+    s = settings_with(
         temperature=0.5,
         system_prompt='line1\nline2 "quoted"',
     )
@@ -214,7 +230,7 @@ def test_reset_prompt_returns_to_bundled_runtime(tmp_path):
 
 def test_save_settings_theme_roundtrip(tmp_path):
     path = tmp_path / "config.toml"
-    s = Settings(base_url="http://x:1/v1", model="m", theme="light")
+    s = settings_with(theme="light")
     save_settings(s, path, cmd=CmdPolicy())
     loaded = build_settings(config_path=path)
     assert loaded.theme == "light"
@@ -222,7 +238,7 @@ def test_save_settings_theme_roundtrip(tmp_path):
 
 def test_save_settings_reasoning_roundtrip(tmp_path):
     path = tmp_path / "config.toml"
-    s = Settings(base_url="http://x:1/v1", model="m", reasoning="always")
+    s = settings_with(reasoning="always")
     save_settings(s, path, cmd=CmdPolicy())
     loaded = build_settings(config_path=path)
     assert loaded.reasoning == "always"
@@ -230,7 +246,7 @@ def test_save_settings_reasoning_roundtrip(tmp_path):
 
 def test_save_settings_omits_default_reasoning(tmp_path):
     path = tmp_path / "config.toml"
-    s = Settings(base_url="http://x:1/v1", model="m")
+    s = settings_with()
     save_settings(s, path, cmd=CmdPolicy())
     assert "reasoning" not in path.read_text()
 
@@ -253,7 +269,7 @@ def test_build_settings_bad_reasoning_falls_back_to_default(tmp_path):
 )
 def test_save_settings_control_chars_roundtrip(tmp_path, prompt):
     path = tmp_path / "config.toml"
-    s = Settings(base_url="http://x:1/v1", system_prompt=prompt)
+    s = settings_with(system_prompt=prompt)
     save_settings(s, path, cmd=CmdPolicy())
     loaded = build_settings(config_path=path)
     assert loaded.system_prompt == prompt
@@ -298,7 +314,7 @@ def test_load_cmd_policy_invalid_falls_back(tmp_path):
 
 def test_save_settings_with_cmd_roundtrip(tmp_path):
     path = tmp_path / "config.toml"
-    s = Settings(base_url="http://x:1/v1", model="m", cmd_mode="auto")
+    s = settings_with(cmd_mode="auto")
     cmd = CmdPolicy(mode="auto", allow=["ls:*", "git status:*"], timeout=30, max_output=2000)
     save_settings(s, path, cmd=cmd)
     text = path.read_text()
@@ -316,7 +332,7 @@ def test_save_settings_requires_a_cmd_policy(tmp_path):
     """Omitting the policy is a TypeError, never a silent wipe of [cmd]."""
     path = tmp_path / "config.toml"
     with pytest.raises(TypeError):
-        save_settings(Settings(base_url="http://x:1/v1"), path)
+        save_settings(settings_with(), path)
 
 
 @pytest.mark.parametrize(
@@ -353,12 +369,12 @@ def test_persist_settings_syncs_cmd_mode_without_a_policy_in_hand(tmp_path):
 
     path = tmp_path / "config.toml"
     save_settings(
-        Settings(base_url="http://x:1/v1"), path,
+        settings_with(), path,
         cmd=CmdPolicy(mode="ask", allow=["cargo build:*"], timeout=7),
     )
     ctx = CommandContext(
         session=Session(tmp_path / "s.jsonl", persist=False),
-        settings=Settings(base_url="http://x:1/v1", cmd_mode="yolo"),
+        settings=settings_with(cmd_mode="yolo"),
         console=Console(record=True, width=100),
         cmd=None,
         config_path=path,

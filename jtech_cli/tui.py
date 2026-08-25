@@ -11,7 +11,7 @@ from pathlib import Path
 
 from jtech_cli import server_info
 from jtech_cli.cmd_tools import CmdPolicy
-from jtech_cli.config import CONFIG_PATH, Settings
+from jtech_cli.config import CONFIG_PATH, Profile, ResolvedProfile, Settings
 from jtech_cli.llm_client import stream_reply
 from jtech_cli.server_info import ServerInfo, fetch_server_info
 from jtech_cli.session import Session
@@ -25,7 +25,12 @@ from jtech_cli.tui_app import (
 from jtech_cli.tui_app import (
     ChatApp as _ChatApp,
 )
-from jtech_cli.tui_screens import CmdChoice, CommandPrompt, SettingsScreen
+from jtech_cli.tui_screens import (
+    CmdChoice,
+    CommandPrompt,
+    ProfilesScreen,
+    SettingsScreen,
+)
 from jtech_cli.tui_widgets import (
     FieldCancel,
     FieldCommit,
@@ -37,19 +42,21 @@ from jtech_cli.tui_widgets import (
 )
 
 
-def _stream_reply_compat(settings: Settings, messages: list[dict]):
+def _stream_reply_compat(
+    profile: ResolvedProfile, temperature: float, messages: list[dict]
+):
     """Late-bound stream seam retained for existing callers and tests."""
-    yield from stream_reply(settings, messages)
+    yield from stream_reply(profile, temperature, messages)
 
 
-def _fetch_server_info_compat(settings: Settings) -> ServerInfo:
+def _fetch_server_info_compat(profile: Profile) -> ServerInfo:
     """Late-bound discovery seam retained for existing callers and tests."""
-    return fetch_server_info(settings)
+    return fetch_server_info(profile)
 
 
-def _fetch_token_count_compat(settings: Settings, text: str) -> int | None:
+def _fetch_token_count_compat(profile: Profile, text: str) -> int | None:
     """Late-bound token-count seam retained for existing callers and tests."""
-    return server_info.fetch_token_count(settings, text)
+    return server_info.fetch_token_count(profile, text)
 
 
 class ChatApp(_ChatApp):
@@ -103,6 +110,7 @@ __all__ = [
     "MultilineCancel",
     "MultilineSubmit",
     "OutputSink",
+    "ProfilesScreen",
     "SettingsScreen",
     "fetch_server_info",
     "render_menu_rows",

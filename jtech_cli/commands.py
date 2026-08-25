@@ -22,6 +22,7 @@ from jtech_cli.cmd_tools import CmdPolicy
 from jtech_cli.config import (
     CONFIG_PATH,
     SETTABLE_KEYS,
+    ProfileError,
     Settings,
     load_cmd_policy,
     save_settings,
@@ -31,14 +32,20 @@ from jtech_cli.session import Session
 from jtech_cli.theme import VALID_THEMES
 
 EnterMultiline = Callable[[str], Awaitable[str]]
+SwitchProfile = Callable[[str], Awaitable[None]]
 Handler = Callable[["CommandContext", str], None | Awaitable[None]]
 
 WRITE_USAGE = "Usage: /write PATH  then paste content, end with a line containing only: END"
+NO_PROFILE = "No API profile is configured — run /profiles to add one."
 
 
 async def _no_multiline(_terminator: str) -> str:
     """Default multi-line reader: no editor available (standalone/test contexts)."""
     return ""
+
+
+async def _no_profile_switch(_name: str) -> None:
+    """Default profile switch: no running app to switch in (standalone/tests)."""
 
 
 @dataclass
@@ -55,6 +62,8 @@ class CommandContext:
     open_settings: Callable[[], None] = field(default=lambda: None)
     clear_chat: Callable[[], None] = field(default=lambda: None)
     switch_theme: Callable[[], None] = field(default=lambda: None)
+    open_profiles: Callable[[], None] = field(default=lambda: None)
+    switch_profile: SwitchProfile = _no_profile_switch
 
     def persist_settings(self) -> None:
         try:
@@ -163,6 +172,27 @@ def build_registry(ctx: CommandContext) -> CommandRegistry:
     def cmd_settings(_: CommandContext, __: str) -> None:
         ctx.open_settings()
 
+    def cmd_profiles(_: CommandContext, __: str) -> None:
+        ctx.open_profiles()
+
+    async def cmd_profile(_: CommandContext, arg: str) -> None:
+        """Activate one named profile, delegating the switch to the app.
+
+        Dispatch stays free of settings, storage, network, and widget work: the
+        app owns when a switch is allowed and what it invalidates.
+        """
+        name = arg.strip()
+        if not name:
+            active = ctx.settings.active_profile
+            current = f"{active.name} ({active.base_url})" if active else "none"
+            configured = ", ".join(ctx.settings.profiles.names) or "none"
+            c.print(
+                f"Usage: /profile NAME   ·   current: {current}   ·   "
+                f"configured: {configured}"
+            )
+            return
+        await ctx.switch_profile(name)
+
     def cmd_theme(_: CommandContext, arg: str) -> None:
         choice = arg.strip().lower()
         if choice not in VALID_THEMES:
@@ -224,12 +254,21 @@ def build_registry(ctx: CommandContext) -> CommandRegistry:
         text = " ".join(
             m["content"] for m in ctx.session.messages_with_system("")
         )
+        total: int | None = 0
+        # A missing profile or credential is reported, never folded into an
+        # empty token count that would read as "the server said zero".
+        note: str | None = None
         if text:
-            total: int | None = await asyncio.to_thread(
-                server_info.fetch_token_count, ctx.settings, text
-            )
-        else:
-            total = 0
+            profile = ctx.settings.active_profile
+            if profile is None:
+                total, note = None, NO_PROFILE
+            else:
+                try:
+                    total = await asyncio.to_thread(
+                        server_info.fetch_token_count, profile, text
+                    )
+                except ProfileError as error:
+                    total, note = None, str(error)
         if total is not None:
             lines.append(f"history_tokens={total}")
         if ctx.server.context_length:
@@ -239,6 +278,8 @@ def build_registry(ctx: CommandContext) -> CommandRegistry:
                 lines.append(f"context_remaining={ctx_length - total}")
 
         c.print("  ".join(lines))
+        if note:
+            c.print(f"[yellow]{note}[/yellow]")
 
     def cmd_render(_: CommandContext, __: str) -> None:
         if not ctx.last_reply:
@@ -257,6 +298,8 @@ def build_registry(ctx: CommandContext) -> CommandRegistry:
         ("diff", cmd_diff, "Create a temp copy of a file to diff against"),
         ("set", cmd_set, f"Change {', '.join(SETTABLE_KEYS)}"),
         ("settings", cmd_settings, "Interactive menu to edit settings"),
+        ("profiles", cmd_profiles, "Manage API profiles: add, edit, activate, delete"),
+        ("profile", cmd_profile, "Activate a named API profile: /profile NAME"),
         ("theme", cmd_theme, f"Switch theme: {' / '.join(VALID_THEMES)}"),
         ("system", cmd_system, "Show current system prompt"),
         ("prompt", cmd_prompt, "Load a system prompt from a file"),

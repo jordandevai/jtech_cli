@@ -6,14 +6,17 @@ Available slash commands:
   /read PATH[:LINE]  Print a file with line numbers. Line range like main.py:10-40 or main.py:10
   /write PATH        Write content to a file. Paste content, then end with a line containing only: END
   /diff PATH         Show a diff between PATH and a temp copy (useful before applying changes)
-  /set KEY VALUE     Change settings, e.g. /set model m, /set theme light, /set reasoning tail
+  /set KEY VALUE     Change a global setting: temperature, theme, reasoning, cmd_mode,
+                     debug_level. The endpoint and model belong to a profile, not here.
   /settings          Open the settings menu (also Ctrl+S): ↑/↓ rows, Enter edits, Esc closes
+  /profiles          Manage API profiles: list, add, edit, rename, activate, delete
+  /profile NAME      Activate a named API profile; the choice persists for the next launch
   /theme [MODE]      Switch theme: auto, light, or dark (no arg cycles)
   /system            Print the effective prompt and its source
   /prompt FILE       Load and persist an additional prompt file
   /prompt reload     Reload the selected prompt file
   /prompt reset      Return to the bundled runtime prompt
-  /models            List models served by the endpoint
+  /models            List models served by the active profile's endpoint
   /stats             Show history size, tokens, and context usage
   /render            Re-render the last reply as Markdown
 
@@ -45,6 +48,16 @@ Keys:
   Ctrl+S             Open settings dialog
   Ctrl+Q / Ctrl+C    Quit
   Ctrl+L             Clear the chat
+
+API profiles:
+  A profile is one OpenAI-compatible endpoint identity: name, base URL, model,
+  and the name of the environment variable holding its API key. The key value
+  itself is never stored in the config file, shown, or logged; a profile with no
+  variable set is treated as a local server needing no authentication. Leave the
+  model blank to use the single model the server reports. The status line shows
+  the active profile, its URL, and its model. Switching profiles is only allowed
+  while idle: one user turn — its first reply, every command result, and every
+  nudge — always runs against one endpoint, model, and credential.
 
 Replies render as live Markdown bubbles (the AI label shows a spinner and
 live character count while streaming). The status line is the bottom row.

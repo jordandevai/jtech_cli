@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
+import os
 import subprocess
 import threading
 import time
@@ -30,13 +32,27 @@ from jtech_cli.cmd_tools import (
     truncate_output,
 )
 from jtech_cli.commands import CommandContext, build_registry
-from jtech_cli.config import CONFIG_PATH, Settings, save_settings
+from jtech_cli.config import (
+    CONFIG_PATH,
+    Profile,
+    ProfileError,
+    Profiles,
+    ResolvedProfile,
+    Settings,
+    resolve_profile,
+    save_settings,
+)
 from jtech_cli.llm_client import StreamItem, stream_reply
 from jtech_cli.prompts import COMMAND_DECLINED_PROMPT, NUDGE_PROMPT
 from jtech_cli.server_info import ServerInfo, fetch_server_info
 from jtech_cli.session import Session
 from jtech_cli.theme import JTECH_DARK, JTECH_LIGHT, textual_theme_name
-from jtech_cli.tui_screens import CmdChoice, CommandPrompt, SettingsScreen
+from jtech_cli.tui_screens import (
+    CmdChoice,
+    CommandPrompt,
+    ProfilesScreen,
+    SettingsScreen,
+)
 from jtech_cli.tui_widgets import (
     InputToMultiline,
     MultilineCancel,
@@ -47,13 +63,16 @@ from jtech_cli.tui_widgets import (
     render_menu_rows,
 )
 
-CONNECTION_ERROR = "Connection failed — check base_url in /settings"
+CONNECTION_ERROR = "Connection failed — check the endpoint in /profiles"
 RENDER_ERROR = "Could not render the reply — it was not added to the conversation"
+NO_PROFILE = "No API profile is configured — run /profiles to add one."
+BUSY_GENERATING = "A reply is streaming — press Esc to stop it before changing profiles."
+BUSY_TOOL_ROUND = "A tool round is running — wait for it to finish before changing profiles."
 SPINNER_FRAMES = "-\\|/"
 
-StreamReply = Callable[[Settings, list[dict]], Iterator[StreamItem]]
-FetchServerInfo = Callable[[Settings], ServerInfo]
-FetchTokenCount = Callable[[Settings, str], int | None]
+StreamReply = Callable[[ResolvedProfile, float, list[dict]], Iterator[StreamItem]]
+FetchServerInfo = Callable[[Profile], ServerInfo]
+FetchTokenCount = Callable[[Profile, str], int | None]
 
 
 @dataclass(frozen=True)
@@ -187,6 +206,8 @@ class ChatApp(App):
             open_settings=self._open_settings,
             clear_chat=self._clear_chat,
             switch_theme=self._switch_theme,
+            open_profiles=self._open_profiles,
+            switch_profile=self._switch_profile,
         )
         self.commands = build_registry(self.ctx)
         self._suggestions: list[tuple[str, str]] = []
@@ -218,10 +239,9 @@ class ChatApp(App):
             chat = self.query_one("#chat", VerticalScroll)
             await chat.mount(*history)
             chat.scroll_end(animate=False)
-        if not self.settings.base_url:
-            self.push_message(
-                "system", "No server configured — run /settings to set base_url and model."
-            )
+        profile = self.settings.active_profile
+        if profile is None:
+            self.push_message("system", NO_PROFILE)
         if self.settings.prompt_notice:
             self.push_message("system", self.settings.prompt_notice)
         self.query_one("#suggestions", Static).display = False
@@ -229,23 +249,31 @@ class ChatApp(App):
         self._focus_input()
         if self.session.messages and self.server.context_length:
             await self._init_token_count()
-        if not self._no_discover and self.settings.base_url:
-            self.call_later(self._discover_server)
+        if not self._no_discover and profile is not None:
+            self.call_later(self._discover_server, profile)
 
-    async def _discover_server(self) -> None:
-        """Refresh server metadata in place without downgrading known values."""
-        info = await asyncio.to_thread(self._fetch_server_info_fn, self.settings)
+    async def _discover_server(self, profile: Profile) -> None:
+        """Refresh metadata for ``profile`` without downgrading known values."""
+        try:
+            info = await asyncio.to_thread(self._fetch_server_info_fn, profile)
+        except ProfileError as error:
+            self.push_message("system", str(error))
+            return
+        if self.settings.active_profile != profile:
+            # The endpoint changed while this probe was in flight. A late answer
+            # from the previous one must not describe the current one.
+            return
         if not info.known:
+            detail = f" ({info.error})" if info.error else ""
             self.push_message(
                 "system",
-                f"Could not reach {self.settings.base_url} — model and context "
-                "info unavailable. Check base_url in /settings.",
+                f"Could not reach {profile.base_url}{detail} — model and context "
+                "info unavailable. Check the endpoint in /profiles.",
             )
             return
         self.server.models = info.models
         self.server.context_length = info.context_length
-        if self.server.model and not self.settings.model:
-            self.settings.model = self.server.model
+        self.server.error = None
         self._render_status()
         if self.session.messages and self.server.context_length:
             await self._init_token_count()
@@ -282,11 +310,18 @@ class ChatApp(App):
 
     async def _init_token_count(self) -> None:
         """Count session tokens on startup so the footer is accurate."""
+        profile = self.settings.active_profile
+        if profile is None:
+            return
         history = self.session.messages_with_system("")
         text = " ".join(message["content"] for message in history)
         if not text:
             return
-        count = await asyncio.to_thread(self._fetch_token_count_fn, self.settings, text)
+        try:
+            count = await asyncio.to_thread(self._fetch_token_count_fn, profile, text)
+        except ProfileError as error:
+            self.push_message("system", str(error))
+            return
         if count:
             self._prompt_tokens = count
             self._render_status()
@@ -372,10 +407,14 @@ class ChatApp(App):
         parts: list[str] = []
         if running:
             parts.append(running)
-        if self.settings.base_url:
-            parts.append(self.settings.base_url)
-        if self.settings.model:
-            parts.append(f"model: {self.settings.model}")
+        profile = self.settings.active_profile
+        if profile is not None:
+            suffix = " (override)" if self.settings.profile_is_overridden else ""
+            parts.append(f"profile: {profile.name}{suffix}")
+            parts.append(profile.base_url)
+            model = profile.model or self.server.model
+            if model:
+                parts.append(f"model: {model}")
         if self.server.context_length:
             if self._prompt_tokens:
                 total = self.server.context_length
@@ -520,16 +559,45 @@ class ChatApp(App):
         self._append("user", content)
         await self._stream_reply()
 
+    def _resolve_turn_profile(self) -> ResolvedProfile:
+        """Pin one endpoint, model, and credential for this whole user turn.
+
+        Raises:
+            ProfileError: if no profile is selected, no model resolves, or the
+                credential is unavailable — before any provider thread starts.
+        """
+        profile = self.settings.active_profile
+        if profile is None:
+            raise ProfileError(NO_PROFILE)
+        return resolve_profile(
+            profile, discovered_model=self.server.model, environ=os.environ
+        )
+
     async def _stream_reply(self) -> None:
-        reply = await self._stream_once()
-        if reply is not None:
-            await self._tool_rounds(reply)
+        """Run one user turn against a single immutable profile snapshot.
+
+        Every completion in the turn — the first answer, each command
+        continuation, and each nudge — is handed the same ``ResolvedProfile``,
+        so an endpoint change can never take effect halfway through a turn.
+        """
+        try:
+            profile = self._resolve_turn_profile()
+        except ProfileError as error:
+            self.push_message("system", str(error))
+            profile = None
+        if profile is not None:
+            temperature = self.settings.temperature
+            reply = await self._stream_once(profile, temperature)
+            if reply is not None:
+                await self._tool_rounds(reply, profile, temperature)
         while self._queue:
             text = self._queue[0]
             self._remove_queue_entry(0)
             await self._send_message(text)
 
-    async def _stream_once(self) -> str | None:
+    async def _stream_once(
+        self, profile: ResolvedProfile, temperature: float
+    ) -> str | None:
         """Consume one stream and return its answer, or ``None`` on failure."""
         parts: list[str] = []
         timings: dict | None = None
@@ -634,7 +702,7 @@ class ChatApp(App):
                 messages = self.session.messages_with_system(
                     self.settings.effective_system_prompt()
                 )
-                for item in self._stream_reply_fn(self.settings, messages):
+                for item in self._stream_reply_fn(profile, temperature, messages):
                     inbox.put(item)
                     if abandoned.is_set() or self._stop_event.is_set():
                         break
@@ -741,7 +809,9 @@ class ChatApp(App):
                 self._generating = False
                 self._render_status()
 
-    async def _tool_rounds(self, reply: str) -> None:
+    async def _tool_rounds(
+        self, reply: str, profile: ResolvedProfile, temperature: float
+    ) -> None:
         """Run model rounds until one reply carries prose and no command calls.
 
         Command output must reach the model before the next completion decision,
@@ -751,6 +821,9 @@ class ChatApp(App):
         reply is nudged rather than treated as an answer. There is no command,
         round, repetition, or retry budget. ``None`` is a cancellation or a
         provider failure that ``_stream_once`` has already reported.
+
+        ``profile`` and ``temperature`` are the turn's captured values: no round
+        here re-reads the live active profile.
         """
         self._tool_rounds_active = True
         try:
@@ -758,15 +831,17 @@ class ChatApp(App):
                 commands = parse_jtech_reply(reply).commands
                 if commands:
                     await self._process_commands(commands)
-                    reply = await self._stream_once()
+                    reply = await self._stream_once(profile, temperature)
                     continue
                 if reply.strip():
                     return
-                reply = await self._nudge()
+                reply = await self._nudge(profile, temperature)
         finally:
             self._tool_rounds_active = False
 
-    async def _nudge(self) -> str | None:
+    async def _nudge(
+        self, profile: ResolvedProfile, temperature: float
+    ) -> str | None:
         """Request a continuation after the model returned an empty reply."""
         if self.settings.debug_level == "system":
             # Keep an auditable event without feeding it into future prompts.
@@ -778,7 +853,7 @@ class ChatApp(App):
             )
             self.push_message("system", NUDGE_PROMPT)
         with self.session.ephemeral("system", NUDGE_PROMPT):
-            return await self._stream_once()
+            return await self._stream_once(profile, temperature)
 
     async def _process_commands(self, commands: list[str]) -> None:
         """Run every parsed command in source order, feeding each result back."""
@@ -814,8 +889,7 @@ class ChatApp(App):
             return
         self.cmd.allow.append(rule)
         try:
-            self.cmd.mode = self.settings.cmd_mode
-            save_settings(self.settings, self.config_path, cmd=self.cmd)
+            self._save(self.settings)
             self.push_message("system", f"Always-allow saved: {rule}")
         except OSError as error:
             self.push_message("system", f"Could not save always-allow rule: {error}")
@@ -886,6 +960,94 @@ class ChatApp(App):
             self._running_proc.kill()
         else:
             self._hide_suggestions()
+
+    def _busy(self) -> str | None:
+        """Why a profile change is refused right now, or ``None`` when idle.
+
+        The current turn must keep one endpoint/model/credential identity, so a
+        switch that is visible in the footer but does not affect the running
+        turn is refused outright rather than half-applied.
+        """
+        if self._generating:
+            return BUSY_GENERATING
+        if self._tool_rounds_active:
+            return BUSY_TOOL_ROUND
+        return None
+
+    def _save(self, settings: Settings) -> None:
+        """Write ``settings`` with the complete live command policy."""
+        self.cmd.mode = self.settings.cmd_mode
+        save_settings(settings, self.config_path, cmd=self.cmd)
+
+    def _open_profiles(self) -> None:
+        busy = self._busy()
+        if busy:
+            self.push_message("system", busy)
+            return
+        self.push_screen(ProfilesScreen(self.settings.profiles, self._commit_profiles))
+
+    async def _commit_profiles(self, candidate: Profiles) -> None:
+        """Persist ``candidate``, then adopt it as the live catalog.
+
+        Persistence comes first, so a failed save needs no live-state rollback:
+        the previous catalog is still the only one anything has seen.
+
+        Raises:
+            ProfileError: if a turn is in progress.
+            OSError: if the config file cannot be written.
+        """
+        busy = self._busy()
+        if busy:
+            self.push_message("system", busy)
+            raise ProfileError(busy)
+        previous = self.settings.active_profile
+        self._save(dataclasses.replace(self.settings, profiles=candidate))
+        self.settings.profiles = candidate
+        self._after_profile_change(previous)
+
+    async def _switch_profile(self, name: str) -> None:
+        """Activate ``name`` and persist the selection for the next launch."""
+        busy = self._busy()
+        if busy:
+            self.push_message("system", busy)
+            return
+        try:
+            candidate = self.settings.profiles.activate(name)
+        except ProfileError as error:
+            self.push_message("system", str(error))
+            return
+        previous = self.settings.active_profile
+        try:
+            self._save(
+                dataclasses.replace(
+                    self.settings, profiles=candidate, profile_override=None
+                )
+            )
+        except OSError as error:
+            self.push_message("system", f"Could not save profile selection: {error}")
+            return
+        self.settings.profiles = candidate
+        # A CLI --base-url/--model override is only cleared once the requested
+        # selection is actually stored.
+        self.settings.profile_override = None
+        self._after_profile_change(previous)
+        self.push_message("system", f"Profile: {name}")
+
+    def _after_profile_change(self, previous: Profile | None) -> None:
+        """Invalidate endpoint-derived state when the selected endpoint changed."""
+        current = self.settings.active_profile
+        if current == previous:
+            self._render_status()
+            return
+        # CommandContext shares this ServerInfo, so clear it in place rather
+        # than rebinding: /models and /stats read the same object.
+        self.server.models = []
+        self.server.context_length = None
+        self.server.error = None
+        self._prompt_tokens = 0
+        self._render_status()
+        if current is not None and not self._no_discover:
+            self.call_later(self._discover_server, current)
 
     def _open_settings(self) -> None:
         self.push_screen(
