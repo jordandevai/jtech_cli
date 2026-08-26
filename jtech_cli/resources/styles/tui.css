@@ -3,6 +3,11 @@
     padding: 0 1;
 }
 
+TranscriptHistory {
+    height: auto;
+    width: 1fr;
+}
+
 #status {
     height: 1;
     color: $text-muted;

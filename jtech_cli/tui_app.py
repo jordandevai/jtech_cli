@@ -17,7 +17,7 @@ from typing import ClassVar
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Vertical, VerticalScroll
+from textual.containers import Vertical
 from textual.widgets import Input, Markdown, Static
 
 from jtech_cli import server_info
@@ -55,9 +55,13 @@ from jtech_cli.tui_screens import (
 )
 from jtech_cli.tui_widgets import (
     InputToMultiline,
+    MarkdownTail,
     MultilineCancel,
     MultilineSubmit,
     OutputSink,
+    PlainTail,
+    Transcript,
+    TranscriptRecord,
     _ChatInput,
     _MultilineInput,
     render_menu_rows,
@@ -123,18 +127,6 @@ class _StreamInbox:
         return batch
 
 
-def _message_widgets(role: str, text: str) -> tuple[Static, Markdown]:
-    """Build the label/body pair for one transcript message.
-
-    Construction only — mounting, scrolling, and persistence stay with the
-    caller, so replayed history can be mounted in one batch while a live
-    message still follows the transcript on its own.
-    """
-    label = Static(role.upper(), classes=f"bubble-label {role}")
-    markdown = Markdown(text or "", classes=f"bubble {role}")
-    return label, markdown
-
-
 class ChatApp(App):
     """Full-screen chat app with injected network boundaries."""
 
@@ -193,7 +185,7 @@ class ChatApp(App):
         self._stop_event = threading.Event()
         self._prompt_tokens = 0
         self._queue: list[str] = []
-        self._queue_lines: list[tuple[Static, Markdown]] = []
+        self._queue_lines: list[PlainTail] = []
         self.ctx = CommandContext(
             session=session,
             settings=settings,
@@ -216,7 +208,7 @@ class ChatApp(App):
 
     def compose(self) -> ComposeResult:
         with Vertical():
-            yield VerticalScroll(id="chat")
+            yield Transcript(id="chat")
             yield Static(id="suggestions")
             yield _ChatInput(
                 id="input",
@@ -228,16 +220,18 @@ class ChatApp(App):
         self.register_theme(JTECH_DARK)
         self.register_theme(JTECH_LIGHT)
         self.theme = textual_theme_name(self.settings.theme)
-        # Replayed history is mounted as one batch and scrolled once: going
-        # through _append() would mount and scroll per stored message.
-        history: list[Static | Markdown] = []
+        # Replayed history becomes completed content in one rendering: it costs
+        # no label or Markdown widget per stored message, however long it is.
+        history: list[TranscriptRecord] = []
         for msg in self.session.messages:
             if msg.get("_debug_only") and self.settings.debug_level != "system":
                 continue
-            history.extend(_message_widgets(msg["role"], msg["content"]))
+            history.append(
+                TranscriptRecord(role=msg["role"], content=msg["content"])
+            )
+        chat = self.query_one("#chat", Transcript)
+        chat.load(history)
         if history:
-            chat = self.query_one("#chat", VerticalScroll)
-            await chat.mount(*history)
             chat.scroll_end(animate=False)
         profile = self.settings.active_profile
         if profile is None:
@@ -278,30 +272,11 @@ class ChatApp(App):
         if self.session.messages and self.server.context_length:
             await self._init_token_count(profile)
 
-    def push_message(self, role: str, text: str) -> tuple[Static, Markdown]:
-        return self._append(role, text)
-
-    def _append(self, role: str, text: str) -> tuple[Static, Markdown]:
-        chat = self.query_one("#chat", VerticalScroll)
-        label, markdown = _message_widgets(role, text)
-        chat.mount(label, markdown)
-        chat.scroll_end(animate=False)
-        return label, markdown
-
-    def _append_plain(
-        self, role: str, text: str, *, hidden: bool = False
-    ) -> tuple[Static, Static]:
-        """Mount a cheap-to-update plain-text bubble, optionally hidden."""
-        chat = self.query_one("#chat", VerticalScroll)
-        label = Static(role.upper(), classes=f"bubble-label {role}")
-        chat.mount(label)
-        body = Static(text or "", classes=f"bubble {role}")
-        chat.mount(body)
-        if hidden:
-            label.display = False
-            body.display = False
-        chat.scroll_end(animate=False)
-        return label, body
+    def push_message(self, role: str, text: str) -> None:
+        """Add one already-complete message to the visible transcript."""
+        self.query_one("#chat", Transcript).append(
+            TranscriptRecord(role=role, content=text)
+        )
 
     def _focus_input(self) -> None:
         inputs = self.query(_ChatInput)
@@ -500,17 +475,20 @@ class ChatApp(App):
             await self._send_message(content)
 
     def _enqueue(self, text: str) -> None:
-        """Queue a message while a reply or tool round is in flight."""
+        """Queue a message while a reply or tool round is in flight.
+
+        The notice is literal app text rather than model Markdown, so it is a
+        plain live entry: it can be withdrawn again by recall or by draining.
+        """
+        chat = self.query_one("#chat", Transcript)
         self._queue.append(text)
-        self._queue_lines.append(self.push_message("system", f"Queued: {text}"))
+        self._queue_lines.append(chat.begin_plain("system", f"Queued: {text}"))
         self._render_status()
 
     def _remove_queue_entry(self, index: int) -> None:
         """Drop a queued message and its transient chat line."""
         self._queue.pop(index)
-        for widget in self._queue_lines.pop(index):
-            if widget.is_mounted:
-                widget.remove()
+        self.query_one("#chat", Transcript).remove(self._queue_lines.pop(index))
         self._render_status()
 
     async def _enter_multiline(self, terminator: str = "'''", prefill: str = "") -> str:
@@ -559,7 +537,7 @@ class ChatApp(App):
             self._enqueue(content)
             return
         self._record_message("user", content)
-        self._append("user", content)
+        self.push_message("user", content)
         await self._stream_reply()
 
     def _resolve_turn_profile(self) -> ResolvedProfile:
@@ -619,11 +597,12 @@ class ChatApp(App):
         self._stop_event.clear()
         self._generating = True
 
-        chat = self.query_one("#chat", VerticalScroll)
-        reason_pair: tuple[Static, Static] | None = None
+        chat = self.query_one("#chat", Transcript)
+        reason_entry: PlainTail | None = None
         if mode != "hide":
-            reason_pair = self._append_plain("reasoning", "", hidden=True)
-        label, ai_md = self._append("ai", "")
+            reason_entry = chat.begin_plain("reasoning", hidden=True)
+        ai_entry: MarkdownTail = chat.begin_markdown("ai")
+        label, ai_md = ai_entry.label, ai_entry.body
         ai_stream = Markdown.get_stream(ai_md)
         # Anchoring lets Textual keep the newest output in view by itself and
         # release that hold the moment the user scrolls, so the stream never
@@ -631,11 +610,27 @@ class ChatApp(App):
         chat.anchor()
 
         def drop_reason_bubble() -> None:
-            if reason_pair is None:
+            """Withdraw the reasoning entry; the transcript owns its widgets."""
+            if reason_entry is not None:
+                chat.remove(reason_entry)
+
+        def close_reason_bubble() -> None:
+            """End the reasoning entry the way its mode asks for.
+
+            ``transient`` never keeps anything, and neither retaining mode has
+            anything worth keeping if no reasoning ever became visible; both
+            withdraw the entry instead of compacting an empty one.
+            """
+            if reason_entry is None:
                 return
-            for widget in reason_pair:
-                if widget.is_mounted:
-                    widget.remove()
+            if mode == "transient" or not reason_visible:
+                chat.remove(reason_entry)
+                return
+            displayed = "…" + reason_tail if mode == "tail" else reason_text.plain
+            chat.finalize(
+                reason_entry,
+                TranscriptRecord("reasoning", displayed, format="plain"),
+            )
 
         def render_reasoning() -> None:
             """Push the accumulated reasoning body into its bubble.
@@ -644,16 +639,16 @@ class ChatApp(App):
             mutable ``Text`` that grows by append, so no mode re-joins every
             fragment received so far.
             """
-            assert reason_pair is not None
+            assert reason_entry is not None
             if mode == "tail":
-                reason_pair[1].update("…" + reason_tail)
+                reason_entry.body.update("…" + reason_tail)
             else:
-                reason_pair[1].update(reason_text)
+                reason_entry.body.update(reason_text)
 
         def apply_reasoning(delta: str) -> None:
             """Fold one batch of reasoning deltas into the reasoning bubble."""
             nonlocal reason_visible, reason_dropped, reason_tail
-            if reason_pair is None:
+            if reason_entry is None:
                 return
             if delta:
                 if mode == "tail":
@@ -661,8 +656,8 @@ class ChatApp(App):
                 else:
                     reason_text.append(delta)
             if reasoning_chars and not reason_visible and not reason_dropped:
-                reason_pair[0].display = True
-                reason_pair[1].display = True
+                reason_entry.label.display = True
+                reason_entry.body.display = True
                 reason_visible = True
             if not reason_visible:
                 return
@@ -776,26 +771,36 @@ class ChatApp(App):
                 pass
             if self._stop_event.is_set():
                 drop_reason_bubble()
-                label.remove()
-                ai_md.remove()
+                chat.remove(ai_entry)
                 self.push_message("system", "Generation stopped.")
                 return None
             failure = error if render_error is None else render_error
             if failure is not None:
-                if mode == "transient":
-                    drop_reason_bubble()
-                label.update("AI")
-                ai_md.add_class("error")
                 headline = CONNECTION_ERROR if render_error is None else RENDER_ERROR
-                await ai_md.update(f"{headline}\n\n{failure}")
+                error_text = f"{headline}\n\n{failure}"
+                # A /clear during the turn already closed these handles; the
+                # failure still ends the turn, it just has nothing to paint.
+                if ai_entry.state == "live":
+                    label.update("AI")
+                    ai_md.add_class("error")
+                    await ai_md.update(error_text)
+                close_reason_bubble()
+                chat.finalize(
+                    ai_entry,
+                    TranscriptRecord("ai", error_text, label="AI", error=True),
+                )
                 chat.scroll_end(animate=False)
                 return None
-            if mode == "transient":
-                drop_reason_bubble()
-            label.update(self._done_label(timings))
             reply = "".join(parts)
             if reply.strip():
                 self._record_message("assistant", reply)
+            done_label = self._done_label(timings)
+            if ai_entry.state == "live":
+                # A queue notice can hold this bubble on screen past the turn,
+                # so the widget gets the done label too, not just the record.
+                label.update(done_label)
+            close_reason_bubble()
+            chat.finalize(ai_entry, TranscriptRecord("ai", reply, label=done_label))
             self.ctx.last_reply = reply
             return reply
         finally:
@@ -1083,6 +1088,9 @@ class ChatApp(App):
         name = textual_theme_name(self.settings.theme)
         if name != self.theme:
             self.theme = name
+            # Live bubbles follow the theme through CSS; completed history is
+            # rendered content, so it has to be rebuilt for the new colors.
+            self.query_one("#chat", Transcript).refresh_theme()
 
     def _on_settings_saved(self) -> None:
         self._switch_theme()
@@ -1100,7 +1108,7 @@ class ChatApp(App):
             self.push_message("system", content)
 
     def _clear_chat(self) -> None:
-        self.query_one("#chat", VerticalScroll).remove_children()
+        self.query_one("#chat", Transcript).clear()
         self._prompt_tokens = 0
         self._render_status()
 
