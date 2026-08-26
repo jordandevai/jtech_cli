@@ -10,6 +10,7 @@ from jtech_cli.config import (
     Profiles,
     ResolvedProfile,
     build_settings,
+    endpoint_origin,
     load_cmd_policy,
     resolve_api_key,
     resolve_profile,
@@ -55,11 +56,52 @@ def test_invalid_names_are_rejected(name):
 
 @pytest.mark.parametrize(
     "url",
-    ["", "127.0.0.1:8080/v1", "ftp://host/v1", "http://", "/v1", "file:///tmp/v1"],
+    [
+        "",
+        "127.0.0.1:8080/v1",
+        "ftp://host/v1",
+        "http://",
+        "/v1",
+        "file:///tmp/v1",
+        "http://:8080/v1",  # a port with no host is not an origin
+    ],
 )
 def test_invalid_base_urls_are_rejected(url):
     with pytest.raises(ProfileError, match="base_url"):
         Profile(name="p", base_url=url)
+
+
+@pytest.mark.parametrize("url", ["http://host:notaport/v1", "http://host:99999/v1"])
+def test_an_unusable_port_is_rejected(url):
+    """A URL with no resolvable port has no origin, so it cannot be scoped."""
+    with pytest.raises(ProfileError, match="invalid port"):
+        Profile(name="p", base_url=url)
+
+
+@pytest.mark.parametrize("url", ["https://host:0/v1", "http://127.0.0.1:0/v1"])
+def test_port_zero_is_rejected_rather_than_read_as_the_default(url):
+    """0 is falsy: folding it into the default port would widen credential scope."""
+    with pytest.raises(ProfileError, match="unusable port 0"):
+        Profile(name="p", base_url=url)
+
+
+@pytest.mark.parametrize("url", ["http://[::1/v1", "https://[not:an:ipv6/v1"])
+def test_an_unparseable_url_raises_the_typed_error(url):
+    """urlparse raises bare ValueError here; the CLI and modal catch ProfileError."""
+    with pytest.raises(ProfileError, match="not a usable URL"):
+        Profile(name="p", base_url=url)
+
+
+@pytest.mark.parametrize(
+    "url, origin",
+    [
+        ("http://[::1]:8080/v1", ("http", "::1", 8080)),
+        ("https://[2001:db8::1]/v1", ("https", "2001:db8::1", 443)),
+    ],
+)
+def test_well_formed_ipv6_endpoints_are_accepted(url, origin):
+    assert Profile(name="p", base_url=url).base_url == url
+    assert endpoint_origin(url) == origin
 
 
 @pytest.mark.parametrize("url", [" http://x/v1", "http://x/v1 ", "http://x/v1\n"])
@@ -72,6 +114,20 @@ def test_base_url_whitespace_is_invalid_config(url):
 def test_model_whitespace_is_rejected(model):
     with pytest.raises(ProfileError, match="model"):
         Profile(name="p", base_url="http://x/v1", model=model)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://user:s3cret@example.com/v1",
+        "https://token@example.com/v1",
+        "http://user:pw@127.0.0.1:8080/v1",
+    ],
+)
+def test_credentials_embedded_in_the_url_are_rejected(url):
+    """A userinfo URL would put a live secret in TOML and on screen."""
+    with pytest.raises(ProfileError, match="must not embed credentials"):
+        Profile(name="p", base_url=url)
 
 
 @pytest.mark.parametrize("env", ["1KEY", "MY KEY", "my-key", "$KEY", "KEY!"])
@@ -115,6 +171,19 @@ def test_add_and_activate_preserve_order():
     assert catalog.activate("cloud").names == ("local", "cloud")
 
 
+def test_the_first_profile_is_always_activated():
+    """An unselected catalog cannot be loaded back, so it is never produced."""
+    catalog = Profiles().add(LOCAL)  # activate not requested
+    assert catalog.active_name == "local"
+    # later additions still respect the caller's choice
+    assert catalog.add(CLOUD).active_name == "local"
+
+
+def test_a_catalog_with_profiles_must_select_one():
+    with pytest.raises(ProfileError, match="must select an active one"):
+        Profiles(items=(LOCAL,))
+
+
 def test_add_rejects_a_duplicate_name():
     catalog = Profiles().add(LOCAL)
     with pytest.raises(ProfileError, match="already exists"):
@@ -138,7 +207,7 @@ def test_catalog_rejects_non_profile_items():
 
 def test_get_rejects_an_unknown_name():
     with pytest.raises(ProfileError, match="No profile named"):
-        Profiles(items=(LOCAL,)).get("nope")
+        Profiles(items=(LOCAL,), active_name="local").get("nope")
 
 
 def test_replace_edits_in_place_and_keeps_position():
@@ -342,18 +411,128 @@ def test_cli_overrides_are_session_only_and_never_saved(tmp_path):
     assert 'base_url = "http://127.0.0.1:8080/v1"' in text
 
 
-def test_a_url_override_keeps_the_profile_credential_source(tmp_path):
+def _saved_cloud(tmp_path):
     path = tmp_path / "config.toml"
     settings = build_settings(config_path=path)
     settings.profiles = Profiles().add(CLOUD, activate=True)
     save_settings(settings, path, cmd=CmdPolicy())
+    return path
 
-    overridden = build_settings(base_url="https://staging.example.com/v1", config_path=path)
-    override = overridden.active_profile
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://api.example.com/v2",  # different path, same server
+        "https://api.example.com:443/v1",  # the default port, spelled out
+        "https://API.Example.COM/v1",  # host case is not part of identity
+    ],
+)
+def test_a_same_origin_url_override_keeps_the_credential_source(tmp_path, url):
+    """A different path, an explicit default port, or different case is one server."""
+    path = _saved_cloud(tmp_path)
+    override = build_settings(base_url=url, config_path=path).active_profile
     assert override.name == "cloud"
-    assert override.base_url == "https://staging.example.com/v1"
+    assert override.base_url == url
     assert override.model == "cloud-model"
     assert override.api_key_env == "CLOUD_API_KEY"
+
+
+def test_an_explicit_default_port_in_the_profile_is_also_one_origin(tmp_path):
+    """The equivalence holds whichever side spells the port out."""
+    path = tmp_path / "config.toml"
+    settings = build_settings(config_path=path)
+    settings.profiles = Profiles().add(
+        Profile(
+            name="cloud",
+            base_url="http://api.example.com:80/v1",
+            model="m",
+            api_key_env="CLOUD_API_KEY",
+        ),
+        activate=True,
+    )
+    save_settings(settings, path, cmd=CmdPolicy())
+
+    override = build_settings(
+        base_url="http://api.example.com/v1", config_path=path
+    ).active_profile
+    assert override.api_key_env == "CLOUD_API_KEY"
+
+
+@pytest.mark.parametrize(
+    "left, right",
+    [
+        ("https://h/v1", "https://h:443/v2"),
+        ("http://h/v1", "http://h:80/v1"),
+        ("https://H.example.com/v1", "https://h.example.com/v1"),
+    ],
+)
+def test_equivalent_origins_compare_equal(left, right):
+    assert endpoint_origin(left) == endpoint_origin(right)
+
+
+@pytest.mark.parametrize(
+    "left, right",
+    [
+        ("https://h/v1", "http://h/v1"),  # scheme
+        ("https://h/v1", "https://other/v1"),  # host
+        ("https://h/v1", "https://h:8443/v1"),  # explicit non-default port
+        ("http://h:80/v1", "https://h:443/v1"),  # both defaults, different scheme
+    ],
+)
+def test_distinct_origins_compare_unequal(left, right):
+    assert endpoint_origin(left) != endpoint_origin(right)
+
+
+@pytest.mark.parametrize("url", ["http://[::1/v1", "https://host:0/v1"])
+def test_endpoint_origin_types_its_own_failures(url):
+    """The helper is public: it may not leak a bare ValueError either."""
+    with pytest.raises(ProfileError):
+        endpoint_origin(url)
+
+
+def test_an_origin_is_scheme_host_and_effective_port():
+    assert endpoint_origin("https://API.Example.COM/v1") == (
+        "https",
+        "api.example.com",
+        443,
+    )
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://staging.example.com/v1",  # different host
+        "http://api.example.com/v1",  # downgraded scheme
+        "https://api.example.com:8443/v1",  # explicit non-default port
+    ],
+)
+def test_a_cross_origin_override_refuses_to_forward_the_credential(tmp_path, url):
+    """--base-url must never hand another party a key it was not issued."""
+    path = _saved_cloud(tmp_path)
+    with pytest.raises(ProfileError) as excinfo:
+        build_settings(base_url=url, config_path=path)
+    message = str(excinfo.value)
+    assert "different host" in message
+    assert "CLOUD_API_KEY" in message
+
+
+def test_a_cross_origin_override_is_fine_without_a_credential(tmp_path):
+    """Only a credential is scoped; an unauthenticated profile may be re-pointed."""
+    path = tmp_path / "config.toml"
+    settings = build_settings(config_path=path)
+    settings.profiles = Profiles().add(LOCAL, activate=True)
+    save_settings(settings, path, cmd=CmdPolicy())
+
+    override = build_settings(base_url="http://elsewhere/v1", config_path=path).active_profile
+    assert override.base_url == "http://elsewhere/v1"
+    assert override.api_key_env == ""
+
+
+def test_a_malformed_override_reports_its_own_error(tmp_path):
+    """A bad URL is a URL error, not a credential-scope error."""
+    path = _saved_cloud(tmp_path)
+    with pytest.raises(ProfileError, match="base_url"):
+        build_settings(base_url="not-a-url", config_path=path)
 
 
 def test_a_base_url_override_with_no_catalog_builds_a_cli_profile(tmp_path):
@@ -456,3 +635,21 @@ def test_every_profile_save_carries_the_command_policy_through(tmp_path):
     assert loaded.timeout == 7
     assert loaded.max_output == 99
     assert build_settings(config_path=path).profiles.active == CLOUD
+
+
+def test_adding_a_first_profile_writes_a_config_that_loads_back(tmp_path):
+    """Regression: an unselected catalog wrote TOML that failed on next launch."""
+    path = tmp_path / "config.toml"
+    settings = build_settings(config_path=path)
+    settings.profiles = settings.profiles.add(Profile(name="first", base_url="http://a/v1"))
+    save_settings(settings, path, cmd=CmdPolicy())
+
+    assert 'active_profile = "first"' in path.read_text()
+    assert build_settings(config_path=path).profiles.active_name == "first"
+
+
+def test_a_userinfo_secret_can_never_reach_the_config_file(tmp_path):
+    path = tmp_path / "config.toml"
+    with pytest.raises(ProfileError):
+        Profile(name="leaky", base_url="https://user:s3cret@example.com/v1")
+    assert not path.exists()

@@ -231,3 +231,17 @@ def test_an_invalid_base_url_flag_is_reported_not_traced(monkeypatch, capsys, tm
 
     assert excinfo.value.code == 1
     assert "base_url" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("url", ["http://[::1/v1", "https://host:0/v1"])
+def test_an_unparseable_base_url_flag_is_reported_not_traced(monkeypatch, capsys, tmp_path, url):
+    """These raise bare ValueError from urlparse unless the domain types them."""
+    as_tty(monkeypatch)
+    use_config(monkeypatch, tmp_path)
+    with pytest.raises(SystemExit) as excinfo:
+        main(["--base-url", url])
+
+    assert excinfo.value.code == 1
+    captured = capsys.readouterr()
+    assert captured.err.startswith("jtech-cli: ")
+    assert "Traceback" not in captured.err

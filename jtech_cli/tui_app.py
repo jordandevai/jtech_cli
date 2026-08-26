@@ -247,8 +247,8 @@ class ChatApp(App):
         self.query_one("#suggestions", Static).display = False
         self._render_status()
         self._focus_input()
-        if self.session.messages and self.server.context_length:
-            await self._init_token_count()
+        if profile is not None and self.session.messages and self.server.context_length:
+            await self._init_token_count(profile)
         if not self._no_discover and profile is not None:
             self.call_later(self._discover_server, profile)
 
@@ -276,7 +276,7 @@ class ChatApp(App):
         self.server.error = None
         self._render_status()
         if self.session.messages and self.server.context_length:
-            await self._init_token_count()
+            await self._init_token_count(profile)
 
     def push_message(self, role: str, text: str) -> tuple[Static, Markdown]:
         return self._append(role, text)
@@ -308,11 +308,13 @@ class ChatApp(App):
         if inputs:
             inputs[0].focus()
 
-    async def _init_token_count(self) -> None:
-        """Count session tokens on startup so the footer is accurate."""
-        profile = self.settings.active_profile
-        if profile is None:
-            return
+    async def _init_token_count(self, profile: Profile) -> None:
+        """Count session tokens for ``profile`` so the footer is accurate.
+
+        The count describes one endpoint's tokenizer, so a result that arrives
+        after the user switched profiles is discarded rather than applied to the
+        new one — the same staleness rule discovery uses.
+        """
         history = self.session.messages_with_system("")
         text = " ".join(message["content"] for message in history)
         if not text:
@@ -320,9 +322,10 @@ class ChatApp(App):
         try:
             count = await asyncio.to_thread(self._fetch_token_count_fn, profile, text)
         except ProfileError as error:
-            self.push_message("system", str(error))
+            if self.settings.active_profile == profile:
+                self.push_message("system", str(error))
             return
-        if count:
+        if count and self.settings.active_profile == profile:
             self._prompt_tokens = count
             self._render_status()
 
@@ -986,11 +989,30 @@ class ChatApp(App):
             return
         self.push_screen(ProfilesScreen(self.settings.profiles, self._commit_profiles))
 
-    async def _commit_profiles(self, candidate: Profiles) -> None:
+    def _adopt_profiles(
+        self, candidate: Profiles, previous: Profile | None, *, activated: bool
+    ) -> None:
+        """Adopt a catalog that has just been persisted successfully.
+
+        The single place the live catalog advances, so ``/profile`` and the
+        modal's Activate action cannot drift apart.
+        """
+        self.settings.profiles = candidate
+        if activated:
+            # An explicit selection supersedes a --base-url/--model override,
+            # but only once that selection is actually stored.
+            self.settings.profile_override = None
+        self._after_profile_change(previous)
+
+    async def _commit_profiles(
+        self, candidate: Profiles, *, activated: bool = False
+    ) -> None:
         """Persist ``candidate``, then adopt it as the live catalog.
 
         Persistence comes first, so a failed save needs no live-state rollback:
         the previous catalog is still the only one anything has seen.
+        ``activated`` marks the modal's Activate action, which is an explicit
+        selection and therefore retires a CLI endpoint override.
 
         Raises:
             ProfileError: if a turn is in progress.
@@ -1001,9 +1023,11 @@ class ChatApp(App):
             self.push_message("system", busy)
             raise ProfileError(busy)
         previous = self.settings.active_profile
-        self._save(dataclasses.replace(self.settings, profiles=candidate))
-        self.settings.profiles = candidate
-        self._after_profile_change(previous)
+        replaced = dataclasses.replace(self.settings, profiles=candidate)
+        if activated:
+            replaced = dataclasses.replace(replaced, profile_override=None)
+        self._save(replaced)
+        self._adopt_profiles(candidate, previous, activated=activated)
 
     async def _switch_profile(self, name: str) -> None:
         """Activate ``name`` and persist the selection for the next launch."""
@@ -1026,11 +1050,7 @@ class ChatApp(App):
         except OSError as error:
             self.push_message("system", f"Could not save profile selection: {error}")
             return
-        self.settings.profiles = candidate
-        # A CLI --base-url/--model override is only cleared once the requested
-        # selection is actually stored.
-        self.settings.profile_override = None
-        self._after_profile_change(previous)
+        self._adopt_profiles(candidate, previous, activated=True)
         self.push_message("system", f"Profile: {name}")
 
     def _after_profile_change(self, previous: Profile | None) -> None:

@@ -9,6 +9,7 @@ from jtech_cli.configuration.profiles import (
     ProfileError,
     Profiles,
     ResolvedProfile,
+    endpoint_origin,
     resolve_api_key,
     resolve_profile,
 )
@@ -54,6 +55,7 @@ __all__ = [
     "SettingSpec",
     "Settings",
     "build_settings",
+    "endpoint_origin",
     "home_dir",
     "load_cmd_policy",
     "load_config_overrides",

@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import enum
-from collections.abc import Awaitable, Callable
+from collections.abc import Callable
 from pathlib import Path
-from typing import ClassVar
+from typing import ClassVar, Protocol
 
 from textual.app import ComposeResult
 from textual.binding import Binding
@@ -205,7 +205,16 @@ class SettingsScreen(ModalScreen[None]):
         return value if len(value) <= 60 else value[:59] + "…"
 
 
-CommitProfiles = Callable[[Profiles], Awaitable[None]]
+class CommitProfiles(Protocol):
+    """Persist a candidate catalog, raising if it cannot be stored.
+
+    ``activated`` marks an explicit user selection, which the app treats as
+    superseding any ``--base-url``/``--model`` override for the session.
+    """
+
+    async def __call__(
+        self, candidate: Profiles, *, activated: bool = False
+    ) -> None: ...
 
 
 class ProfilesScreen(ModalScreen[None]):
@@ -419,7 +428,7 @@ class ProfilesScreen(ModalScreen[None]):
         except ProfileError as error:
             self.notify(str(error), severity="error")
             return
-        if await self._persist(candidate):
+        if await self._persist(candidate, activated=True):
             self._to_list(focus=self._target)
 
     # --- editing -----------------------------------------------------------
@@ -478,10 +487,10 @@ class ProfilesScreen(ModalScreen[None]):
 
     # --- persistence -------------------------------------------------------
 
-    async def _persist(self, candidate: Profiles) -> bool:
+    async def _persist(self, candidate: Profiles, *, activated: bool = False) -> bool:
         """Store ``candidate``, adopting it locally only once it is saved."""
         try:
-            await self._commit(candidate)
+            await self._commit(candidate, activated=activated)
         except (OSError, ProfileError) as error:
             self.notify(str(error), severity="error")
             return False

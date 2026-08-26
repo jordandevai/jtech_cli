@@ -15,6 +15,7 @@ from jtech_cli.config import (
     ProfileError,
     Profiles,
     Settings,
+    build_settings,
     load_cmd_policy,
 )
 from jtech_cli.prompts import NUDGE_PROMPT
@@ -3184,3 +3185,188 @@ async def test_a_turn_without_a_profile_reports_instead_of_streaming(tmp_path, m
         assert started == []
         assert any("No API profile is configured" in b for b in bubbles(app))
         assert not app._generating
+
+
+async def test_modal_activation_retires_a_cli_override(tmp_path):
+    """Regression: the modal persisted a selection the override kept shadowing."""
+    settings = two_profile_settings()
+    settings.profile_override = Profile(
+        name="local", base_url="http://override.example/v1", model="override-model"
+    )
+    app = make_app(tmp_path, settings=settings)
+    async with app.run_test(size=(80, 30)) as pilot:
+        assert "(override)" in app.query_one("#status", Static).content
+
+        await open_profiles(app, pilot)
+        await pilot.press("down")  # cloud
+        await pilot.press("enter")  # actions
+        await pilot.press("enter")  # Activate
+        await settle(pilot)
+
+        assert app.settings.profiles.active_name == "cloud"
+        assert app.settings.profile_override is None
+        assert app.settings.active_profile == CLOUD
+        status = app.query_one("#status", Static).content
+        assert "profile: cloud" in status
+        assert "(override)" not in status
+        assert "override.example" not in status
+
+
+async def test_a_failed_modal_activation_keeps_the_override(tmp_path):
+    (tmp_path / "config.toml").mkdir()  # writing here raises OSError
+    settings = two_profile_settings()
+    override = Profile(name="local", base_url="http://override.example/v1", model="ov")
+    settings.profile_override = override
+    app = make_app(tmp_path, settings=settings)
+    async with app.run_test(size=(80, 30)) as pilot:
+        await open_profiles(app, pilot)
+        await pilot.press("down", "enter", "enter")  # activate cloud
+        await settle(pilot)
+
+        assert app.settings.profile_override is override
+        assert app.settings.profiles.active_name == "local"
+
+
+async def test_a_modal_edit_does_not_retire_a_cli_override(tmp_path):
+    """Editing is not selecting: only Activate supersedes the CLI flag."""
+    settings = two_profile_settings()
+    override = Profile(name="local", base_url="http://override.example/v1", model="ov")
+    settings.profile_override = override
+    app = make_app(tmp_path, settings=settings)
+    async with app.run_test(size=(80, 30)) as pilot:
+        await open_profiles(app, pilot)
+        await pilot.press("down", "enter", "down", "enter")  # edit cloud
+        await settle(pilot)
+        set_field(app, "profile-model", "edited-model")
+        await pilot.press("enter")
+        await settle(pilot)
+
+        assert app.settings.profiles.get("cloud").model == "edited-model"
+        assert app.settings.profile_override is override
+
+
+async def test_adding_the_first_profile_persists_an_active_selection(tmp_path):
+    """Regression: the modal could write a config that failed on next launch."""
+    app = make_app(tmp_path, settings=Settings())
+    async with app.run_test(size=(80, 30)) as pilot:
+        await open_profiles(app, pilot)
+        await pilot.press("enter")  # the only row is Add profile…
+        await settle(pilot)
+
+        set_field(app, "profile-name", "first")
+        set_field(app, "profile-url", "http://first:1/v1")
+        await pilot.press("enter")
+        await settle(pilot)
+
+        assert app.settings.profiles.active_name == "first"
+        text = (tmp_path / "config.toml").read_text()
+        assert 'active_profile = "first"' in text
+        assert build_settings(config_path=tmp_path / "config.toml").profiles.active_name == "first"
+
+
+async def test_a_stale_token_count_is_discarded(tmp_path, monkeypatch):
+    """A count describes one tokenizer; a late one must not describe the new one."""
+    monkeypatch.setenv("CLOUD_API_KEY", "sk-secret")
+    app = make_app(
+        tmp_path,
+        settings=two_profile_settings(),
+        fetch_token_count_fn=lambda profile, text: 7,
+    )
+    app.session.add("user", "hello world")
+    entered = threading.Event()
+    released = threading.Event()
+
+    def slow_count(profile, text):
+        entered.set()
+        released.wait(5)
+        return 42
+
+    async with app.run_test() as pilot:
+        await _wait_until(app, pilot, lambda: app._prompt_tokens == 7)
+
+        app._fetch_token_count_fn = slow_count
+        counting = asyncio.ensure_future(app._init_token_count(LOCAL))
+        await _wait_until(app, pilot, entered.is_set, tries=100)
+
+        await app._switch_profile("cloud")
+        await settle(pilot)
+        assert app._prompt_tokens == 0  # the switch cleared the old count
+
+        released.set()
+        await counting
+        await settle(pilot)
+
+        assert app._prompt_tokens == 0  # the old endpoint's 42 never landed
+        assert "ctx" not in app.query_one("#status", Static).content
+
+
+async def test_a_stale_credential_error_is_not_reported(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLOUD_API_KEY", "sk-secret")
+    app = make_app(
+        tmp_path,
+        settings=two_profile_settings(),
+        fetch_token_count_fn=lambda profile, text: 7,
+    )
+    app.session.add("user", "hello world")
+
+    def boom(profile, text):
+        raise ProfileError("stale credential complaint")
+
+    async with app.run_test() as pilot:
+        await _wait_until(app, pilot, lambda: app._prompt_tokens == 7)
+
+        app._fetch_token_count_fn = boom
+        await app._switch_profile("cloud")
+        await settle(pilot)
+        await app._init_token_count(LOCAL)  # a probe from before the switch
+        await settle(pilot)
+
+        assert not any("stale credential" in bubble for bubble in bubbles(app))
+
+
+async def test_a_current_credential_error_is_still_reported(tmp_path):
+    """The staleness guard silences late results, not live failures."""
+    app = make_app(tmp_path, settings=two_profile_settings())
+    app.session.add("user", "hello world")
+
+    def boom(profile, text):
+        raise ProfileError("live credential complaint")
+
+    app._fetch_token_count_fn = boom
+    async with app.run_test() as pilot:
+        await settle(pilot)
+        assert any("live credential complaint" in b for b in bubbles(app))
+
+
+async def test_a_live_token_count_still_reaches_the_footer(tmp_path):
+    """The staleness guard must not disable the normal path."""
+    app = make_app(
+        tmp_path,
+        settings=two_profile_settings(),
+        fetch_token_count_fn=lambda profile, text: 128,
+    )
+    app.session.add("user", "hello world")
+    async with app.run_test() as pilot:
+        await _wait_until(app, pilot, lambda: app._prompt_tokens == 128)
+        assert "ctx" in app.query_one("#status", Static).content
+
+
+@pytest.mark.parametrize("url", ["http://[::1/v1", "https://host:0/v1"])
+async def test_the_editor_reports_an_unparseable_url_instead_of_crashing(tmp_path, url):
+    """urlparse raises bare ValueError on these; the modal only catches ProfileError."""
+    app = make_app(tmp_path, settings=two_profile_settings())
+    async with app.run_test(size=(80, 30)) as pilot:
+        before = app.settings.profiles
+        await open_profiles(app, pilot)
+        await pilot.press("enter", "down", "enter")  # edit local
+        await settle(pilot)
+
+        set_field(app, "profile-url", url)
+        await pilot.press("enter")
+        await settle(pilot)
+
+        assert app._exception is None
+        assert isinstance(app.screen, ProfilesScreen)  # editor still open
+        assert app.screen.query_one("#profile-url", Input).value == url
+        assert app.settings.profiles is before
+        assert notifications(app)

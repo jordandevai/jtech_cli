@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import tomllib
 from pathlib import Path
@@ -20,6 +21,7 @@ from jtech_cli.configuration.profiles import (
     Profile,
     ProfileError,
     Profiles,
+    endpoint_origin,
 )
 from jtech_cli.configuration.settings import (
     DEFAULT_CMD_MODE,
@@ -175,11 +177,14 @@ def _cli_override(
 ) -> Profile | None:
     """Build the session-only profile for ``--base-url``/``--model``.
 
-    Overriding an existing selection keeps that profile's name and credential
-    source, so a URL-only override still authenticates the way the profile says.
+    An override keeps the profile's credential source only while it stays on the
+    same origin. Re-pointing an authenticated profile at another host is refused
+    rather than quietly forwarding that host a key it was never issued: a flag on
+    the command line must not be able to hand a secret to a third party.
 
     Raises:
-        ProfileError: if the override values do not form a valid profile.
+        ProfileError: if the override values do not form a valid profile, or
+            would move a credential to a different origin.
     """
     if not base_url and not model:
         return None
@@ -194,12 +199,23 @@ def _cli_override(
             base_url=base_url.strip(),
             model=(model or "").strip(),
         )
-    return Profile(
+    # Validate the endpoint first, so a malformed URL reports its own error
+    # rather than looking like a credential-scope violation.
+    candidate = Profile(
         name=active.name,
         base_url=(base_url or active.base_url).strip(),
         model=(model or active.model).strip(),
-        api_key_env=active.api_key_env,
     )
+    if not active.api_key_env:
+        return candidate
+    if endpoint_origin(candidate.base_url) != endpoint_origin(active.base_url):
+        raise ProfileError(
+            f"--base-url points at a different host than profile {active.name!r}, "
+            f"whose API key (${active.api_key_env}) belongs to {active.base_url}. "
+            "A credential is never sent to another host: configure a profile for "
+            "that endpoint and activate it instead."
+        )
+    return dataclasses.replace(candidate, api_key_env=active.api_key_env)
 
 
 def build_settings(

@@ -17,7 +17,7 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from urllib.parse import urlparse
+from urllib.parse import ParseResult, urlparse
 
 # The OpenAI SDK requires a non-empty key even for an unauthenticated local
 # server; this is the placeholder the client has always sent to llama-server.
@@ -30,6 +30,10 @@ CLI_PROFILE_NAME = "cli"
 
 _NAME_PATTERN = re.compile(r"[a-z0-9][a-z0-9_-]*")
 _ENV_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+#: Ports that need no mention. An omitted port means the scheme's default, so a
+#: credential's scope must not split on whether the user typed ":443".
+_DEFAULT_PORTS = {"http": 80, "https": 443}
 
 
 class ProfileError(ValueError):
@@ -52,6 +56,22 @@ def _check_name(value: object) -> str:
     return name
 
 
+def _parse_endpoint(url: str) -> ParseResult:
+    """``urlparse`` the endpoint, typing its failures as ``ProfileError``.
+
+    ``urlparse`` raises bare ``ValueError`` on inputs like ``http://[::1/v1``.
+    Letting that escape would bypass the CLI and profile-editor handlers, which
+    catch ``ProfileError``, and surface a traceback instead of a fixable message.
+
+    Raises:
+        ProfileError: if the URL cannot be parsed at all.
+    """
+    try:
+        return urlparse(url)
+    except ValueError as error:
+        raise ProfileError(f"base_url is not a usable URL ({error}): {url!r}") from error
+
+
 def _check_base_url(name: str, value: object) -> str:
     url = _check_str("base_url", value)
     if not url:
@@ -60,12 +80,21 @@ def _check_base_url(name: str, value: object) -> str:
         raise ProfileError(
             f"profile {name!r}: base_url must not have leading or trailing whitespace"
         )
-    parsed = urlparse(url)
-    if parsed.scheme not in ("http", "https") or not parsed.netloc:
-        raise ProfileError(
-            f"profile {name!r}: base_url must be an absolute http:// or https:// URL "
-            f"with a host, got {url!r}"
-        )
+    try:
+        parsed = _parse_endpoint(url)
+        if parsed.username or parsed.password:
+            # A userinfo URL would put a live secret in config.toml, the footer,
+            # and the profile manager. api_key_env is the only way a credential
+            # enters.
+            raise ProfileError(
+                "base_url must not embed credentials (user:password@host) — "
+                "supply the key through api_key_env instead"
+            )
+        # Scheme, host, and port must all be usable — the same rule that decides
+        # credential scope, so a URL can never be valid yet have no origin.
+        endpoint_origin(url)
+    except ProfileError as error:
+        raise ProfileError(f"profile {name!r}: {error}") from error
     return url
 
 
@@ -86,6 +115,38 @@ def _check_api_key_env(name: str, value: object) -> str:
             f"([A-Za-z_][A-Za-z0-9_]*), got {env!r}"
         )
     return env
+
+
+def endpoint_origin(url: str) -> tuple[str, str, int]:
+    """Scheme, host, and effective port of ``url`` — a credential's scope.
+
+    Two endpoints share an origin when they are the same server, so a key issued
+    for one is meaningful for the other. The port is resolved to its effective
+    value, so ``https://h/v1`` and ``https://h:443/v1`` are one origin rather
+    than two — comparing raw host:port text would refuse a legitimate override.
+    ``urlparse`` normalizes scheme and host to lowercase.
+
+    Raises:
+        ProfileError: if the URL has no usable scheme, host, or port.
+    """
+    parsed = _parse_endpoint(url)
+    try:
+        port = parsed.port
+    except ValueError as error:
+        raise ProfileError(f"base_url has an invalid port: {url!r}") from error
+    if parsed.scheme not in _DEFAULT_PORTS or not parsed.hostname:
+        raise ProfileError(
+            "base_url must be an absolute http:// or https:// URL with a host, "
+            f"got {url!r}"
+        )
+    if port == 0:
+        # Port 0 cannot be connected to. Treating it as "unspecified" would fold
+        # it into the default port and silently widen a credential's scope.
+        raise ProfileError(f"base_url has an unusable port 0: {url!r}")
+    # Explicitly against None: 0 is falsy, so `port or default` would map an
+    # explicit port onto the default one.
+    effective = port if port is not None else _DEFAULT_PORTS[parsed.scheme]
+    return parsed.scheme, parsed.hostname, effective
 
 
 @dataclass(frozen=True, slots=True)
@@ -161,6 +222,12 @@ class Profiles:
             raise ProfileError(f"duplicate profile name(s): {', '.join(duplicates)}")
         object.__setattr__(self, "items", items)
         if self.active_name is None:
+            if names:
+                # A stored catalog with no selection cannot be loaded back, so
+                # it must never be constructible in the first place.
+                raise ProfileError(
+                    "a profile catalog with profiles must select an active one"
+                )
             return
         active = _check_str("active_profile", self.active_name)
         if active not in names:
@@ -190,16 +257,21 @@ class Profiles:
         raise ProfileError(f"No profile named {name!r}")
 
     def add(self, profile: Profile, *, activate: bool = False) -> Profiles:
-        """Append ``profile``, optionally selecting it.
+        """Append ``profile``, selecting it when asked — or when it is the first.
+
+        The first profile is always activated: leaving it unselected would write
+        a catalog that fails to load on the next launch, and with one profile
+        there is nothing to choose between.
 
         Raises:
             ProfileError: if the name is already configured.
         """
         if profile.name in self.names:
             raise ProfileError(f"A profile named {profile.name!r} already exists")
+        select = activate or not self.items
         return Profiles(
             items=(*self.items, profile),
-            active_name=profile.name if activate else self.active_name,
+            active_name=profile.name if select else self.active_name,
         )
 
     def replace(self, old_name: str, profile: Profile) -> Profiles:
