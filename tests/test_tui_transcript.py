@@ -9,11 +9,12 @@ import io
 from pathlib import Path
 
 import pytest
+from rich.cells import cell_len
 from rich.console import Console
 from rich.markdown import Markdown as RichMarkdown
 from textual.app import App, ComposeResult
 from textual.geometry import Offset, Size
-from textual.selection import Selection
+from textual.widget import Widget
 from textual.widgets import Markdown, Static
 
 import jtech_cli
@@ -144,6 +145,39 @@ def styles_of(history: TranscriptHistory) -> list[tuple[str | None, str | None]]
                 )
             )
     return snapshot
+
+
+async def drag_select(pilot, widget: Widget, start: Offset, end: Offset) -> str:
+    """Press at ``start``, drag to ``end``, release; return the copied text.
+
+    Both offsets are widget-relative cells and both ends are inclusive, matching
+    the cells a pointer covers. The result is what Textual would put on the
+    clipboard, so these tests observe the selection coordinate system instead of
+    choosing one — a hand-built `Selection` cannot show that a drag selected the
+    whole widget rather than the range under the pointer.
+
+    The press/move/release go through `Pilot`, which owns the widget-relative to
+    screen-coordinate translation and the bounds check. `hover()` carries no
+    button, which is correct: the screen continues a drag from its own selecting
+    state rather than from the button field.
+    """
+    widget.screen.clear_selection()
+    await pilot.mouse_down(widget, start)
+    await pilot.hover(widget, end)
+    await pilot.mouse_up(widget, end)
+    await pilot.pause()
+    return widget.screen.get_selected_text()
+
+
+def painted_text(history: TranscriptHistory, row: int) -> str:
+    """The text the selection colour actually covers on one rendered row."""
+    highlight = history.selection_style.bgcolor
+    assert highlight is not None
+    return "".join(
+        segment.text
+        for segment in history.render_line(row)._segments
+        if segment.style is not None and segment.style.bgcolor == highlight
+    )
 
 
 def render_to_text(renderable, width: int = 60) -> str:
@@ -423,6 +457,66 @@ async def test_completed_markdown_parses_like_rich_for_everything_but_links():
     assert render_to_text(ours) == render_to_text(RichMarkdown(document))
 
 
+async def test_dragging_one_word_copies_that_word_and_not_the_transcript():
+    """A drag must select the range it covers, not the entire widget.
+
+    Textual derives a sub-widget selection from the ``offset`` metadata on the
+    segments `render_line()` returns. Without it the compositor reports no
+    content offset for any position inside the widget and the screen falls back
+    to `SELECT_ALL`, so dragging one word copies every completed message.
+    """
+    app = TranscriptApp(
+        [
+            TranscriptRecord("user", "first message"),
+            TranscriptRecord("ai", "second message with several words in it"),
+            TranscriptRecord("user", "third message"),
+        ]
+    )
+    async with app.run_test(size=SIZE) as pilot:
+        await pilot.pause()
+        history = transcript(app).history
+        row = next(y for y, line in enumerate(lines(history)) if "second" in line)
+        column = lines(history)[row].index("several")
+
+        copied = await drag_select(
+            pilot,
+            history,
+            Offset(column, row),
+            Offset(column + len("several") - 1, row),
+        )
+
+        selection = app.screen.selections[history]
+        assert selection.start is not None and selection.end is not None  # not all
+        assert copied == "several"
+        assert "first message" not in copied
+        assert "third message" not in copied
+
+
+async def test_dragging_across_wide_characters_copies_what_it_highlighted():
+    """Paste and highlight have to describe the same characters.
+
+    `Selection` indexes the rendered line by character while `Strip.divide()`
+    cuts on cells, so the conversion happens at paint time. The drag endpoints
+    here are screen cells measured with `cell_len()`, stating that rule rather
+    than one Unicode width table.
+    """
+    app = TranscriptApp([TranscriptRecord("ai", "A日本🙂B", format="plain")])
+    async with app.run_test(size=SIZE) as pilot:
+        await pilot.pause()
+        history = transcript(app).history
+        row = next(y for y, line in enumerate(lines(history)) if "日本" in line)
+
+        copied = await drag_select(
+            pilot,
+            history,
+            Offset(cell_len("A"), row),  # first cell of 日
+            Offset(cell_len("A日本"), row),  # first cell of 🙂
+        )
+
+        assert copied == "日本🙂"
+        assert painted_text(history, row) == "日本🙂"
+
+
 async def test_selection_extracts_and_paints_without_losing_content_or_links():
     url = "https://example.com/link"
     app = TranscriptApp([TranscriptRecord("ai", f"open [Example]({url}) please")])
@@ -430,18 +524,14 @@ async def test_selection_extracts_and_paints_without_losing_content_or_links():
         await pilot.pause()
         history = transcript(app).history
         row = next(y for y, line in enumerate(lines(history)) if "Example" in line)
-        line = lines(history)[row]
-
-        selection = Selection(Offset(0, row), Offset(len("open Example"), row))
-        extracted, ending = history.get_selection(selection)
-        assert extracted == line[: len("open Example")]
-        assert ending == "\n"
-
         unselected = history.render_line(row)
-        app.screen.selections = {history: selection}
-        await pilot.pause()
-        selected = history.render_line(row)
 
+        copied = await drag_select(
+            pilot, history, Offset(0, row), Offset(len("open Example") - 1, row)
+        )
+        assert copied == "open Example"
+
+        selected = history.render_line(row)
         assert selected.text == unselected.text
         assert selected.cell_length == unselected.cell_length
         assert any(
@@ -453,46 +543,59 @@ async def test_selection_extracts_and_paints_without_losing_content_or_links():
             for segment in selected._segments
         )
         # the selection colour really reaches the selected span, and only it
-        painted = history.selection_style.bgcolor
-        assert painted is not None
-        inside = "".join(
-            segment.text
-            for segment in selected._segments
-            if segment.style is not None and segment.style.bgcolor == painted
-        )
-        assert inside == "open Example"
+        assert painted_text(history, row) == "open Example"
 
 
-async def test_a_multiline_selection_copies_content_without_layout_padding():
-    """Copying across lines must not drag the pane-width padding along.
+async def test_a_multiline_drag_keeps_content_space_and_drops_layout_fill():
+    """Right-side fill goes; trailing spaces that came from the source stay.
 
-    Rendered lines are padded out so role backgrounds fill the pane. Pasted
-    into an editor that padding turns every copied line into trailing
-    whitespace, which is why extraction works on the unpadded text.
+    Rendered lines are padded out so role backgrounds fill the pane, and that
+    fill arrives as whitespace-only trailing segments. Source trailing spaces
+    sit inside the segment holding the visible content, so the two are told
+    apart by segment boundary — ``rstrip()`` would take both. A line that is
+    nothing but fill copies as a break rather than as a run of spaces.
     """
     app = TranscriptApp(
         [
+            TranscriptRecord("system", "plain-before  \nplain-after", format="plain"),
+            TranscriptRecord("ai", "```text\ncode-before  \ncode-after\n```"),
             TranscriptRecord("user", "hello"),
-            TranscriptRecord("system", "notice", format="plain"),
         ]
     )
     async with app.run_test(size=SIZE) as pilot:
         await pilot.pause()
         history = transcript(app).history
-        last = len(history._lines) - 1
+        rendered = lines(history)
 
         # the rendered lines really are padded — that is what has to be dropped
-        assert any(line != line.rstrip() for line in lines(history))
+        assert any(line != line.rstrip() for line in rendered)
 
-        selection = Selection(Offset(0, 0), Offset(history._render_width, last))
-        extracted, ending = history.get_selection(selection)
+        copied = await drag_select(
+            pilot,
+            history,
+            Offset(0, 0),
+            Offset(history._render_width - 1, len(rendered) - 1),
+        )
 
-        assert ending == "\n"
-        copied = extracted.split("\n")
-        assert copied == [line.rstrip() for line in copied]  # no trailing padding
-        assert "hello" in extracted
-        assert "notice" in extracted
-        assert extracted.index("hello") < extracted.index("notice")
+        # Textual drops the trailing blank lines from the copied text itself.
+        assert copied.split("\n") == [
+            "",
+            "SYSTEM",
+            "plain-before  ",  # the two source spaces survive
+            "plain-after",
+            "",
+            "",
+            "AI",
+            "",  # code-block top pad: fill only
+            " code-before  ",  # Rich's one-column code pad, then source spaces
+            " code-after",
+            "",  # code-block bottom pad: fill only
+            "",
+            "",
+            "USER",
+            "",  # bubble top pad: fill only
+            "  hello",  # the bubble's visible left pad, without the right fill
+        ]
 
 
 async def test_a_theme_reflow_restyles_without_changing_records_or_text():

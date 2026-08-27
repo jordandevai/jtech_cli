@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import ClassVar, Literal, Protocol, runtime_checkable
 
 from markdown_it import MarkdownIt
+from rich.cells import cell_len
 from rich.console import Console, Group, RenderableType
 from rich.errors import MarkupError
 from rich.markdown import Markdown as RichMarkdown
@@ -435,7 +436,16 @@ class TranscriptHistory(Widget):
         return len(self._lines)
 
     def render_line(self, y: int) -> Strip:
-        """Return one rendered line, painting the active selection over it."""
+        """Return one rendered line, selection painted and offsets stamped.
+
+        The offsets are what let Textual select inside this widget at all: the
+        compositor reads ``meta["offset"]`` off the segments this returns, and
+        without it every drag over completed history resolves to the whole
+        widget. They are stamped last, over the final segment layout, because
+        `Strip.divide()` gives both halves of a split segment the original
+        segment's style — offsets applied earlier would misreport the second
+        half's start.
+        """
         width = self.size.width
         self._ensure_rendered(width)
         rich_style = self.rich_style
@@ -443,19 +453,33 @@ class TranscriptHistory(Widget):
             return Strip.blank(width, rich_style)
         line = self._lines[y].crop_extend(0, width, rich_style).apply_style(rich_style)
         selection = self.text_selection
-        if selection is None:
-            return line
-        span = selection.get_span(y)
-        if span is None:
-            return line
+        if selection is not None:
+            span = selection.get_span(y)
+            if span is not None:
+                line = self._paint_span(line, span)
+        # x origin 0: this widget sits inside the scrolling container and never
+        # scrolls horizontally itself.
+        return line.apply_offsets(0, y)
+
+    def _paint_span(self, line: Strip, span: tuple[int, int]) -> Strip:
+        """Paint the selected part of ``line``, given a character span.
+
+        `Selection` carries character offsets into the rendered line — that is
+        the coordinate system `Strip.apply_offsets()` stamps and the compositor
+        converts a screen cell into. `Strip.divide()` cuts on cell positions
+        instead, so the span is converted here, and only here, with Rich's own
+        width measurement.
+        """
+        text = line.text
         start, end = span
-        length = line.cell_length
-        end = length if end == -1 else end
-        start = max(0, min(start, length))
-        end = max(start, min(end, length))
-        if start == end:
+        end = len(text) if end == -1 else end
+        start = max(0, min(start, len(text)))
+        end = max(start, min(end, len(text)))
+        cell_start = cell_len(text[:start])
+        cell_end = cell_len(text[:end])
+        if cell_start == cell_end:
             return line
-        before, selected, after = line.divide([start, end, length])
+        before, selected, after = line.divide([cell_start, cell_end, line.cell_length])
         return Strip.join([before, self._paint(selected, self.selection_style), after])
 
     @staticmethod
@@ -470,16 +494,40 @@ class TranscriptHistory(Widget):
             list(Segment.apply_style(strip, post_style=style)), strip.cell_length
         )
 
+    @staticmethod
+    def _copyable_text(strip: Strip) -> str:
+        """One rendered line's text, with the right-side layout fill removed.
+
+        A line is padded out to the pane width so role backgrounds fill it, and
+        that fill arrives as its own whitespace-only trailing segments.
+        Trailing spaces that came from the source stay inside the segment
+        carrying the visible content, so dropping whole trailing whitespace
+        segments removes the layout and keeps the content — where `rstrip()`
+        would take both.
+
+        A line that is nothing but fill has no visible difference between
+        source whitespace and layout, so it reduces to ``""``: the break is
+        preserved without pasting a pane-width run of spaces.
+        """
+        segments = list(strip)
+        while segments and segments[-1].text and segments[-1].text.isspace():
+            segments.pop()
+        return "".join(segment.text for segment in segments if not segment.control)
+
     def get_selection(self, selection: Selection) -> tuple[str, str] | None:
         """Extract the selected completed text, without the layout padding.
 
-        Rendered lines are padded out to the pane width so role backgrounds
-        fill it. That padding is layout, not content: copied across several
-        lines it would bury pasted prose and code in trailing spaces. Dropping
-        only trailing space leaves every column offset inside a line intact, so
-        the extracted text still lines up with the visual selection.
+        `Selection` indexes the rendered line by character — the coordinate
+        system `render_line()` stamps with `Strip.apply_offsets()` — so
+        `Selection.extract()` slices it directly. Only the fill is removed
+        first, and because fill is appended it shifts no index a content
+        character occupies; a selection reaching into it simply clamps.
+
+        The rendered, reflowed text is what the user selected, so that is what
+        is copied; the source Markdown is not reconstructed. The whole line
+        cache is walked, but only when a copy is actually requested.
         """
-        text = "\n".join(strip.text.rstrip() for strip in self._lines)
+        text = "\n".join(self._copyable_text(strip) for strip in self._lines)
         return selection.extract(text), "\n"
 
     async def action_open_link(self, href: str) -> None:

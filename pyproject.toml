@@ -6,9 +6,21 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "bashlex>=0.18",
+    # ``_TranscriptMarkdown`` re-derives the ``markup`` and ``parsed`` state of
+    # Rich's Markdown renderer and feeds it markdown-it's ``gfm-like`` token
+    # stream. That is an internal contract of these exact releases, so both are
+    # pinned rather than ranged, and the parser is declared directly instead of
+    # being borrowed from Rich's transitive dependencies.
+    "markdown-it-py[linkify]==4.2.0",
     "openai>=1.30.0",
-    "rich>=13.7.0",
-    "textual>=0.80",
+    "rich==15.0.0",
+    # Completed-history selection rides Textual's content-offset protocol:
+    # Strip.apply_offsets(), Widget.get_selection()/text_selection, and the
+    # compositor's cell-to-character conversion. That protocol only settled
+    # into its current end-offset semantics in 8.2.0 — 8.1.1 and earlier fail
+    # the transcript selection tests, and nothing before 2.0.0 has the API at
+    # all.
+    "textual>=8.2.0",
 ]
 
 [tool.uv]
