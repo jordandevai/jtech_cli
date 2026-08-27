@@ -29,6 +29,7 @@ from jtech_cli.tui_screens import (
     CmdChoice,
     CommandPrompt,
     ProfilesScreen,
+    QuitScreen,
     SettingsScreen,
 )
 from jtech_cli.tui_widgets import (
@@ -111,6 +112,7 @@ __all__ = [
     "MultilineSubmit",
     "OutputSink",
     "ProfilesScreen",
+    "QuitScreen",
     "SettingsScreen",
     "fetch_server_info",
     "render_menu_rows",

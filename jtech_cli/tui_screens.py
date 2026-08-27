@@ -1,4 +1,4 @@
-"""Modal screens for command approval, settings editing, and profile management."""
+"""Modal screens for command approval, settings, profiles, and quit confirmation."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from typing import ClassVar, Protocol
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical, VerticalScroll
-from textual.screen import ModalScreen
+from textual.screen import ModalScreen, ScreenResultType
 from textual.widgets import Static, TextArea
 
 from jtech_cli.cmd_tools import CmdPolicy
@@ -33,13 +33,36 @@ from jtech_cli.tui_widgets import (
 )
 
 
+class _ChatModal(ModalScreen[ScreenResultType]):
+    """Base modal that keeps the application's contextual ``Ctrl+C`` reachable.
+
+    Textual truncates the non-priority binding chain at the innermost modal
+    (``Screen._modal_binding_chain``), so a modal otherwise swallows ``Ctrl+C``
+    once its own copy action skips, and the app never sees it. Both
+    destinations are declared for the one key: ``_check_bindings()`` walks them
+    in order and stops at the first that does not raise ``SkipAction``, so a
+    non-empty selection still copies and only an unconsumed press reaches the
+    app.
+
+    ``screen.copy_text`` is re-declared rather than reimplemented; it has to be
+    named again only because a subclass that declares a key replaces every
+    base-class binding for it. ``Cmd+C`` is untouched — ``Screen`` registers it
+    under the separate ``super+c`` key.
+    """
+
+    BINDINGS: ClassVar[list[Binding]] = [
+        Binding("ctrl+c", "screen.copy_text", "Copy selected text", show=False),
+        Binding("ctrl+c", "app.contextual_ctrl_c", "Quit", show=False),
+    ]
+
+
 class CmdChoice(enum.Enum):
     ALLOW = "allow"
     ALWAYS = "always"
     DECLINE = "decline"
 
 
-class CommandPrompt(ModalScreen[CmdChoice]):
+class CommandPrompt(_ChatModal[CmdChoice]):
     """Approval prompt for one AI-requested shell command."""
 
     BINDINGS: ClassVar[list[Binding]] = [
@@ -72,7 +95,7 @@ class CommandPrompt(ModalScreen[CmdChoice]):
         self.dismiss(CmdChoice.DECLINE)
 
 
-class SettingsScreen(ModalScreen[None]):
+class SettingsScreen(_ChatModal[None]):
     """Menu-style settings editor with immediate validation and persistence."""
 
     BINDINGS: ClassVar[list[Binding]] = [
@@ -217,7 +240,7 @@ class CommitProfiles(Protocol):
     ) -> None: ...
 
 
-class ProfilesScreen(ModalScreen[None]):
+class ProfilesScreen(_ChatModal[None]):
     """Manage API profiles: list, activate, add, edit, rename, and delete.
 
     Deliberately probes nothing. Connectivity is transient and a local server
@@ -496,3 +519,68 @@ class ProfilesScreen(ModalScreen[None]):
             return False
         self._profiles = candidate
         return True
+
+
+class QuitScreen(ModalScreen[bool]):
+    """Confirm an ordinary quit; a second Ctrl+C confirms immediately.
+
+    The screen decides nothing about the application's lifetime: it returns
+    ``True`` to exit and ``False`` to stay, and ``ChatApp`` owns the exit.
+
+    Its ``Ctrl+C`` is declared ``priority=True`` deliberately. Every other
+    ``Ctrl+C`` in the app is selection-first; this one is the panic exit the
+    user pressed twice, so it must win even over a selection inside the dialog.
+    """
+
+    BINDINGS: ClassVar[list[Binding]] = [
+        Binding("left,up,shift+tab", "move(-1)", "Previous", show=False),
+        Binding("right,down,tab", "move(1)", "Next", show=False),
+        Binding("enter", "choose", "Choose", show=False),
+        Binding("escape", "stay", "Stay", show=False),
+        Binding(
+            "ctrl+c",
+            "panic_quit",
+            "Quit now",
+            show=False,
+            priority=True,
+        ),
+    ]
+
+    CHOICES: ClassVar[tuple[tuple[str, str], ...]] = (
+        ("Stay", "Return to JTech CLI"),
+        ("Quit", "Exit JTech CLI"),
+    )
+
+    _HINT = "Arrows/Tab choose · Enter confirm · Esc stay · Ctrl+C quit now"
+
+    def __init__(self) -> None:
+        super().__init__()
+        # Index 0 is Stay: the default must never be the destructive choice.
+        self._cursor = 0
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="quit-dialog"):
+            yield Static("Quit JTech CLI?", classes="dialog-title")
+            yield Static(id="quit-rows")
+            yield Static(self._HINT, id="quit-hint")
+
+    def on_mount(self) -> None:
+        self._render_choices()
+
+    def action_move(self, direction: int) -> None:
+        self._cursor = (self._cursor + direction) % len(self.CHOICES)
+        self._render_choices()
+
+    def action_choose(self) -> None:
+        self.dismiss(self._cursor == 1)
+
+    def action_stay(self) -> None:
+        self.dismiss(False)
+
+    def action_panic_quit(self) -> None:
+        self.dismiss(True)
+
+    def _render_choices(self) -> None:
+        self.query_one("#quit-rows", Static).update(
+            render_menu_rows(self.CHOICES, self._cursor)
+        )

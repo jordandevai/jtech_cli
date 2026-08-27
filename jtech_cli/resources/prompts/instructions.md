@@ -1,6 +1,6 @@
 Available slash commands:
 
-  /exit              Quit the session (also Ctrl+Q / Ctrl+C)
+  /exit              Quit the session (also Ctrl+Q)
   /help              Show this help
   /clear             Clear conversation history
   /read PATH[:LINE]  Print a file with line numbers. Line range like main.py:10-40 or main.py:10
@@ -46,7 +46,20 @@ Keys:
   input empty)       (not submitted): edit it, or clear it to cancel it, then
                        Enter sends it (back to the queue if still replying)
   Ctrl+S             Open settings dialog
-  Ctrl+Q / Ctrl+C    Quit
+  Ctrl+Q             Quit immediately
+  Ctrl+C             Copy the selection if there is one; otherwise clear the
+                     chat composer (single- or multi-line, whitespace included)
+                     without leaving; otherwise, with an empty composer, open
+                     the quit confirmation. Over settings, profiles, or a
+                     command prompt it opens that confirmation and leaves the
+                     screen and its unsaved fields untouched.
+  Ctrl+C / Esc       In the quit confirmation: Ctrl+C exits immediately, Esc
+  (quit prompt)      returns to the previous screen. Stay is the default;
+                     arrows/Tab move and Enter confirms.
+  Ctrl+V             Paste the application's local clipboard into the focused
+                     single-line or multi-line editor. Pasting from the system
+                     clipboard uses your terminal's own shortcut and bracketed
+                     paste, not an application key.
   Ctrl+L             Clear the chat
 
 API profiles:

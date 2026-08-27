@@ -154,6 +154,24 @@ error rather than resolved by guessing which endpoint was meant.
   one step. Deleting the active profile is refused — activate another first, so
   no endpoint is ever chosen for you. Nothing is probed here: a local server may
   legitimately be stopped while its profile is edited.
+- **Contextual `Ctrl+C`**: one key, resolved in priority order — copy a
+  non-empty selection; otherwise clear the chat composer (single-line or
+  multi-line, whitespace included) without leaving; otherwise, with an empty
+  composer, open a quit confirmation. **Stay** is the default, `Esc` returns to
+  the previous screen, arrows/`Tab` plus `Enter` choose, and pressing `Ctrl+C`
+  again in that prompt exits immediately. Opened above `/settings`, `/profiles`,
+  or a command prompt it leaves that screen and any unsaved field untouched.
+  `Ctrl+Q` and `/exit` still quit immediately.
+- **Clipboard**: `Ctrl+V` pastes Textual's local clipboard into the focused
+  single-line or multi-line editor, so copy-then-paste inside the app works
+  everywhere with no clipboard integration at all. Copying *out* to the system
+  clipboard is a best-effort OSC 52 request that your terminal — and, under
+  tmux, its configuration — may or may not honour; the app is never told either
+  way, so it never claims success. Pasting *in* from the system clipboard stays
+  with your terminal's own shortcut and bracketed paste (`Ctrl+Shift+V`,
+  `Shift+Insert`, or `Cmd+V` are common examples, not guaranteed bindings). For
+  environment-specific setup, see
+  [tmux's clipboard documentation](https://github.com/tmux/tmux/wiki/Clipboard).
 - **Connection errors**: a missing profile or an unreachable endpoint renders a
   clear notice in the chat (and a startup hint to open `/profiles`) instead of a
   raw stack trace. An invalid config file stops startup with one actionable
@@ -169,7 +187,9 @@ error rather than resolved by guessing which endpoint was meant.
 | `Esc` | Cancel multi-line editor · stop a reply while it streams |
 | `Ctrl+S` | Open settings dialog |
 | `Ctrl+L` | Clear the chat |
-| `Ctrl+Q` / `Ctrl+C` | Quit |
+| `Ctrl+Q` | Quit immediately |
+| `Ctrl+C` | Copy selection · otherwise clear composer · when empty, confirm quit |
+| `Ctrl+V` | Paste the local clipboard into the focused editor |
 
 ## Commands
 

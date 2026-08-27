@@ -51,6 +51,7 @@ from jtech_cli.tui_screens import (
     CmdChoice,
     CommandPrompt,
     ProfilesScreen,
+    QuitScreen,
     SettingsScreen,
 )
 from jtech_cli.tui_widgets import (
@@ -134,7 +135,7 @@ class ChatApp(App):
 
     BINDINGS: ClassVar[list[Binding]] = [
         Binding("ctrl+q", "quit", "Quit"),
-        Binding("ctrl+c", "quit", "Quit"),
+        Binding("ctrl+c", "contextual_ctrl_c", "Copy / Clear / Quit"),
         Binding("ctrl+l", "clear_chat", "Clear"),
         Binding("ctrl+s", "settings", "Settings"),
         Binding("escape", "stop_stream", "Stop", show=False),
@@ -1117,3 +1118,45 @@ class ChatApp(App):
 
     def action_settings(self) -> None:
         self._open_settings()
+
+    def action_contextual_ctrl_c(self) -> None:
+        """Clear the chat composer, or confirm quit once it is already empty.
+
+        Selection copy is not handled here. Textual's ``Input``, ``TextArea``,
+        and ``Screen`` copy actions raise ``SkipAction`` only when there is
+        nothing selected, so reaching this action *is* the evidence that no
+        selection existed — re-checking it here would be a second clipboard
+        path that could disagree with the first.
+
+        A non-quit modal owns the screen when the stack is deeper than one. Its
+        fields are not the chat composer, so a global shortcut must not erase an
+        unsaved profile or settings edit: the confirmation opens above it and
+        leaves both that modal and the suspended draft untouched.
+        """
+        if len(self.screen_stack) == 1:
+            textarea = self._multiline_textarea
+            if textarea is not None:
+                if textarea.text != "":
+                    textarea.text = ""
+                    textarea.focus()
+                    return
+            else:
+                # Whitespace is user-entered content: clear it rather than
+                # treating it as an empty composer that should offer to quit.
+                chat_input = self.query_one("#input", _ChatInput)
+                if chat_input.value != "":
+                    chat_input.value = ""
+                    # Input.Changed -> _update_suggestions() hides the menu.
+                    chat_input.focus()
+                    return
+        self.push_screen(QuitScreen(), self._complete_quit)
+
+    def _complete_quit(self, confirmed: bool) -> None:
+        """Exit only on an explicit confirmation from the quit screen.
+
+        Staying needs no work: dismissing the modal restores the previous screen
+        and its focus, which may be settings, profiles, or a command prompt
+        rather than the chat input.
+        """
+        if confirmed:
+            self.exit()

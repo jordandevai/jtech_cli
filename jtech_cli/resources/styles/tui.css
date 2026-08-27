@@ -73,7 +73,8 @@ TranscriptHistory {
 
 #settings-dialog,
 #profiles-dialog,
-#cmd-dialog {
+#cmd-dialog,
+#quit-dialog {
     width: 72;
     height: auto;
     max-height: 100%;
@@ -87,13 +88,15 @@ TranscriptHistory {
     border: round $primary;
 }
 
-#cmd-dialog {
+#cmd-dialog,
+#quit-dialog {
     border: round $warning;
 }
 
 #settings-dialog .dialog-title,
 #profiles-dialog .dialog-title,
-#cmd-dialog .dialog-title {
+#cmd-dialog .dialog-title,
+#quit-dialog .dialog-title {
     text-style: bold;
     text-align: center;
     margin-bottom: 1;
@@ -102,7 +105,8 @@ TranscriptHistory {
 #settings-rows,
 #settings-editor,
 #profiles-rows,
-#profiles-editor {
+#profiles-editor,
+#quit-rows {
     padding: 0 1;
 }
 
@@ -123,7 +127,8 @@ TranscriptHistory {
 }
 
 #settings-hint,
-#profiles-hint {
+#profiles-hint,
+#quit-hint {
     color: $text-muted;
     margin-top: 1;
     text-align: center;
