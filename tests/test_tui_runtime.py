@@ -741,3 +741,38 @@ async def test_cancelling_during_process_creation_still_kills_the_command(tmp_pa
         # Past the background job's own delay: it must never have run.
         await asyncio.sleep(3)
     assert not marker.exists()
+
+
+async def test_cancelling_a_running_command_kills_it_without_a_prior_stop(tmp_path):
+    """Plain task cancellation, as Textual delivers it to a worker.
+
+    `_exec_command()`'s own `finally` releases ownership of the process, so by
+    the time `run()` gets to call `request_stop()` there is nothing left for it
+    to find. Stopping the command cannot be delegated to whoever cancelled the
+    task: the command phase has to own it.
+    """
+    marker = tmp_path / "orphan.txt"
+    command = f"( sleep 3; echo LEAKED > {marker} ) & sleep 60 | cat"
+    stream, _ = scripted_stream(command_call(command), "done")
+    async with _Harness().run_test() as pilot:
+        runtime, _ = make_runtime(pilot.app, stream, root=tmp_path)
+        task = asyncio.create_task(runtime.run())
+        proc = await wait_for_command(runtime, pilot)
+        children = descendants(proc.pid)
+        assert len(children) >= 2, children
+
+        # No request_stop() and no app exit: cancellation alone.
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert runtime.state.running_proc is None
+        assert proc.poll() is not None, "the command outlived its cancelled run"
+        for _ in range(100):
+            await pilot.pause(0.05)
+            if not alive(children):
+                break
+        assert alive(children) == []
+        # Past the background job's own delay: it must never have run.
+        await asyncio.sleep(4)
+    assert not marker.exists()

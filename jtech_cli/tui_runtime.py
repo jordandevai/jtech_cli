@@ -832,6 +832,21 @@ class AutonomousRuntime:
                     out, _ = await asyncio.to_thread(
                         proc.communicate, timeout=self._cmd.timeout
                     )
+                except asyncio.CancelledError:
+                    # Cancelling the await does not stop the child, and the
+                    # ``finally`` below is about to release ownership of it —
+                    # after which ``request_stop()`` has nothing left to find.
+                    # This is the last place that can stop the command, so it
+                    # does not delegate the job to whoever cancelled it.
+                    #
+                    # The kill is synchronous and lands before this yields:
+                    # the command must not depend on this coroutine being
+                    # resumed, or on the loop still scheduling work, to die.
+                    # Only the reap waits, shielded so a second cancellation
+                    # cannot skip it.
+                    _kill_command_group(proc)
+                    await asyncio.shield(asyncio.to_thread(proc.wait))
+                    raise
                 except subprocess.TimeoutExpired as error:
                     _kill_command_group(proc)
                     await asyncio.to_thread(proc.wait)
