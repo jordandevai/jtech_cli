@@ -921,22 +921,42 @@ def _status_glyph(status: str) -> str:
         raise ValueError(f"Unknown agent status: {status!r}") from None
 
 
+def _check_single_line(value: str, what: str) -> None:
+    """Reject a label that would not occupy exactly one sidebar row.
+
+    A row is one line for the agent plus one line per task, so a label carrying
+    its own line break forges a row the orchestration layer never declared —
+    a fake agent or a fake task, drawn indistinguishably from a real one.
+    ``splitlines()`` is the predicate because it is exactly what splits the
+    rendered text: it catches an interior break, a trailing one, and the
+    carriage returns and Unicode separators a terminal would break on too.
+
+    Raises:
+        ValueError: if ``value`` is anything other than one line.
+    """
+    if value.splitlines() != [value]:
+        raise ValueError(f"{what} must be a single line: {value!r}")
+
+
 def _validate_agent_summary(summary: AgentSummary) -> None:
     """Check one summary completely, before anything is mutated for it.
 
     This is the only validation on the orchestration-to-presentation boundary,
     shared by insertion and update, so neither path can accept data the other
     would reject. Nothing here strips, generates, repairs, or substitutes
-    caller data.
+    caller data — a label with a line break is rejected, never silently
+    flattened.
 
     Raises:
-        ValueError: if an id or label is empty, a status is unknown, or two
-            tasks of this agent share a task id.
+        ValueError: if an id or label is empty, a label spans more than one
+            line, a status is unknown, or two tasks of this agent share a task
+            id.
     """
     if not summary.agent_id:
         raise ValueError("An agent summary needs a non-empty agent id")
     if not summary.label:
         raise ValueError(f"Agent {summary.agent_id!r} needs a non-empty label")
+    _check_single_line(summary.label, f"The label of agent {summary.agent_id!r}")
     _status_glyph(summary.status)
     seen: set[str] = set()
     for task in summary.tasks:
@@ -949,6 +969,10 @@ def _validate_agent_summary(summary: AgentSummary) -> None:
                 f"Task {task.task_id!r} of agent {summary.agent_id!r} needs a "
                 "non-empty label"
             )
+        _check_single_line(
+            task.label,
+            f"The label of task {task.task_id!r} of agent {summary.agent_id!r}",
+        )
         _status_glyph(task.status)
         if task.task_id in seen:
             raise ValueError(
@@ -1076,6 +1100,10 @@ class AgentWorkspace(Horizontal):
         self._items: dict[str, _AgentListItem] = {
             primary.agent_id: _AgentListItem(primary, selected=True)
         }
+        # Agent ids claimed by a registration that has not finished yet.
+        # ``add_agent()`` awaits two DOM mutations, so the registry alone cannot
+        # answer "is this id taken?" across that gap.
+        self._pending: set[str] = set()
         self._primary_agent_id = primary.agent_id
         self._selected_agent_id = primary.agent_id
 
@@ -1139,27 +1167,57 @@ class AgentWorkspace(Horizontal):
         already mounted; a violation of that contract surfaces as the normal
         mount error rather than being queued or dropped.
 
+        Registration spans two awaited DOM mutations, so the id is claimed
+        before the first of them: two concurrent registrations of one id would
+        otherwise both pass a check made only against the finished registry,
+        both mount, and leave one transcript orphaned under a sidebar row the
+        registry cannot reach. A registration that fails or is cancelled after
+        mounting takes its widgets back out and releases the claim, so the
+        workspace is left exactly as it was and the id is free to retry.
+
         Args:
             summary: The new agent's presentation data.
             records: Completed activity to seed, rendered in one pass.
 
         Raises:
             ValueError: if ``summary`` fails boundary validation, or if its
-                agent id is already registered.
+                agent id is already registered or currently being registered.
         """
         _validate_agent_summary(summary)
-        if summary.agent_id in self._summaries:
-            raise ValueError(f"Agent {summary.agent_id!r} is already registered")
+        agent_id = summary.agent_id
+        if agent_id in self._summaries:
+            raise ValueError(f"Agent {agent_id!r} is already registered")
+        if agent_id in self._pending:
+            raise ValueError(f"Agent {agent_id!r} is already being registered")
+        # Claimed synchronously, before any await can yield to another caller.
+        self._pending.add(agent_id)
         transcript = Transcript(classes="agent-activity")
         transcript.display = False
         item = _AgentListItem(summary, selected=False)
-        await self.query_one("#activity-stack", Vertical).mount(transcript)
-        await self.query_one("#agent-list", ListView).append(item)
-        if records:
-            transcript.load(records)
-        self._summaries[summary.agent_id] = summary
-        self._activities[summary.agent_id] = transcript
-        self._items[summary.agent_id] = item
+        try:
+            try:
+                await self.query_one("#activity-stack", Vertical).mount(transcript)
+                await self.query_one("#agent-list", ListView).append(item)
+                if records:
+                    transcript.load(records)
+            except BaseException:
+                # BaseException, because cancellation between the mounts is the
+                # likeliest way this unwinds and it must not leave a widget the
+                # registry never learned about. ``parent``, not ``is_mounted``:
+                # Textual finishes mounting on a later pass of the loop, but a
+                # widget is in the DOM from the mount call onward. The base
+                # method is named explicitly because ``Transcript.remove()``
+                # means "drop this tail entry", not "leave the DOM".
+                for widget in (transcript, item):
+                    if widget.parent is not None:
+                        Widget.remove(widget)
+                raise
+            # Synchronous from here: the three registries commit together.
+            self._summaries[agent_id] = summary
+            self._activities[agent_id] = transcript
+            self._items[agent_id] = item
+        finally:
+            self._pending.discard(agent_id)
         return transcript
 
     def update_agent(self, summary: AgentSummary) -> None:

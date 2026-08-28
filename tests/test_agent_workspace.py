@@ -6,6 +6,7 @@ which are testable with a minimal host and, for the pure helper, with no host
 at all.
 """
 
+import asyncio
 from pathlib import Path
 
 import pytest
@@ -433,6 +434,112 @@ async def test_invalid_duplicate_and_unknown_agent_data_fails_explicitly():
         assert len(app.query(Transcript)) == 2
         assert workspace.selected_agent_id == "primary"
         assert workspace.selected_activity is chat
+
+
+async def test_concurrent_registration_of_one_id_registers_exactly_one_agent():
+    """Registration spans two awaits, so the id must be claimed before them."""
+    app = WorkspaceApp()
+    async with app.run_test() as pilot:
+        workspace = workspace_of(app)
+
+        results = await asyncio.gather(
+            workspace.add_agent(AgentSummary("same", "First", "running")),
+            workspace.add_agent(AgentSummary("same", "Second", "idle")),
+            return_exceptions=True,
+        )
+        await pilot.pause()
+
+        granted = [r for r in results if isinstance(r, Transcript)]
+        refused = [r for r in results if isinstance(r, ValueError)]
+        assert len(granted) == 1
+        assert len(refused) == 1
+        assert "already being registered" in str(refused[0])
+
+        # The winner's handle is the one the registry hands out, and the loser
+        # left neither a transcript nor a sidebar row behind.
+        assert workspace.activity_for("same") is granted[0]
+        assert list(workspace._summaries) == ["primary", "same"]
+        assert len(app.query(Transcript)) == 2
+        assert len(app.query(_AgentListItem)) == 2
+        assert workspace._pending == set()
+
+
+async def test_a_cancelled_registration_leaves_no_widget_and_frees_its_id():
+    app = WorkspaceApp()
+    async with app.run_test() as pilot:
+        workspace = workspace_of(app)
+        before_streams = len(app.query(Transcript))
+        before_rows = len(app.query(_AgentListItem))
+
+        registration = asyncio.ensure_future(
+            workspace.add_agent(AgentSummary("ghost", "Ghost", "idle"))
+        )
+        # Yield once so it reaches its first awaited DOM mutation, then cancel
+        # it the way an orchestrator's ``wait_for`` or task cancellation would.
+        await asyncio.sleep(0)
+        registration.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await registration
+        await pilot.pause()
+
+        assert list(workspace._summaries) == ["primary"]
+        assert len(app.query(Transcript)) == before_streams
+        assert len(app.query(_AgentListItem)) == before_rows
+        assert workspace._pending == set()
+
+        # A cancelled registration is not a claim: the id retries cleanly.
+        retried = await workspace.add_agent(AgentSummary("ghost", "Ghost", "idle"))
+        await pilot.pause()
+        assert workspace.activity_for("ghost") is retried
+        assert len(app.query(Transcript)) == before_streams + 1
+        assert len(app.query(_AgentListItem)) == before_rows + 1
+
+
+async def test_a_label_may_not_forge_a_sidebar_row():
+    """A line break in a label would draw a row nobody declared."""
+    forged_agent = AgentSummary("x", "Agent A\n  ! Forged agent", "idle")
+    forged_task = AgentSummary(
+        "y",
+        "Agent B",
+        "idle",
+        (AgentTaskSummary("t", "Task\n  ● Forged", "idle"),),
+    )
+    trailing_agent = AgentSummary("z", "Agent C\n", "idle")
+    carriage_task = AgentSummary(
+        "w", "Agent D", "idle", (AgentTaskSummary("t", "Task\r  ● Forged", "idle"),)
+    )
+
+    # The constructor is a boundary too, not just add/update.
+    with pytest.raises(ValueError, match="must be a single line"):
+        AgentWorkspace(forged_agent, Transcript())
+
+    app = WorkspaceApp()
+    async with app.run_test() as pilot:
+        workspace = workspace_of(app)
+        await workspace.add_agent(AgentSummary("a", "Agent A", "idle"))
+        await pilot.pause()
+        before = sidebar_rows(app)
+
+        for summary in (forged_agent, forged_task, trailing_agent, carriage_task):
+            with pytest.raises(ValueError, match="must be a single line"):
+                await workspace.add_agent(summary)
+        with pytest.raises(ValueError, match="must be a single line"):
+            workspace.update_agent(AgentSummary("a", "Agent A\n  ! Forged", "idle"))
+        with pytest.raises(ValueError, match="must be a single line"):
+            workspace.update_agent(
+                AgentSummary(
+                    "a",
+                    "Agent A",
+                    "idle",
+                    (AgentTaskSummary("t", "Task\n  ● Forged", "idle"),),
+                )
+            )
+        await pilot.pause()
+
+        # Every row still comes from a summary the caller actually declared.
+        assert sidebar_rows(app) == before
+        assert list(workspace._summaries) == ["primary", "a"]
+        assert workspace._pending == set()
 
 
 async def test_theme_refresh_reaches_hidden_transcripts(monkeypatch):
