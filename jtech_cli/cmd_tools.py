@@ -1,9 +1,14 @@
-"""Guarded shell command execution: parse, policy, and executor.
+"""Guarded tool protocol, shell command policy, and executor.
 
-The AI requests commands with standalone ``jtech_cmd(...)`` calls. Each call is
-decided in order: absolute blacklist (immutable, all modes) -> mode (off/yolo)
--> allowlist -> prompt. Pure logic lives here so it is unit-testable without
-the TUI; the TUI owns prompting, rendering, and re-stream.
+The AI requests work with standalone ``jtech_cmd(...)`` and ``jtech_agent(...)``
+calls. One scanner owns both: they differ only in name, arity, and argument
+validation, so fence handling, HTML-wrapper handling, quoted-literal parsing,
+standalone-line detection, span masking, and diagnostics are written once.
+
+Shell calls are then decided in order: absolute blacklist (immutable, all
+modes) -> mode (off/yolo) -> allowlist -> prompt. Pure logic lives here so it
+is unit-testable without the TUI; the TUI owns prompting, rendering, dispatch,
+and re-stream.
 """
 
 from __future__ import annotations
@@ -11,8 +16,10 @@ from __future__ import annotations
 import ast
 import re
 import subprocess
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal
 
 import bashlex
 from bashlex.errors import ParsingError
@@ -71,12 +78,105 @@ class CmdPolicy:
     max_output: int = DEFAULT_MAX_OUTPUT
 
 
+#: Key rule for a dispatched agent; ``primary`` is the app's own conversation.
+_AGENT_KEY_PATTERN = re.compile(r"[a-z0-9][a-z0-9_-]*")
+RESERVED_AGENT_KEY = "primary"
+
+ToolName = Literal["jtech_cmd", "jtech_agent"]
+
+
+def _single_line(field_name: str, value: str) -> str:
+    """Return ``value`` stripped, rejecting an empty or multi-line label.
+
+    Raises:
+        ValueError: if the stripped value is empty or spans more than one line.
+    """
+    text = value.strip()
+    if not text:
+        raise ValueError(f"{field_name} must not be empty")
+    if text.splitlines() != [text]:
+        raise ValueError(f"{field_name} must be a single line")
+    return text
+
+
+@dataclass(frozen=True, slots=True)
+class AgentDispatch:
+    """One validated ``jtech_agent(...)`` call.
+
+    The boundary value between the tool protocol and orchestration. Every field
+    is normalized (outer whitespace stripped) and validated here, so no caller
+    truncates, synthesizes, or silently replaces a label or a task.
+
+    Args:
+        agent_key: Stable lowercase key identifying one reusable private
+            conversation. Reusing it continues that agent.
+        agent_label: Single-line sidebar label; immutable for the key.
+        profile_name: Name of an available API profile; immutable for the key.
+        task_label: Single-line task label shown beneath the agent.
+        task: The complete instruction sent to the agent. May be multiline.
+
+    Raises:
+        ValueError: if any field violates those rules.
+    """
+
+    agent_key: str
+    agent_label: str
+    profile_name: str
+    task_label: str
+    task: str
+
+    def __post_init__(self) -> None:
+        # ``object.__setattr__`` because the boundary value is frozen: this is
+        # normalization at construction, not mutation afterwards.
+        key = self.agent_key.strip()
+        if not _AGENT_KEY_PATTERN.fullmatch(key):
+            raise ValueError(
+                f"agent_key {key!r} is invalid: use lowercase letters, digits, "
+                "'-' or '_', starting with a letter or digit"
+            )
+        if key == RESERVED_AGENT_KEY:
+            raise ValueError(
+                f"agent_key {RESERVED_AGENT_KEY!r} is reserved for the coordinator"
+            )
+        object.__setattr__(self, "agent_key", key)
+        object.__setattr__(
+            self, "agent_label", _single_line("agent_label", self.agent_label)
+        )
+        object.__setattr__(
+            self, "profile_name", _single_line("profile_name", self.profile_name)
+        )
+        object.__setattr__(
+            self, "task_label", _single_line("task_label", self.task_label)
+        )
+        task = self.task.strip()
+        if not task:
+            raise ValueError("task must not be empty")
+        object.__setattr__(self, "task", task)
+
+
+@dataclass(frozen=True, slots=True)
+class ToolProtocolError:
+    """One recognized tool call the runtime refuses to execute.
+
+    Args:
+        tool_name: The tool whose call line failed.
+        line: One-based line of the candidate call in the model's own reply.
+        message: What the model must correct.
+    """
+
+    tool_name: ToolName
+    line: int
+    message: str
+
+
 @dataclass
 class ParsedReply:
-    """The executable command region and optional surrounding commentary."""
+    """The executable tool calls, diagnostics, and surrounding commentary."""
 
     commands: list[str]
     commentary: str = ""
+    dispatches: list[AgentDispatch] = field(default_factory=list)
+    errors: list[ToolProtocolError] = field(default_factory=list)
 
 
 class ShellParseError(ValueError):
@@ -179,6 +279,33 @@ def _analyze_shell(command: str) -> _ShellAnalysis:
 # ---------------------------------------------------------------- parsing
 
 _JTECH_CMD = "jtech_cmd"
+_JTECH_AGENT = "jtech_agent"
+#: The complete tool vocabulary, and how many string arguments each call takes.
+_TOOL_ARITY: dict[str, int] = {_JTECH_CMD: 1, _JTECH_AGENT: 5}
+
+
+class _CallSyntaxError(ValueError):
+    """One recognized tool call that cannot be parsed or validated."""
+
+    def __init__(self, tool_name: str, message: str) -> None:
+        super().__init__(message)
+        self.tool_name = tool_name
+
+
+@dataclass(frozen=True, slots=True)
+class _ToolCall:
+    """One syntactically valid call and the span it occupies in the reply."""
+
+    name: str
+    args: tuple[str, ...]
+    start: int
+    end: int
+
+
+def _skip_ws(text: str, position: int) -> int:
+    while position < len(text) and text[position].isspace():
+        position += 1
+    return position
 
 
 def _quoted_literal_end(text: str, start: int) -> int | None:
@@ -196,108 +323,179 @@ def _quoted_literal_end(text: str, start: int) -> int | None:
     return None
 
 
-def _unwrap_html_code(text: str) -> str:
-    """Remove one whole-response HTML code wrapper, if present."""
+def _tool_name_at(text: str, position: int) -> str | None:
+    """The tool name beginning at ``position`` as a whole token, else ``None``.
+
+    The token boundary matters: ``jtech_cmdline`` names no tool, so a line that
+    starts with it is prose rather than a malformed call.
+    """
+    for name in _TOOL_ARITY:
+        if not text.startswith(name, position):
+            continue
+        after = position + len(name)
+        if after < len(text) and not (text[after].isspace() or text[after] == "("):
+            continue
+        return name
+    return None
+
+
+def _unwrap_html_code(text: str) -> tuple[str, int]:
+    """Remove one whole-response HTML code wrapper, and count the lines it hid.
+
+    Returns the text to scan and the number of reply lines consumed by the
+    wrapper, so a diagnostic still names the line the model actually wrote.
+    """
     opening = "<code>"
     closing = "</code>"
-    if text.startswith(opening) and text.endswith(closing):
-        inner = text[len(opening) : -len(closing)].strip()
-        if (
-            inner
-            and inner.startswith(_JTECH_CMD)
-            and "<code>" not in inner
-            and "</code>" not in inner
-        ):
-            return inner
-    return text
+    if not (text.startswith(opening) and text.endswith(closing)):
+        return text, 0
+    inner_raw = text[len(opening) : -len(closing)]
+    inner = inner_raw.strip()
+    if not inner or "<code>" in inner or "</code>" in inner:
+        return text, 0
+    if _tool_name_at(inner, 0) is None:
+        return text, 0
+    skipped = len(inner_raw) - len(inner_raw.lstrip())
+    return inner, text.count("\n", 0, len(opening) + skipped)
 
 
-def _parse_command_at(text: str, start: int) -> tuple[str, int] | None:
-    """Parse one command call at ``start`` and return its end position."""
-    position = start
-    if not text.startswith(_JTECH_CMD, position):
-        return None
-    position += len(_JTECH_CMD)
-    if position < len(text) and not (text[position].isspace() or text[position] == "("):
-        return None
-    while position < len(text) and text[position].isspace():
-        position += 1
+def _scan_source(reply: str) -> tuple[str, int]:
+    """The text to scan, and how many reply lines precede its first line."""
+    stripped = reply.strip()
+    lead = len(reply) - len(reply.lstrip())
+    text, wrapper_lines = _unwrap_html_code(stripped)
+    return text, reply.count("\n", 0, lead) + wrapper_lines
+
+
+def _parse_call_at(text: str, start: int) -> _ToolCall:
+    """Parse the recognized tool call beginning at ``start``.
+
+    ``ast.literal_eval`` parses each argument without evaluating Python code.
+
+    Raises:
+        _CallSyntaxError: if the call is malformed, carries a non-string
+            argument, or has the wrong number of arguments.
+    """
+    name = _tool_name_at(text, start)
+    if name is None:  # pragma: no cover - callers check first
+        raise ValueError(f"no tool call at position {start}")
+    position = _skip_ws(text, start + len(name))
     if position >= len(text) or text[position] != "(":
-        return None
-    position += 1
-    while position < len(text) and text[position].isspace():
+        raise _CallSyntaxError(name, f"{name} must be called as {name}(...)")
+    position = _skip_ws(text, position + 1)
+    args: list[str] = []
+    if position < len(text) and text[position] == ")":
         position += 1
-    if position >= len(text) or text[position] not in "'\"":
-        return None
+    else:
+        while True:
+            position = _skip_ws(text, position)
+            ordinal = len(args) + 1
+            if position >= len(text) or text[position] not in "'\"":
+                raise _CallSyntaxError(
+                    name, f"{name} argument {ordinal} must be a quoted string"
+                )
+            literal_end = _quoted_literal_end(text, position)
+            if literal_end is None:
+                raise _CallSyntaxError(
+                    name,
+                    f"{name} argument {ordinal} has an unterminated string literal",
+                )
+            try:
+                value = ast.literal_eval(text[position:literal_end])
+            except (SyntaxError, ValueError) as error:
+                raise _CallSyntaxError(
+                    name, f"{name} argument {ordinal} is not a valid string literal"
+                ) from error
+            if not isinstance(value, str):
+                raise _CallSyntaxError(
+                    name, f"{name} argument {ordinal} must be a string"
+                )
+            args.append(value)
+            position = _skip_ws(text, literal_end)
+            if position < len(text) and text[position] == ",":
+                position += 1
+                continue
+            if position < len(text) and text[position] == ")":
+                position += 1
+                break
+            raise _CallSyntaxError(
+                name, f"{name} argument {ordinal} must be followed by ',' or ')'"
+            )
+    arity = _TOOL_ARITY[name]
+    if len(args) != arity:
+        plural = "" if arity == 1 else "s"
+        raise _CallSyntaxError(
+            name,
+            f"{name} takes exactly {arity} string argument{plural}, got {len(args)}",
+        )
+    return _ToolCall(name, tuple(args), start, position)
 
-    literal_start = position
-    literal_end = _quoted_literal_end(text, literal_start)
-    if literal_end is None:
-        return None
-    try:
-        command = ast.literal_eval(text[literal_start:literal_end])
-    except (SyntaxError, ValueError):
-        return None
-    if not isinstance(command, str):
-        return None
-    position = literal_end
-    while position < len(text) and text[position].isspace():
-        position += 1
-    if position >= len(text) or text[position] != ")":
-        return None
-    return command, position + 1
 
+def _parse_call_line(text: str, start: int) -> tuple[list[_ToolCall], int] | None:
+    """Parse the standalone tool calls on the line beginning at ``start``.
 
-def _parse_command_line(
-    text: str, start: int
-) -> tuple[list[str], list[tuple[int, int]], int] | None:
-    """Parse standalone calls beginning at one line and return its next line."""
+    Returns the calls and the next scan position, or ``None`` when the line is
+    not a tool-call candidate at all — that is ordinary commentary.
+
+    Raises:
+        _CallSyntaxError: if a candidate line is malformed or carries trailing
+            text that is not another call.
+    """
     line_end = text.find("\n", start)
     if line_end < 0:
         line_end = len(text)
     line = text[start:line_end]
     position = start + len(line) - len(line.lstrip(" \t"))
-    if not text.startswith(_JTECH_CMD, position):
+    if _tool_name_at(text, position) is None:
         return None
 
-    commands: list[str] = []
-    spans: list[tuple[int, int]] = []
+    calls: list[_ToolCall] = []
     while True:
-        parsed = _parse_command_at(text, position)
-        if parsed is None:
-            return None
-        command, command_end = parsed
-        tail_end = text.find("\n", command_end)
+        call = _parse_call_at(text, position)
+        calls.append(call)
+        tail_end = text.find("\n", call.end)
         if tail_end < 0:
             tail_end = len(text)
-        tail_start = command_end
+        tail_start = call.end
         while tail_start < tail_end and text[tail_start] in " \t":
             tail_start += 1
-        commands.append(command)
-        spans.append((position, command_end))
         if tail_start == tail_end:
-            return commands, spans, tail_end + (tail_end < len(text))
-        if not text.startswith(_JTECH_CMD, tail_start):
-            return None
+            return calls, tail_end + (tail_end < len(text))
+        if _tool_name_at(text, tail_start) is None:
+            raise _CallSyntaxError(
+                call.name,
+                f"a {call.name} call line may not carry other text: "
+                f"{text[tail_start:tail_end].strip()!r}",
+            )
         position = tail_start
 
 
 def parse_jtech_reply(reply: str) -> ParsedReply:
-    """Parse standalone command-call lines anywhere in a reply.
+    """Parse standalone tool-call lines anywhere in a reply.
 
-    A call must begin a line (apart from indentation) and occupy the command
-    line, although multiple calls may share one line. This permits commentary
-    before, between, and after commands without executing inline examples.
-    Markdown fences and HTML ``<code>`` blocks are inert; a whole-response
-    ``<code>`` wrapper remains supported by the compatibility unwrapping above.
-    ``ast.literal_eval`` parses string arguments without evaluating Python code.
+    A call must begin a line (apart from indentation) and occupy the rest of
+    that line, although several calls may share one line. This permits
+    commentary before, between, and after calls without executing inline
+    examples. Markdown fences and HTML ``<code>`` blocks are inert; a
+    whole-response ``<code>`` wrapper remains supported for either tool.
+
+    A line that opens with a tool name but is malformed, mis-typed, wrongly
+    sized, or followed by other text becomes a :class:`ToolProtocolError`
+    rather than silently reverting to commentary — the model asked for a tool
+    and is told exactly why it did not run.
     """
-    text = _unwrap_html_code(reply.strip())
+    text, base_line = _scan_source(reply)
     if not text:
         return ParsedReply([])
 
     commands: list[str] = []
+    dispatches: list[AgentDispatch] = []
+    errors: list[ToolProtocolError] = []
     spans: list[tuple[int, int]] = []
+
+    def line_of(position: int) -> int:
+        return base_line + text.count("\n", 0, position) + 1
+
     position = 0
     in_fence = False
     in_html_code = False
@@ -328,17 +526,33 @@ def parse_jtech_reply(reply: str) -> ParsedReply:
             position = line_end + (line_end < len(text))
             continue
 
-        parsed_line = _parse_command_line(text, position)
+        try:
+            parsed_line = _parse_call_line(text, position)
+        except _CallSyntaxError as error:
+            errors.append(
+                ToolProtocolError(error.tool_name, line_of(position), str(error))
+            )
+            position = line_end + (line_end < len(text))
+            continue
         if parsed_line is None:
             position = line_end + (line_end < len(text))
             continue
-        line_commands, line_spans, next_position = parsed_line
-        commands.extend(line_commands)
-        spans.extend(line_spans)
+        line_calls, next_position = parsed_line
+        for call in line_calls:
+            spans.append((call.start, call.end))
+            if call.name == _JTECH_CMD:
+                commands.append(call.args[0])
+                continue
+            try:
+                dispatches.append(AgentDispatch(*call.args))
+            except ValueError as error:
+                errors.append(
+                    ToolProtocolError(_JTECH_AGENT, line_of(call.start), str(error))
+                )
         position = next_position
 
-    if not commands:
-        return ParsedReply([], text)
+    if not spans:
+        return ParsedReply(commands, text, dispatches, errors)
 
     masked = list(text)
     for start, end in spans:
@@ -346,7 +560,17 @@ def parse_jtech_reply(reply: str) -> ParsedReply:
             if masked[index] != "\n":
                 masked[index] = " "
     commentary = "".join(masked).strip()
-    return ParsedReply(commands, commentary)
+    return ParsedReply(commands, commentary, dispatches, errors)
+
+
+def duplicate_agent_keys(dispatches: Sequence[AgentDispatch]) -> tuple[str, ...]:
+    """Agent keys a single reply dispatches more than once, in sorted order.
+
+    One agent key is one conversation, so a batch cannot write to it twice
+    concurrently. The caller rejects the whole batch rather than serializing it.
+    """
+    keys = [dispatch.agent_key for dispatch in dispatches]
+    return tuple(sorted({key for key in keys if keys.count(key) > 1}))
 
 
 def split_segments(command: str) -> list[str]:

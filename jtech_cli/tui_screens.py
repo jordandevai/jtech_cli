@@ -7,6 +7,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import ClassVar, Protocol
 
+from rich.text import Text
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical, VerticalScroll
@@ -63,7 +64,12 @@ class CmdChoice(enum.Enum):
 
 
 class CommandPrompt(_ChatModal[CmdChoice]):
-    """Approval prompt for one AI-requested shell command."""
+    """Approval prompt for one AI-requested shell command.
+
+    Any agent may be the requester, and only one prompt is ever mounted at a
+    time, so the title names who is asking: the authorization target has to be
+    unambiguous whichever activity stream happens to be on screen.
+    """
 
     BINDINGS: ClassVar[list[Binding]] = [
         Binding("y", "allow_once", "Allow", show=False),
@@ -72,14 +78,27 @@ class CommandPrompt(_ChatModal[CmdChoice]):
         Binding("escape", "decline_cmd", "Decline", show=False),
     ]
 
-    def __init__(self, command: str, reason: str) -> None:
+    def __init__(
+        self, command: str, reason: str, *, requester: str = "Primary"
+    ) -> None:
+        """Args:
+            command: The command awaiting a decision.
+            reason: Why the policy is asking rather than running it.
+            requester: The label of the agent that asked. The default keeps
+                standalone callers unchanged.
+        """
         super().__init__()
         self._command = command
         self._reason = reason
+        self._requester = requester
 
     def compose(self) -> ComposeResult:
         with VerticalScroll(id="cmd-dialog"):
-            yield Static("Run command?", classes="dialog-title")
+            # A ``Text`` value, not markup: an agent label is data, and console
+            # markup in it must not be able to restyle or forge this dialog.
+            yield Static(
+                Text(f"Run command for {self._requester}?"), classes="dialog-title"
+            )
             yield Static(self._command, id="cmd-command")
             if self._reason:
                 yield Static(self._reason, id="cmd-reason")

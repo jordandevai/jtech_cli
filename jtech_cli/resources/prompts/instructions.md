@@ -20,6 +20,41 @@ Available slash commands:
   /stats             Show history size, tokens, and context usage
   /render            Re-render the last reply as Markdown
 
+  Agents:
+  The AI you talk to is the coordinator. When a request has separable work, it
+  dispatches subagents itself with standalone `jtech_agent(...)` calls — you
+  never type a command for it, and there is no /agent or /agents. Each agent
+  gets a name you see in the sidebar, an API profile the coordinator chose from
+  your configured ones, and its own private conversation and context. Several
+  agents run at once when their work is independent; they share this one
+  working directory, so nothing merges or locks their edits.
+  The sidebar on the right lists Primary first, then each agent with its tasks
+  indented two columns beneath it. Status is a glyph, not a color: ○ idle,
+  ● running, ◌ waiting for you, ✓ completed, ! failed.
+  Click an agent, or Tab into the sidebar and press Enter on the highlighted
+  row, to watch its live stream: its reasoning, replies, commands, and output.
+  Arrow keys only move the highlight; Enter or a click commits the choice.
+  Clicking a task line selects its agent. A new agent or a status change never
+  changes what you are looking at. The status line always describes Primary.
+  An agent view is read only: the composer, command menu, and multi-line editor
+  are hidden and replaced by "Read only — subagents communicate with their
+  dispatcher." Your draft, selection, multi-line text, and queue are untouched
+  and come back when you return to Primary. Selecting and copying text in the
+  agent's transcript still works. Ctrl+L reports that the view is read only
+  instead of clearing, Esc does nothing, and Ctrl+C copies a selection or opens
+  the quit confirmation — it never clears the Primary draft you cannot see.
+  Results return to the coordinator automatically; you do not relay them.
+  Reusing an agent's key sends it a follow-up task in the same conversation and
+  adds a task row beneath it; a new key creates a new agent. An agent's label
+  and profile are fixed once it exists.
+  Agents inherit the same command policy and hard blacklist you set. An
+  approval prompt names the agent asking for it ("Run command for Coder?") and
+  only one appears at a time, whichever stream you are looking at. Quitting
+  stops every agent and kills every command they are running.
+  Subagent transcripts live in memory for this run only: they are not restored
+  after a restart, although the results the coordinator received are, because
+  they are part of its own history.
+
   AI shell:
   The AI can request shell commands via standalone `jtech_cmd(...)` calls. Each one is gated:
   Calls may be interleaved with commentary, but each call must begin its own

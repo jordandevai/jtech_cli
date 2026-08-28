@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from jtech_cli.cmd_tools import (
+    AgentDispatch,
     CmdPolicy,
     ExecResult,
     ShellParseError,
@@ -14,6 +15,7 @@ from jtech_cli.cmd_tools import (
     allow_rule_for,
     check_blacklist,
     decide,
+    duplicate_agent_keys,
     escape_project,
     execute,
     format_result,
@@ -107,8 +109,158 @@ def test_prose_after_single_newline_invalidates_command_prefix():
 
 def test_empty_reply_and_malformed_call_are_not_commands():
     assert parse_jtech_reply("").commands == []
-    assert parse_jtech_reply('jtech_cmd("git status"').commands == []
-    assert parse_jtech_reply("jtech_cmd(git status)").commands == []
+    for reply in ('jtech_cmd("git status"', "jtech_cmd(git status)"):
+        parsed = parse_jtech_reply(reply)
+        assert parsed.commands == []
+        # A line that opened with the tool name is a failed call, not prose.
+        assert [error.tool_name for error in parsed.errors] == ["jtech_cmd"]
+        assert [error.line for error in parsed.errors] == [1]
+
+
+# ---------------------------------------------------------- agent dispatch
+
+DISPATCH = (
+    'jtech_agent("coder", "Coder", "local", "Implement parser", '
+    '"Inspect the current parser and implement the change.")'
+)
+
+
+def test_parse_one_dispatch_keeps_every_field_and_the_commentary():
+    parsed = parse_jtech_reply(f"I will delegate this.\n\n{DISPATCH}\n\nThen review.")
+    assert parsed.commands == []
+    assert parsed.errors == []
+    assert parsed.dispatches == [
+        AgentDispatch(
+            agent_key="coder",
+            agent_label="Coder",
+            profile_name="local",
+            task_label="Implement parser",
+            task="Inspect the current parser and implement the change.",
+        )
+    ]
+    assert "I will delegate this." in parsed.commentary
+    assert "Then review." in parsed.commentary
+    assert "jtech_agent" not in parsed.commentary
+
+
+def test_parse_multiline_task_without_executing_python():
+    reply = (
+        'jtech_agent("auditor", "Auditor", "cloud", "Audit", """Review it.\n'
+        "Run the tests.\n"
+        'Report findings.""")'
+    )
+    parsed = parse_jtech_reply(reply)
+    assert parsed.errors == []
+    assert parsed.dispatches[0].task == "Review it.\nRun the tests.\nReport findings."
+
+
+def test_a_tool_line_inside_a_task_string_is_part_of_that_task():
+    reply = (
+        'jtech_agent("a", "A", "local", "t", """Do this:\n'
+        'jtech_cmd("rm -rf /")\n'
+        'and stop.""")'
+    )
+    parsed = parse_jtech_reply(reply)
+    assert parsed.commands == []
+    assert parsed.errors == []
+    assert len(parsed.dispatches) == 1
+    assert 'jtech_cmd("rm -rf /")' in parsed.dispatches[0].task
+
+
+def test_several_dispatches_parse_in_source_order():
+    reply = (
+        'jtech_agent("b", "B", "local", "t2", "second")\n'
+        'jtech_agent("a", "A", "cloud", "t1", "first")'
+    )
+    parsed = parse_jtech_reply(reply)
+    assert [d.agent_key for d in parsed.dispatches] == ["b", "a"]
+    assert [d.profile_name for d in parsed.dispatches] == ["local", "cloud"]
+
+
+def test_dispatch_fields_are_stripped_not_truncated():
+    reply = 'jtech_agent(" coder ", " Coder ", " local ", " Task ", "  do it  ")'
+    dispatch = parse_jtech_reply(reply).dispatches[0]
+    assert dispatch == AgentDispatch("coder", "Coder", "local", "Task", "do it")
+
+
+def test_dispatch_examples_inside_code_blocks_stay_inert():
+    fenced = f"Example:\n\n```\n{DISPATCH}\n```\n"
+    assert parse_jtech_reply(fenced).dispatches == []
+    assert parse_jtech_reply(fenced).errors == []
+    inline = f"Call it like {DISPATCH} when you delegate."
+    assert parse_jtech_reply(inline).dispatches == []
+    assert parse_jtech_reply(inline).errors == []
+
+
+def test_a_whole_response_html_wrapper_still_carries_a_dispatch():
+    assert parse_jtech_reply(f"<code>\n{DISPATCH}\n</code>").dispatches[0].agent_key == (
+        "coder"
+    )
+
+
+@pytest.mark.parametrize(
+    ("reply", "fragment"),
+    [
+        ('jtech_agent("Coder", "C", "local", "t", "x")', "agent_key 'Coder' is invalid"),
+        ('jtech_agent("primary", "C", "local", "t", "x")', "reserved"),
+        ('jtech_agent("", "C", "local", "t", "x")', "agent_key '' is invalid"),
+        ('jtech_agent("a", "  ", "local", "t", "x")', "agent_label must not be empty"),
+        ('jtech_agent("a", "C", "  ", "t", "x")', "profile_name must not be empty"),
+        ('jtech_agent("a", "C", "local", " ", "x")', "task_label must not be empty"),
+        ('jtech_agent("a", "C", "local", "t", "  ")', "task must not be empty"),
+        ('jtech_agent("a", "C", "local", "t")', "takes exactly 5 string arguments"),
+        ('jtech_agent("a", "C", "local", "t", "x", "y")', "takes exactly 5"),
+        ('jtech_agent("a", 3, "local", "t", "x")', "argument 2 must be a quoted string"),
+        ('jtech_agent("a", "C", "local", "t", "x"', "must be followed by ',' or ')'"),
+        ('jtech_agent("a", "C", "local", "t", "x") and then', "may not carry other text"),
+    ],
+)
+def test_invalid_dispatches_become_line_numbered_errors(reply, fragment):
+    parsed = parse_jtech_reply(reply)
+    assert parsed.dispatches == []
+    assert len(parsed.errors) == 1
+    error = parsed.errors[0]
+    assert error.tool_name == "jtech_agent"
+    assert error.line == 1
+    assert fragment in error.message
+
+
+def test_a_multiline_label_is_rejected_by_the_boundary_type():
+    with pytest.raises(ValueError, match="agent_label must be a single line"):
+        AgentDispatch("a", "one\ntwo", "local", "t", "x")
+
+
+def test_error_lines_are_one_based_in_the_original_reply():
+    reply = '\n\nfirst line of prose\n\njtech_agent("a", "A", "local", "t")'
+    assert parse_jtech_reply(reply).errors[0].line == 5
+
+
+def test_one_parse_error_keeps_every_other_call_out_of_the_result():
+    """The runtime executes nothing from a reply with any error, so the
+    caller must be able to see both the error and that nothing is missing."""
+    reply = 'jtech_cmd("ls")\njtech_agent("a", "A", "local", "t")'
+    parsed = parse_jtech_reply(reply)
+    assert parsed.commands == ["ls"]
+    assert len(parsed.errors) == 1
+
+
+def test_a_reply_can_carry_both_tool_kinds_for_the_runtime_to_refuse():
+    reply = 'jtech_cmd("ls")\n' + DISPATCH
+    parsed = parse_jtech_reply(reply)
+    assert parsed.commands == ["ls"]
+    assert len(parsed.dispatches) == 1
+    assert parsed.errors == []
+
+
+def test_duplicate_agent_keys_are_reported_for_the_whole_batch():
+    reply = (
+        'jtech_agent("a", "A", "local", "t1", "one")\n'
+        'jtech_agent("b", "B", "local", "t", "two")\n'
+        'jtech_agent("a", "A", "local", "t2", "three")'
+    )
+    parsed = parse_jtech_reply(reply)
+    assert duplicate_agent_keys(parsed.dispatches) == ("a",)
+    assert duplicate_agent_keys(parsed.dispatches[:2]) == ()
 
 
 def test_quoted_commands_support_escaped_values():

@@ -15,7 +15,13 @@ from jtech_cli.config import (
     resolve_prompt_source,
     save_settings,
 )
-from jtech_cli.prompts import DEFAULT_SYSTEM_PROMPT, PromptSourceError
+from jtech_cli.prompts import (
+    DEFAULT_SYSTEM_PROMPT,
+    WORKER_PROMPT,
+    PromptSourceError,
+    compose_coordinator_prompt,
+    compose_worker_prompt,
+)
 
 LOCAL = Profile(name="local", base_url="http://x:1/v1", model="m")
 
@@ -135,6 +141,63 @@ def test_resolve_inline_prompt_keeps_custom_instructions():
     assert s.prompt_source == "inline"
     assert "my custom prompt" in s.effective_system_prompt()
     assert s.effective_system_prompt().endswith(DEFAULT_SYSTEM_PROMPT)
+
+
+# ------------------------------------------------- orchestration prompts
+
+
+def test_coordinator_prompt_keeps_the_base_contract_and_adds_dispatch():
+    base = Settings(system_prompt="my custom prompt").effective_system_prompt()
+    prompt = compose_coordinator_prompt(
+        base, profile_names=("local", "cloud"), active_profile_name="local"
+    )
+    assert prompt.startswith(base)
+    assert "my custom prompt" in prompt
+    assert DEFAULT_SYSTEM_PROMPT in prompt
+    assert "jtech_agent(" in prompt
+    # The shell/coding contract is composed, never restated by the fragment.
+    assert prompt.count(DEFAULT_SYSTEM_PROMPT) == 1
+
+
+def test_coordinator_prompt_lists_profiles_in_order_and_marks_the_current_one():
+    prompt = compose_coordinator_prompt(
+        "BASE", profile_names=("cli", "local", "cloud"), active_profile_name="cli"
+    )
+    listing = prompt[prompt.index("### Available profiles") :]
+    assert listing.index("`cli`") < listing.index("`local`") < listing.index("`cloud`")
+    assert "`cli` — the profile this conversation runs on" in listing
+    assert "`local` —" not in listing
+
+
+def test_coordinator_prompt_without_profiles_forbids_dispatch():
+    prompt = compose_coordinator_prompt(
+        "BASE", profile_names=(), active_profile_name=None
+    )
+    assert "dispatch is unavailable" in prompt
+    assert "Do not call jtech_agent" in prompt
+
+
+def test_coordinator_prompt_states_the_batch_and_continuation_rules():
+    prompt = compose_coordinator_prompt(
+        "BASE", profile_names=("local",), active_profile_name="local"
+    )
+    assert "Reuse a key to continue that agent" in prompt
+    assert "genuinely independent" in prompt
+    assert "may not dispatch the same key twice" in prompt
+    assert "shell calls or agent calls, never both" in prompt
+    assert "[JTECH agent result]" in prompt
+    assert "no tool call at all" in prompt
+
+
+def test_worker_prompt_keeps_the_base_contract_and_restricts_the_worker():
+    base = Settings(system_prompt="my custom prompt").effective_system_prompt()
+    prompt = compose_worker_prompt(base)
+    assert prompt.startswith(base)
+    assert "my custom prompt" in prompt
+    assert prompt.endswith(WORKER_PROMPT)
+    assert "You cannot dispatch agents" in prompt
+    assert "### Available profiles" not in prompt
+    assert prompt.count(DEFAULT_SYSTEM_PROMPT) == 1
 
 
 def test_messages_with_system_empty_prompt_sends_none():

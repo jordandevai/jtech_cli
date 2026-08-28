@@ -5,6 +5,7 @@ from rich.console import Console
 
 from jtech_cli.commands import CommandContext, build_registry
 from jtech_cli.config import Profile, ProfileError, Profiles, Settings
+from jtech_cli.prompts import DEFAULT_SYSTEM_PROMPT
 from jtech_cli.session import Session
 
 LOCAL = Profile(name="local", base_url="http://x:1/v1", model="m")
@@ -414,3 +415,30 @@ async def test_stats_surfaces_a_credential_error(tmp_path, monkeypatch):
     assert "messages=1" in out
     assert "CLOUD_API_KEY" in out
     assert "history_tokens" not in out
+
+
+# ---------------------------------------------------------------- /system
+
+
+def test_system_prints_the_settings_prompt_without_a_host_callback(tmp_path):
+    """Standalone contexts have no extra composition: what settings say is sent."""
+    ctx, console = make_ctx(tmp_path, settings=local_settings(system_prompt="mine"))
+    reg = build_registry(ctx)
+    reg.handle("/system")
+    text = output(console)
+    assert "Prompt source: inline" in text
+    assert "mine" in text
+    assert "Agent dispatch" not in text
+
+
+def test_system_prints_the_host_composed_prompt_when_one_is_injected(tmp_path):
+    """The TUI adds the coordinator contract, so /system must show that, not
+    the settings prompt the next request would not actually carry."""
+    ctx, console = make_ctx(tmp_path)
+    ctx.effective_prompt = lambda: "COMPOSED PROMPT\n\n## Agent dispatch"
+    reg = build_registry(ctx)
+    reg.handle("/system")
+    text = output(console)
+    assert "COMPOSED PROMPT" in text
+    assert "Agent dispatch" in text
+    assert DEFAULT_SYSTEM_PROMPT.splitlines()[0] not in text

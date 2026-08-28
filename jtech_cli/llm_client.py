@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Iterator
 
 from openai import OpenAI
@@ -22,20 +23,27 @@ StreamItem = str | ReasoningEvent | UsageEvent | TimingsEvent
 # profiles may share a base URL with different keys, and sharing a client
 # between them would send one profile's requests with the other's credential.
 _client_cache: dict[tuple[str, str], OpenAI] = {}
+# Concurrent agents stream from their own provider threads, so lookup-then-
+# create is a race: two threads could each build a client for one identity and
+# leave one connection pool orphaned. The lock covers only that lookup and
+# construction — never the stream — so agents on distinct endpoints, and on the
+# same one, still consume their responses in parallel.
+_cache_lock = threading.Lock()
 
 
 def make_client(profile: ResolvedProfile) -> OpenAI:
     """OpenAI client for ``profile``, cached per (base URL, credential)."""
     key = (profile.base_url, profile.api_key)
-    client = _client_cache.get(key)
-    if client is None:
-        client = OpenAI(
-            base_url=profile.base_url,
-            api_key=profile.api_key,
-            timeout=30,
-            max_retries=0,
-        )
-        _client_cache[key] = client
+    with _cache_lock:
+        client = _client_cache.get(key)
+        if client is None:
+            client = OpenAI(
+                base_url=profile.base_url,
+                api_key=profile.api_key,
+                timeout=30,
+                max_retries=0,
+            )
+            _client_cache[key] = client
     return client
 
 

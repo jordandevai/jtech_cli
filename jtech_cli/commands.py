@@ -33,6 +33,7 @@ from jtech_cli.theme import VALID_THEMES
 
 EnterMultiline = Callable[[str], Awaitable[str]]
 SwitchProfile = Callable[[str], Awaitable[None]]
+EffectivePrompt = Callable[[], str]
 Handler = Callable[["CommandContext", str], None | Awaitable[None]]
 
 WRITE_USAGE = "Usage: /write PATH  then paste content, end with a line containing only: END"
@@ -64,6 +65,12 @@ class CommandContext:
     switch_theme: Callable[[], None] = field(default=lambda: None)
     open_profiles: Callable[[], None] = field(default=lambda: None)
     switch_profile: SwitchProfile = _no_profile_switch
+    #: The prompt the next model request will actually carry, when a host
+    #: composes more than the settings do — the TUI adds the coordinator
+    #: contract. Absent outside the TUI, where the settings prompt *is* what
+    #: would be sent; that is documented standalone behavior, not a fallback
+    #: for a lookup that failed.
+    effective_prompt: EffectivePrompt | None = None
 
     def persist_settings(self) -> None:
         try:
@@ -213,6 +220,9 @@ def build_registry(ctx: CommandContext) -> CommandRegistry:
         c.print(f"Prompt source: {ctx.settings.prompt_source}")
         if ctx.settings.prompt_notice:
             c.print(ctx.settings.prompt_notice)
+        if ctx.effective_prompt is not None:
+            c.print(ctx.effective_prompt())
+            return
         c.print(ctx.settings.effective_system_prompt())
 
     def cmd_prompt(_: CommandContext, arg: str) -> None:

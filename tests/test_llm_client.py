@@ -1,5 +1,6 @@
 """Unit tests for the streaming LLM client (mocked OpenAI endpoint)."""
 
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -178,3 +179,62 @@ def test_reasoning_and_timings_events_are_preserved(monkeypatch):
     assert ("reasoning", "hmm") in items
     assert ("timings", {"prompt_n": 12}) in items
     assert "".join(i for i in items if isinstance(i, str)) == "4"
+
+
+# ------------------------------------------------------ concurrent access
+
+
+def test_concurrent_lookups_of_one_identity_build_exactly_one_client(monkeypatch):
+    """Concurrent agents share provider threads through this cache.
+
+    A slow constructor makes the lookup-then-create window wide enough that an
+    unsynchronized cache would let several threads each build a client and
+    leave every one but the last orphaned.
+    """
+    built = fake_openai(monkeypatch)
+    real = llm_client.OpenAI
+
+    def slow(**kwargs):
+        threading.Event().wait(0.02)
+        return real(**kwargs)
+
+    monkeypatch.setattr(llm_client, "OpenAI", slow)
+
+    start = threading.Barrier(8)
+    clients: list[object] = []
+
+    def worker() -> None:
+        start.wait(5)
+        clients.append(make_client(CLOUD))
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(10)
+
+    assert len(built) == 1
+    assert len(clients) == 8
+    assert all(client is clients[0] for client in clients)
+
+
+def test_concurrent_lookups_of_distinct_identities_stay_separate(monkeypatch):
+    built = fake_openai(monkeypatch)
+    results: dict[str, object] = {}
+
+    def worker(profile: ResolvedProfile) -> None:
+        results[profile.base_url] = make_client(profile)
+
+    threads = [
+        threading.Thread(target=worker, args=(profile,))
+        for profile in (LOCAL, CLOUD)
+        for _ in range(4)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(10)
+
+    assert len(built) == 2
+    assert results[LOCAL.base_url] is not results[CLOUD.base_url]
+    assert {client.kwargs["api_key"] for client in built} == {"none", "sk-secret"}

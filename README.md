@@ -113,6 +113,63 @@ error rather than resolved by guessing which endpoint was meant.
 
 ## The TUI
 
+- **Agent workspace**: the activity pane (85% of the width) on the left, an
+  agent sidebar (15%) on the right, with the composer and status line spanning
+  the full width below them. The split follows the terminal continuously —
+  there is no divider to drag, no collapse button, and no persisted width;
+  sidebar text is ellipsized rather than widening. The conversation you type
+  into is **Primary**, the coordinator, and it is selected on startup. Every
+  agent it dispatches gets its own row, with one line per task indented two
+  columns beneath it, and a status glyph carried by shape rather than color so
+  a monochrome terminal keeps the signal: `○` idle, `●` running, `◌` waiting,
+  `✓` completed, `!` failed.
+- **Selecting an agent**: click a row, or `Tab` into the sidebar and press
+  `Enter` on the highlighted one. Arrowing through the list only moves the
+  highlight — `Enter` or a click commits it — and clicking a task line selects
+  its owning agent, since tasks are text inside the agent's row rather than
+  targets of their own. Selection shows that agent's own live stream: its
+  reasoning, replies, commands, and output. Each stream keeps its own content,
+  live tail, and scroll position while another is displayed, and a new agent,
+  a status change, or a finished task never steals the selection or scrolls
+  something else into view. The status line stays Primary's throughout — it
+  describes your profile, model, context, and queue, never the selected
+  agent's.
+- **Read-only agent view**: with an agent selected the composer, the command
+  menu, and the multi-line editor are hidden and replaced by
+  `Read only — subagents communicate with their dispatcher.` Nothing you had
+  typed is touched: return to Primary and the same draft, selection,
+  multi-line text, and queue are exactly where you left them. Text selection
+  and copy stay available in the agent's transcript. While an agent is shown,
+  `Ctrl+L` reports `Subagent activity is read only; switch to Primary to clear
+  chat.` instead of clearing anything, `Esc` does nothing, and `Ctrl+C` copies
+  a selection if there is one and otherwise opens the quit confirmation —
+  it never clears the Primary draft you cannot see.
+- **Automatic dispatch**: there is no `/agent` command and nothing to configure.
+  When a request has separable work, the coordinator emits standalone
+  `jtech_agent("key", "Label", "profile", "Task label", "the task")` calls of
+  its own. It picks one of *your* configured API profiles per agent, so a local
+  model can investigate while a cloud model reviews. Several agents in one
+  reply start together and run concurrently; each one's final answer returns to
+  the coordinator automatically, in the order it dispatched them, and it keeps
+  working until your goal is done. Reusing a key sends a follow-up task into
+  the same agent's conversation and adds a task row; a new key creates a new
+  agent. A key's label and profile are fixed for the session.
+  All agents share this one working directory: the coordinator is told to
+  parallelize only independent work, and nothing locks or merges concurrent
+  edits.
+- **Agent commands and approvals**: agents inherit the live `cmd_mode`,
+  allowlist, and hard blacklist — there are no per-agent permissions. Approvals
+  are serialized, so exactly one prompt is on screen at a time whichever stream
+  you are viewing, and its title names the requester (`Run command for
+  Coder?`). Choosing **always allow** saves the rule once and any agent already
+  waiting behind it re-reads the policy instead of asking you again. `Esc`
+  stops Primary's own work only; it never cancels an agent. Quitting stops
+  every runtime and kills every command they are running.
+- **Ephemeral agent history**: an agent's conversation lives in memory for the
+  run. The results the coordinator received are part of *its* history and are
+  restored on the next launch, but the agents themselves are not: after a
+  restart, the first new task for a key starts a fresh worker. Durable
+  per-agent history is separate, unshipped work.
 - **Chat bubbles**: your prompts appear as gray "USER" bubbles on a shaded
   surface that spans the full chat width; the model's reply streams live into
   an unshaded "AI" Markdown bubble, so code blocks are syntax-highlighted in
@@ -133,7 +190,8 @@ error rather than resolved by guessing which endpoint was meant.
   alias); in multi-line mode `Ctrl+Enter` submits and `Esc` cancels.
 - **Esc to stop**: pressing `Esc` while a reply is streaming aborts the
   generation and discards the partial bubble (with a dim "Generation stopped."
-  note).
+  note). It applies to Primary's own work, and only while Primary is selected;
+  a selected agent's stream is read only and is never cancelled by it.
 - **Message queue**: pressing `Enter` while a reply is streaming queues the
   message — it shows as a dim "Queued" line and a count in the status bar — and
   queued messages send in order once the reply finishes or is stopped. Press
@@ -186,7 +244,7 @@ error rather than resolved by guessing which endpoint was meant.
 | `'''` | Begin / end multi-line input |
 | `Esc` | Cancel multi-line editor · stop a reply while it streams |
 | `Ctrl+S` | Open settings dialog |
-| `Ctrl+L` | Clear the chat |
+| `Ctrl+L` | Clear the chat (refused while a subagent is selected) |
 | `Ctrl+Q` | Quit immediately |
 | `Ctrl+C` | Copy selection · otherwise clear composer · when empty, confirm quit |
 | `Ctrl+V` | Paste the local clipboard into the focused editor |
@@ -240,7 +298,8 @@ jtech_cli/
   prompts.py      # Markdown prompt API
   theme.py        # TOML theme API and terminal detection
   tui.py          # stable public TUI import/facade
-  tui_app.py      # Textual app lifecycle, streaming, and tool orchestration
+  tui_app.py      # app lifecycle, agent catalog, profiles, approvals, dispatch
+  tui_runtime.py  # one conversation's autonomous model/command loop (all agents)
   tui_screens.py  # settings and command-approval modals
   tui_widgets.py  # reusable inputs, events, and output sink
   commands.py     # slash-command registry/handlers + CommandContext (DI container)

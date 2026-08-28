@@ -1,35 +1,37 @@
-"""Chat application lifecycle, streaming orchestration, and command execution."""
+"""Chat application lifecycle, agent orchestration, and command policy.
+
+The app owns everything that is app-wide: the Primary conversation and its
+composer, the catalog of dispatched agents, profile lookup and resolution,
+serialized command approval, settings persistence, and the workspace. One
+conversation's own model/command loop lives in
+:class:`~jtech_cli.tui_runtime.AutonomousRuntime`, which Primary and every
+subagent instantiate identically.
+"""
 
 from __future__ import annotations
 
 import asyncio
 import dataclasses
 import os
-import subprocess
-import threading
-import time
-from collections import deque
-from collections.abc import Callable, Iterator, Sequence
+import uuid
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import ClassVar
+from typing import ClassVar, Literal
 
-from rich.text import Text
+from rich.console import RenderableType
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical
-from textual.widgets import Input, Markdown, Static
+from textual.widgets import Input, Static
 
 from jtech_cli import server_info
 from jtech_cli.cmd_tools import (
+    AgentDispatch,
     CmdPolicy,
-    ExecResult,
     allow_rule_for,
     decide,
-    format_result,
-    parse_jtech_reply,
-    timeout_partial_output,
-    truncate_output,
+    duplicate_agent_keys,
 )
 from jtech_cli.commands import CommandContext, build_registry
 from jtech_cli.config import (
@@ -42,11 +44,22 @@ from jtech_cli.config import (
     resolve_profile,
     save_settings,
 )
-from jtech_cli.llm_client import StreamItem, stream_reply
-from jtech_cli.prompts import COMMAND_DECLINED_PROMPT, NUDGE_PROMPT
+from jtech_cli.llm_client import stream_reply
+from jtech_cli.prompts import compose_coordinator_prompt, compose_worker_prompt
 from jtech_cli.server_info import ServerInfo, fetch_server_info
 from jtech_cli.session import Session
 from jtech_cli.theme import JTECH_DARK, JTECH_LIGHT, textual_theme_name
+from jtech_cli.tui_runtime import (
+    CONNECTION_ERROR,
+    RENDER_ERROR,
+    SPINNER_FRAMES,
+    AgentOutcome,
+    AgentRunState,
+    AutonomousRuntime,
+    CommandAuthorization,
+    RunPhase,
+    StreamReply,
+)
 from jtech_cli.tui_screens import (
     CmdChoice,
     CommandPrompt,
@@ -57,9 +70,9 @@ from jtech_cli.tui_screens import (
 from jtech_cli.tui_widgets import (
     AgentStatus,
     AgentSummary,
+    AgentTaskSummary,
     AgentWorkspace,
     InputToMultiline,
-    MarkdownTail,
     MultilineCancel,
     MultilineSubmit,
     OutputSink,
@@ -71,69 +84,55 @@ from jtech_cli.tui_widgets import (
     render_menu_rows,
 )
 
-CONNECTION_ERROR = "Connection failed — check the endpoint in /profiles"
-RENDER_ERROR = "Could not render the reply — it was not added to the conversation"
 NO_PROFILE = "No API profile is configured — run /profiles to add one."
 BUSY_GENERATING = "A reply is streaming — press Esc to stop it before changing profiles."
 BUSY_TOOL_ROUND = "A tool round is running — wait for it to finish before changing profiles."
-SPINNER_FRAMES = "-\\|/"
 PRIMARY_AGENT_ID = "primary"
 SUBAGENT_READONLY = "Read only — subagents communicate with their dispatcher."
 SUBAGENT_CLEAR_BLOCKED = (
     "Subagent activity is read only; switch to Primary to clear chat."
 )
+AGENT_STOPPED = "Agent stopped before completing the task."
 
-StreamReply = Callable[[ResolvedProfile, float, list[dict]], Iterator[StreamItem]]
 FetchServerInfo = Callable[[Profile], ServerInfo]
 FetchTokenCount = Callable[[Profile, str], int | None]
 
+#: Every non-terminal phase an agent row and its current task row can show.
+#: ``stopped`` maps to ``failed``: an assignment that did not finish is not a
+#: success, and Primary is told so.
+_PHASE_STATUS: dict[RunPhase, AgentStatus] = {
+    "starting": "running",
+    "streaming": "running",
+    "tool": "running",
+    "command": "running",
+    "waiting": "waiting",
+    "completed": "completed",
+    "failed": "failed",
+    "stopped": "failed",
+}
 
-@dataclass(frozen=True)
-class _StreamEnd:
-    """Terminal marker the provider thread enqueues exactly once."""
 
-    error: Exception | None = None
+class _DispatchRejected(Exception):
+    """One dispatch call refused before any task or model request exists."""
 
 
-_QueuedStreamItem = StreamItem | _StreamEnd
+@dataclass(slots=True)
+class _ManagedAgent:
+    """One dispatched agent's identity, conversation, and current assignment.
 
-
-class _StreamInbox:
-    """Ordered handoff from the provider thread to the Textual event loop.
-
-    The provider iterator is synchronous and runs off the event loop, so it may
-    not touch widgets or stream state. It only appends here. Every event is
-    enqueued once, drained once in source order, and at most one wake-up is
-    outstanding for a non-empty queue: the idle-to-pending transition and the
-    drain that clears it share one lock, so an item can neither slip into the
-    gap between draining and clearing nor schedule a redundant callback.
+    The profile *name* is retained, never a resolved credential-bearing value:
+    each new task re-resolves that name and pins its current endpoint, model,
+    and credential, exactly as a Primary turn does.
     """
 
-    def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
-        self._loop = loop
-        self._items: deque[_QueuedStreamItem] = deque()
-        self._lock = threading.Lock()
-        self._ready = asyncio.Event()
-        self._notified = False
-
-    def put(self, item: _QueuedStreamItem) -> None:
-        """Enqueue one event from any thread, waking the consumer if idle."""
-        with self._lock:
-            self._items.append(item)
-            notify = not self._notified
-            self._notified = True
-        if notify:
-            self._loop.call_soon_threadsafe(self._ready.set)
-
-    async def get_batch(self) -> list[_QueuedStreamItem]:
-        """Await and return every event queued since the last drain, in order."""
-        await self._ready.wait()
-        with self._lock:
-            self._ready.clear()
-            batch = list(self._items)
-            self._items.clear()
-            self._notified = False
-        return batch
+    agent_key: str
+    agent_label: str
+    profile_name: str
+    session: Session
+    transcript: Transcript
+    tasks: list[AgentTaskSummary]
+    runtime: AutonomousRuntime | None = None
+    active_task_id: str | None = None
 
 
 class ChatApp(App):
@@ -184,14 +183,16 @@ class ChatApp(App):
         self.cmd = cmd if cmd is not None else CmdPolicy()
         self.settings.cmd_mode = self.cmd.mode
         self._project_root = Path.cwd().resolve()
-        self._running_proc: subprocess.Popen | None = None
-        self._cmd_interrupted = False
-        self._tool_rounds_active = False
+        self._primary_runtime: AutonomousRuntime | None = None
+        # Insertion ordered by first dispatch. Primary is not a member:
+        # its session, transcript, and composer belong to the app itself.
+        self._agents: dict[str, _ManagedAgent] = {}
+        # One approval modal at a time, and the policy re-read inside the
+        # lock: a rule another agent just saved must decide this request too.
+        self._approval_lock = asyncio.Lock()
         self._multiline_textarea: _MultilineInput | None = None
         self._multiline_future: asyncio.Future[str] | None = None
         self._multiline_terminator = "'''"
-        self._generating = False
-        self._stop_event = threading.Event()
         self._prompt_tokens = 0
         self._queue: list[str] = []
         self._queue_lines: list[PlainTail] = []
@@ -209,6 +210,7 @@ class ChatApp(App):
             switch_theme=self._switch_theme,
             open_profiles=self._open_profiles,
             switch_profile=self._switch_profile,
+            effective_prompt=self._primary_system_prompt,
         )
         self.commands = build_registry(self.ctx)
         self._suggestions: list[tuple[str, str]] = []
@@ -663,13 +665,13 @@ class ChatApp(App):
         not a flag, because ``_stream_reply()`` drains the queue through nested
         calls to this method: only the outermost accepted turn may report the
         agent idle again, and every exit — a provider error, a rendering error,
-        cancellation, a command round, a nudge, or a drained queue — releases
-        exactly one acquired depth.
+        cancellation, a command round, an agent batch, a nudge, or a drained
+        queue — releases exactly one acquired depth.
         """
         content = content.strip()
         if not content:
             return
-        if self._generating or self._tool_rounds_active:
+        if self._primary_runtime is not None:
             self._enqueue(content)
             return
         self._primary_turn_depth += 1
@@ -702,8 +704,9 @@ class ChatApp(App):
         """Run one user turn against a single immutable profile snapshot.
 
         Every completion in the turn — the first answer, each command
-        continuation, and each nudge — is handed the same ``ResolvedProfile``,
-        so an endpoint change can never take effect halfway through a turn.
+        continuation, each agent batch, and each nudge — is handed the same
+        ``ResolvedProfile``, so an endpoint change can never take effect
+        halfway through a turn.
         """
         try:
             profile = self._resolve_turn_profile()
@@ -711,408 +714,453 @@ class ChatApp(App):
             self.push_message("system", str(error))
             profile = None
         if profile is not None:
-            temperature = self.settings.temperature
-            reply = await self._stream_once(profile, temperature)
-            if reply is not None:
-                await self._tool_rounds(reply, profile, temperature)
+            runtime = AutonomousRuntime(
+                self._primary_run_state(profile),
+                host=self,
+                stream_reply_fn=self._stream_reply_fn,
+                cmd_policy=self.cmd,
+                project_root=self._project_root,
+            )
+            self._primary_runtime = runtime
+            try:
+                await runtime.run()
+            finally:
+                self._primary_runtime = None
         while self._queue:
             text = self._queue[0]
             self._remove_queue_entry(0)
             await self._send_message(text)
 
-    async def _stream_once(
-        self, profile: ResolvedProfile, temperature: float
-    ) -> str | None:
-        """Consume one stream and return its answer, or ``None`` on failure."""
-        parts: list[str] = []
-        timings: dict | None = None
-        error: Exception | None = None
-        started = time.monotonic()
-        mode = self.settings.reasoning
-        content_chars = 0
-        reasoning_chars = 0
-        got_item = False
-        got_content = False
-        tick_count = 0
-        reason_visible = False
-        reason_dropped = False
-        reason_tail = ""
-        reason_text = Text()
-        self._stop_event.clear()
-        self._generating = True
+    def _primary_run_state(self, profile: ResolvedProfile) -> AgentRunState:
+        """The run state for one accepted Primary turn.
 
-        chat = self.query_one("#chat", Transcript)
-        reason_entry: PlainTail | None = None
-        if mode != "hide":
-            reason_entry = chat.begin_plain("reasoning", hidden=True)
-        ai_entry: MarkdownTail = chat.begin_markdown("ai")
-        label, ai_md = ai_entry.label, ai_entry.body
-        ai_stream = Markdown.get_stream(ai_md)
-        # Anchoring lets Textual keep the newest output in view by itself and
-        # release that hold the moment the user scrolls, so the stream never
-        # has to issue a scroll request of its own per chunk.
-        chat.anchor()
+        The footer figures are seeded from the app, not zeroed: a new turn
+        inherits what the last one measured until the provider reports again.
+        """
+        state = AgentRunState(
+            agent_key=PRIMARY_AGENT_ID,
+            agent_label=self._workspace.summary_for(PRIMARY_AGENT_ID).label,
+            kind="primary",
+            session=self.session,
+            transcript=self.query_one("#chat", Transcript),
+            profile=profile,
+            temperature=self.settings.temperature,
+            system_prompt=self._primary_system_prompt,
+            reasoning_mode=lambda: self.settings.reasoning,
+            debug_level=lambda: self.settings.debug_level,
+        )
+        state.prompt_tokens = self._prompt_tokens
+        state.last_reply = self.ctx.last_reply
+        return state
 
-        def drop_reason_bubble() -> None:
-            """Withdraw the reasoning entry; the transcript owns its widgets."""
-            if reason_entry is not None:
-                chat.remove(reason_entry)
+    # -------------------------------------------------------------- prompts
 
-        def close_reason_bubble() -> None:
-            """End the reasoning entry the way its mode asks for.
+    def _primary_system_prompt(self) -> str:
+        """The prompt the next Primary completion will actually carry."""
+        active = self.settings.active_profile
+        return compose_coordinator_prompt(
+            self.settings.effective_system_prompt(),
+            profile_names=[
+                profile.name for profile in self._available_dispatch_profiles()
+            ],
+            active_profile_name=active.name if active is not None else None,
+        )
 
-            ``transient`` never keeps anything, and neither retaining mode has
-            anything worth keeping if no reasoning ever became visible; both
-            withdraw the entry instead of compacting an empty one.
-            """
-            if reason_entry is None:
-                return
-            if mode == "transient" or not reason_visible:
-                chat.remove(reason_entry)
-                return
-            displayed = "…" + reason_tail if mode == "tail" else reason_text.plain
-            chat.finalize(
-                reason_entry,
-                TranscriptRecord("reasoning", displayed, format="plain"),
+    def _worker_system_prompt(self) -> str:
+        """The prompt every subagent completion carries."""
+        return compose_worker_prompt(self.settings.effective_system_prompt())
+
+    # ------------------------------------------------------------- profiles
+
+    def _available_dispatch_profiles(self) -> tuple[Profile, ...]:
+        """Every profile an agent may be dispatched to, in advertised order.
+
+        A session-only ``--base-url`` override comes first and hides a
+        configured profile of the same name, so one name never advertises two
+        endpoints.
+        """
+        configured = self.settings.profiles.items
+        override = self.settings.profile_override
+        if override is None:
+            return tuple(configured)
+        return (
+            override,
+            *(item for item in configured if item.name != override.name),
+        )
+
+    def _profile_for_dispatch(self, name: str) -> Profile:
+        """The profile called ``name``, with the same override precedence.
+
+        Raises:
+            ProfileError: if no available profile has that name.
+        """
+        override = self.settings.profile_override
+        if override is not None and override.name == name:
+            return override
+        return self.settings.profiles.get(name)
+
+    async def _resolve_agent_profile(self, profile: Profile) -> ResolvedProfile:
+        """Pin ``profile`` to one model and credential for one agent task.
+
+        Discovery runs off the event loop and only when the profile configures
+        no model. It never writes ``self.server`` or the Primary footer: a
+        subagent's endpoint is not the one the status bar describes.
+
+        Raises:
+            ProfileError: if the credential is unavailable, the endpoint cannot
+                be reached, or no single model resolves. There is no
+                active-profile or model fallback.
+        """
+        if profile.model:
+            return resolve_profile(profile, discovered_model=None, environ=os.environ)
+        active = self.settings.active_profile
+        if active is not None and profile == active and self.server.model:
+            return resolve_profile(
+                profile, discovered_model=self.server.model, environ=os.environ
+            )
+        info = await asyncio.to_thread(self._fetch_server_info_fn, profile)
+        if not info.models and info.error:
+            raise ProfileError(
+                f"Profile {profile.name!r}: {profile.base_url} could not be "
+                f"reached to discover its model ({info.error})"
+            )
+        return resolve_profile(
+            profile, discovered_model=info.model, environ=os.environ
+        )
+
+    # ------------------------------------------------------------- dispatch
+
+    def _new_task_id(self) -> str:
+        """A fresh opaque task id.
+
+        A method so a test can make ids deterministic without an id factory in
+        the public constructor. No user or model value ever enters it, and it
+        is never used as a DOM id or a filesystem path.
+        """
+        return "task-" + uuid.uuid4().hex
+
+    async def dispatch_agents(
+        self, run: AgentRunState, calls: tuple[AgentDispatch, ...]
+    ) -> tuple[AgentOutcome, ...]:
+        """Run one whole dispatch batch and return its results in call order.
+
+        Distinct keys start together and run concurrently; one failure never
+        cancels a sibling; and the results are appended to the coordinator in
+        the order it wrote the calls, whatever order they finish in, so
+        provider timing cannot make its context nondeterministic.
+
+        Raises:
+            ValueError: if a non-Primary run reaches here, or the batch repeats
+                an agent key. The runtime refuses both first; this is the
+                authority boundary saying so again, before anything is created.
+        """
+        if run.kind != "primary":
+            raise ValueError("only Primary may dispatch agents")
+        duplicates = duplicate_agent_keys(calls)
+        if duplicates:
+            raise ValueError(
+                f"one response cannot dispatch {', '.join(duplicates)} twice"
             )
 
-        def render_reasoning() -> None:
-            """Push the accumulated reasoning body into its bubble.
-
-            ``tail`` renders a bounded string; the retaining modes hand over one
-            mutable ``Text`` that grows by append, so no mode re-joins every
-            fragment received so far.
-            """
-            assert reason_entry is not None
-            if mode == "tail":
-                reason_entry.body.update("…" + reason_tail)
-            else:
-                reason_entry.body.update(reason_text)
-
-        def apply_reasoning(delta: str) -> None:
-            """Fold one batch of reasoning deltas into the reasoning bubble."""
-            nonlocal reason_visible, reason_dropped, reason_tail
-            if reason_entry is None:
-                return
-            if delta:
-                if mode == "tail":
-                    reason_tail = (reason_tail + delta)[-500:]
-                else:
-                    reason_text.append(delta)
-            if reasoning_chars and not reason_visible and not reason_dropped:
-                reason_entry.label.display = True
-                reason_entry.body.display = True
-                reason_visible = True
-            if not reason_visible:
-                return
-            if got_content and mode == "transient":
-                drop_reason_bubble()
-                reason_visible = False
-                reason_dropped = True
-            elif delta:
-                render_reasoning()
-
-        def update_label() -> None:
-            """Repaint the AI status line from the running counters only."""
-            if not label.is_mounted:
-                return
-            elapsed = int(time.monotonic() - started)
-            frame = SPINNER_FRAMES[tick_count % len(SPINNER_FRAMES)]
-            if not got_item:
-                label.update(f"AI  ·  waiting {elapsed}s")
-            elif not got_content:
-                label.update(f"AI  ·  {frame}  thinking… {reasoning_chars}")
-            else:
-                label.update(f"AI  ·  {frame}  {content_chars}")
-
-        def tick() -> None:
-            nonlocal tick_count
-            tick_count += 1
-            update_label()
-
-        timer = self.set_interval(1.0, tick)
-        inbox = _StreamInbox(asyncio.get_running_loop())
-        # This stream's own stop signal, separate from the app-wide Escape
-        # flag: it says "nobody is reading the inbox any more", which is true
-        # on every exit, not only the ones the user asked for.
-        abandoned = threading.Event()
-
-        def consume() -> None:
-            """Provider thread: enqueue every event, then one end marker."""
-            producer_error: Exception | None = None
+        outcomes: list[AgentOutcome | None] = [None] * len(calls)
+        started: list[tuple[int, _ManagedAgent, AgentDispatch, str]] = []
+        for index, call in enumerate(calls):
+            task_id = self._new_task_id()
             try:
-                messages = self.session.messages_with_system(
-                    self.settings.effective_system_prompt()
+                managed = await self._begin_agent_task(call, task_id)
+            except _DispatchRejected as rejection:
+                outcomes[index] = AgentOutcome(
+                    agent_key=call.agent_key,
+                    agent_label=call.agent_label,
+                    task_id=task_id,
+                    task_label=call.task_label,
+                    status="failed",
+                    content=str(rejection),
                 )
-                for item in self._stream_reply_fn(profile, temperature, messages):
-                    inbox.put(item)
-                    if abandoned.is_set() or self._stop_event.is_set():
-                        break
-            except Exception as exc:  # noqa: BLE001 - report connection failures cleanly
-                producer_error = exc
-            finally:
-                inbox.put(_StreamEnd(producer_error))
+                continue
+            started.append((index, managed, call, task_id))
 
-        producer = threading.Thread(target=consume, daemon=True)
-        producer.start()
-
-        render_error: Exception | None = None
+        self._set_run_phase(run, "waiting")
         try:
-            try:
-                ended = False
-                while not ended:
-                    batch = await inbox.get_batch()
-                    content_deltas: list[str] = []
-                    reason_deltas: list[str] = []
-                    for item in batch:
-                        if isinstance(item, _StreamEnd):
-                            error = item.error
-                            ended = True
-                            break
-                        got_item = True
-                        if isinstance(item, tuple):
-                            kind, payload = item
-                            if kind == "reasoning":
-                                reasoning_chars += len(payload)
-                                reason_deltas.append(payload)
-                            elif kind == "usage":
-                                self._prompt_tokens = payload["prompt_tokens"]
-                            elif kind == "timings":
-                                timings = payload
-                                prompt_n = payload.get("prompt_n")
-                                if prompt_n:
-                                    self._prompt_tokens = int(prompt_n)
-                        else:
-                            parts.append(item)
-                            content_chars += len(item)
-                            if item:
-                                got_content = True
-                                content_deltas.append(item)
-                    # /clear can unmount the live bubbles mid-stream; the answer
-                    # keeps accumulating for the model, but there is nothing
-                    # left to paint.
-                    if label.is_mounted:
-                        apply_reasoning("".join(reason_deltas))
-                        combined_delta = "".join(content_deltas)
-                        if combined_delta:
-                            # Awaited, not detached: the next batch cannot be
-                            # drained — and the stream cannot be finalized —
-                            # until this lands.
-                            await ai_stream.write(combined_delta)
-                    update_label()
-            except Exception as exc:  # noqa: BLE001 - a broken renderer ends the turn
-                # Rendering happens on the event loop now, so a failure here has
-                # no provider thread to surface it. Leaving it to propagate
-                # would latch _generating and queue every later message behind
-                # a turn that can never finish, so it is reported like any
-                # other stream failure and the turn ends.
-                render_error = exc
-            finally:
-                timer.stop()
-
-            await ai_stream.stop()
-            async with ai_md.lock:
-                pass
-            if self._stop_event.is_set():
-                drop_reason_bubble()
-                chat.remove(ai_entry)
-                self.push_message("system", "Generation stopped.")
-                return None
-            failure = error if render_error is None else render_error
-            if failure is not None:
-                headline = CONNECTION_ERROR if render_error is None else RENDER_ERROR
-                error_text = f"{headline}\n\n{failure}"
-                # A /clear during the turn already closed these handles; the
-                # failure still ends the turn, it just has nothing to paint.
-                if ai_entry.state == "live":
-                    label.update("AI")
-                    ai_md.add_class("error")
-                    await ai_md.update(error_text)
-                close_reason_bubble()
-                chat.finalize(
-                    ai_entry,
-                    TranscriptRecord("ai", error_text, label="AI", error=True),
-                )
-                chat.scroll_end(animate=False)
-                return None
-            reply = "".join(parts)
-            if reply.strip():
-                self._record_message("assistant", reply)
-            done_label = self._done_label(timings)
-            if ai_entry.state == "live":
-                # A queue notice can hold this bubble on screen past the turn,
-                # so the widget gets the done label too, not just the record.
-                label.update(done_label)
-            close_reason_bubble()
-            chat.finalize(ai_entry, TranscriptRecord("ai", reply, label=done_label))
-            self.ctx.last_reply = reply
-            return reply
+            results = await asyncio.gather(
+                *(
+                    self._dispatch_one(managed, call, task_id)
+                    for _, managed, call, task_id in started
+                ),
+                return_exceptions=True,
+            )
         finally:
-            abandoned.set()
-            try:
-                # Every path but a render failure has already seen _StreamEnd,
-                # so the producer is done. That one has not: releasing the turn
-                # with it still running would let the next request overlap it
-                # and grow an inbox nobody drains. Join off the event loop —
-                # Escape already makes a turn wait for its provider this way.
-                if producer.is_alive():
-                    await asyncio.to_thread(producer.join)
-            finally:
-                self._generating = False
-                self._render_status()
+            self._set_run_phase(run, "tool")
 
-    async def _tool_rounds(
-        self, reply: str, profile: ResolvedProfile, temperature: float
+        for (index, managed, call, task_id), result in zip(
+            started, results, strict=True
+        ):
+            if isinstance(result, asyncio.CancelledError):
+                # Shutdown, not a task failure: it must unwind, not be reported
+                # to the model as a completed batch.
+                raise result
+            if isinstance(result, BaseException):
+                message = f"{type(result).__name__}: {result}"
+                managed.transcript.append(
+                    TranscriptRecord(role="system", content=message, error=True)
+                )
+                self._set_agent_task_status(call.agent_key, task_id, "failed")
+                outcomes[index] = AgentOutcome(
+                    agent_key=call.agent_key,
+                    agent_label=managed.agent_label,
+                    task_id=task_id,
+                    task_label=call.task_label,
+                    status="failed",
+                    content=message,
+                )
+                continue
+            outcomes[index] = result
+        # Every call has an outcome by construction: it was rejected, it
+        # returned one, or its exception was converted above. Assert it rather
+        # than filtering, which would silently hand the coordinator a shorter
+        # batch than it dispatched.
+        assert all(outcome is not None for outcome in outcomes)
+        return tuple(outcomes)  # type: ignore[arg-type]
+
+    async def _begin_agent_task(
+        self, call: AgentDispatch, task_id: str
+    ) -> _ManagedAgent:
+        """Create or continue one agent and append its new running task.
+
+        A new key gets one in-memory session, one workspace view, and the task
+        recorded exactly once — the transcript record seeded into the view is
+        the presentation of that same message, not a second model message.
+
+        Raises:
+            _DispatchRejected: if the key exists with a different label or
+                profile, or is already running a task. Nothing is mutated.
+        """
+        task = AgentTaskSummary(task_id, call.task_label, "running")
+        managed = self._agents.get(call.agent_key)
+        if managed is None:
+            session = Session(persist=False)
+            session.add("user", call.task)
+            transcript = await self.add_agent_view(
+                AgentSummary(call.agent_key, call.agent_label, "running", (task,)),
+                (TranscriptRecord(role="user", content=call.task),),
+            )
+            managed = _ManagedAgent(
+                agent_key=call.agent_key,
+                agent_label=call.agent_label,
+                profile_name=call.profile_name,
+                session=session,
+                transcript=transcript,
+                tasks=[task],
+            )
+            self._agents[call.agent_key] = managed
+            return managed
+        if managed.agent_label != call.agent_label:
+            raise _DispatchRejected(
+                f"Agent {call.agent_key!r} already exists with the label "
+                f"{managed.agent_label!r}. An agent key keeps its label for the "
+                "session; use a new key for a differently labelled agent."
+            )
+        if managed.profile_name != call.profile_name:
+            raise _DispatchRejected(
+                f"Agent {call.agent_key!r} already exists on profile "
+                f"{managed.profile_name!r}. An agent key keeps its profile for "
+                "the session; use a new key to work on another profile."
+            )
+        if managed.runtime is not None:
+            raise _DispatchRejected(
+                f"Agent {call.agent_key!r} is still working on its current task. "
+                "Wait for its result before sending it another one."
+            )
+        managed.session.add("user", call.task)
+        managed.transcript.append(TranscriptRecord(role="user", content=call.task))
+        managed.tasks.append(task)
+        self.update_agent_view(
+            AgentSummary(
+                call.agent_key, managed.agent_label, "running", tuple(managed.tasks)
+            )
+        )
+        return managed
+
+    async def _dispatch_one(
+        self, managed: _ManagedAgent, call: AgentDispatch, task_id: str
+    ) -> AgentOutcome:
+        """Resolve one task's profile, run it, and map its typed outcome.
+
+        A pre-stream failure is written into the worker's own transcript before
+        the task is marked failed: a worker that never reached a provider still
+        has to show why.
+        """
+        def finish(
+            status: Literal["completed", "failed"], content: str
+        ) -> AgentOutcome:
+            """Mark this task terminal and describe it to the coordinator."""
+            self._set_agent_task_status(call.agent_key, task_id, status)
+            return AgentOutcome(
+                agent_key=call.agent_key,
+                agent_label=managed.agent_label,
+                task_id=task_id,
+                task_label=call.task_label,
+                status=status,
+                content=content,
+            )
+
+        try:
+            profile = self._profile_for_dispatch(call.profile_name)
+            resolved = await self._resolve_agent_profile(profile)
+        except ProfileError as error:
+            managed.transcript.append(
+                TranscriptRecord(role="system", content=str(error), error=True)
+            )
+            return finish("failed", str(error))
+
+        runtime = AutonomousRuntime(
+            AgentRunState(
+                agent_key=call.agent_key,
+                agent_label=managed.agent_label,
+                kind="subagent",
+                session=managed.session,
+                transcript=managed.transcript,
+                profile=resolved,
+                temperature=self.settings.temperature,
+                system_prompt=self._worker_system_prompt,
+                reasoning_mode=lambda: self.settings.reasoning,
+                debug_level=lambda: self.settings.debug_level,
+            ),
+            host=self,
+            stream_reply_fn=self._stream_reply_fn,
+            cmd_policy=self.cmd,
+            project_root=self._project_root,
+        )
+        managed.runtime = runtime
+        managed.active_task_id = task_id
+        try:
+            result = await runtime.run()
+        finally:
+            managed.runtime = None
+            managed.active_task_id = None
+        if result.status == "completed":
+            return finish("completed", result.final_text)
+        if result.status == "failed":
+            return finish("failed", result.error)
+        return finish("failed", AGENT_STOPPED)
+
+    def _set_agent_task_status(
+        self, agent_key: str, task_id: str, status: AgentStatus
     ) -> None:
-        """Run model rounds until one reply carries prose and no command calls.
+        """Repaint one agent row and exactly one of its task rows.
 
-        Command output must reach the model before the next completion decision,
-        so this loop owns the only normal exit: a reply with non-whitespace text
-        and no parsed commands. Any command call — however often it repeats, and
-        whatever result it produced — costs another model round, and an empty
-        reply is nudged rather than treated as an answer. There is no command,
-        round, repetition, or retry budget. ``None`` is a cancellation or a
-        provider failure that ``_stream_once`` has already reported.
+        Only one task of an agent runs at a time, so the agent row always shows
+        the status of the task named here; earlier task rows keep the terminal
+        status they finished with.
 
-        ``profile`` and ``temperature`` are the turn's captured values: no round
-        here re-reads the live active profile.
+        Raises:
+            KeyError: if the agent or the task is unknown. That is an internal
+                inconsistency, not a condition to skip past.
         """
-        self._tool_rounds_active = True
-        try:
-            while reply is not None:
-                commands = parse_jtech_reply(reply).commands
-                if commands:
-                    await self._process_commands(commands)
-                    reply = await self._stream_once(profile, temperature)
-                    continue
-                if reply.strip():
-                    return
-                reply = await self._nudge(profile, temperature)
-        finally:
-            self._tool_rounds_active = False
-
-    async def _nudge(
-        self, profile: ResolvedProfile, temperature: float
-    ) -> str | None:
-        """Request a continuation after the model returned an empty reply."""
-        if self.settings.debug_level == "system":
-            # Keep an auditable event without feeding it into future prompts.
-            self._record_message(
-                "system",
-                NUDGE_PROMPT,
-                include_in_context=False,
-                debug_only=True,
+        managed = self._agents.get(agent_key)
+        if managed is None:
+            raise KeyError(f"Unknown agent key: {agent_key!r}")
+        for index, task in enumerate(managed.tasks):
+            if task.task_id == task_id:
+                managed.tasks[index] = dataclasses.replace(task, status=status)
+                break
+        else:
+            raise KeyError(f"Agent {agent_key!r} has no task {task_id!r}")
+        self.update_agent_view(
+            AgentSummary(
+                agent_key, managed.agent_label, status, tuple(managed.tasks)
             )
-            self.push_message("system", NUDGE_PROMPT)
-        with self.session.ephemeral("system", NUDGE_PROMPT):
-            return await self._stream_once(profile, temperature)
+        )
 
-    async def _process_commands(self, commands: list[str]) -> None:
-        """Run every parsed command in source order, feeding each result back."""
-        for command in commands:
-            if not command.strip():
-                self._note_command(command, "empty command — not run")
-                continue
-            decision = decide(command, self.cmd, self._project_root)
-            if decision.action == "blocked":
-                self._note_command(command, f"blocked — {decision.reason}")
-                continue
-            if decision.action == "ask":
-                choice = await self._prompt_for_command(command, decision.reason)
-                if choice is CmdChoice.DECLINE:
-                    self._note_command(command, "declined by the user")
-                    self._add_system(COMMAND_DECLINED_PROMPT)
-                    continue
-                if choice is CmdChoice.ALWAYS:
-                    self._add_allow_rule(allow_rule_for(command, self.cmd.allow))
-            result = await self._exec_command(command)
-            self.push_message("system", self._cmd_bubble(command, result))
-            self._add_system(format_result(command, result=result))
+    # ------------------------------------------------------ runtime callbacks
 
-    def _note_command(self, command: str, note: str) -> None:
-        self.push_message("system", f"$ {command}\n→ {note}")
-        self._add_system(format_result(command, note=note))
+    def _set_run_phase(self, run: AgentRunState, phase: RunPhase) -> None:
+        """Move one run to ``phase`` from outside its own runtime."""
+        run.phase = phase
+        self.runtime_changed(run)
 
-    async def _prompt_for_command(self, command: str, reason: str) -> CmdChoice:
-        """Ask the user about one command, reporting Primary as waiting.
+    def runtime_changed(self, run: AgentRunState) -> None:
+        """Follow one run's observable state into the UI it owns.
 
-        The surrounding accepted turn still owns the final transition to
-        ``idle``; this only marks the stretch where Primary cannot progress
-        without the user.
+        The single synchronization point: no timer polls a runtime field, and
+        nothing else reads one to paint with.
         """
-        self._set_primary_agent_status("waiting")
-        try:
-            return await self.push_screen_wait(CommandPrompt(command, reason))
-        finally:
-            self._set_primary_agent_status("running")
+        if run.kind == "primary":
+            self._prompt_tokens = run.prompt_tokens
+            self.ctx.last_reply = run.last_reply
+            self._render_status(
+                running="running command…" if run.phase == "command" else None
+            )
+            wanted: AgentStatus | None = None
+            if run.phase == "waiting":
+                wanted = "waiting"
+            elif self._primary_turn_depth:
+                # The accepted turn still owns the transition to idle, so a
+                # finished phase never paints it here.
+                wanted = "running"
+            if (
+                wanted is not None
+                and self._workspace.summary_for(PRIMARY_AGENT_ID).status != wanted
+            ):
+                # Every phase change reaches here; only a real transition is
+                # worth a sidebar repaint.
+                self._set_primary_agent_status(wanted)
+            return
+        managed = self._agents[run.agent_key]
+        task_id = managed.active_task_id
+        if task_id is None:
+            raise KeyError(
+                f"Agent {run.agent_key!r} reported {run.phase!r} with no active task"
+            )
+        # The task the runtime is actually working on, never the last row of
+        # the list: a continuation appends, and earlier rows keep their own
+        # terminal status.
+        self._set_agent_task_status(run.agent_key, task_id, _PHASE_STATUS[run.phase])
 
-    def _add_allow_rule(self, rule: str | None) -> None:
+    # ------------------------------------------------------------- approvals
+
+    async def authorize_command(
+        self, run: AgentRunState, command: str
+    ) -> CommandAuthorization:
+        """Decide one command for ``run`` under the live global policy.
+
+        Serialized for every runtime: one approval modal exists at a time, and
+        the decision is re-evaluated after the lock is acquired, because the
+        agent ahead in the queue may have saved an allow rule that covers this
+        command too.
+        """
+        async with self._approval_lock:
+            decision = decide(command, self.cmd, self._project_root)
+            if decision.action == "run":
+                return CommandAuthorization("run")
+            if decision.action == "blocked":
+                return CommandAuthorization("blocked", decision.reason)
+            self._set_run_phase(run, "waiting")
+            try:
+                choice = await self.push_screen_wait(
+                    CommandPrompt(command, decision.reason, requester=run.agent_label)
+                )
+            finally:
+                self._set_run_phase(run, "tool")
+            if choice is CmdChoice.DECLINE:
+                return CommandAuthorization("declined", "declined by the user")
+            if choice is CmdChoice.ALWAYS:
+                self._add_allow_rule(allow_rule_for(command, self.cmd.allow), run)
+            return CommandAuthorization("run")
+
+    def _add_allow_rule(self, rule: str | None, run: AgentRunState) -> None:
+        """Persist one always-allow rule, reporting it to the run that earned it."""
         if not rule or rule in self.cmd.allow:
             return
         self.cmd.allow.append(rule)
         try:
             self._save(self.settings)
-            self.push_message("system", f"Always-allow saved: {rule}")
+            note = f"Always-allow saved: {rule}"
         except OSError as error:
-            self.push_message("system", f"Could not save always-allow rule: {error}")
+            note = f"Could not save always-allow rule: {error}"
+        run.transcript.append(TranscriptRecord(role="system", content=note))
 
-    async def _exec_command(self, command: str) -> ExecResult:
-        """Run one command in a worker; Esc and timeout preserve partial output."""
-        self._render_status(running="running command…")
-        self._cmd_interrupted = False
-        try:
-            proc = await asyncio.to_thread(
-                subprocess.Popen,
-                ["bash", "-c", command],
-                cwd=self._project_root,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-            )
-        except OSError as error:
-            self._render_status()
-            return ExecResult(127, str(error))
-        self._running_proc = proc
-        try:
-            try:
-                out, _ = await asyncio.to_thread(
-                    proc.communicate, timeout=self.cmd.timeout
-                )
-            except subprocess.TimeoutExpired as error:
-                proc.kill()
-                await asyncio.to_thread(proc.wait)
-                partial, truncated = truncate_output(
-                    timeout_partial_output(error), self.cmd.max_output
-                )
-                return ExecResult(124, partial, timed_out=True, truncated=truncated)
-            out = out or ""
-            if self._cmd_interrupted:
-                self._cmd_interrupted = False
-                text, truncated = truncate_output(out, self.cmd.max_output)
-                return ExecResult(130, text, interrupted=True, truncated=truncated)
-            text, truncated = truncate_output(out, self.cmd.max_output)
-            return ExecResult(proc.returncode, text, truncated=truncated)
-        finally:
-            self._running_proc = None
-            self._render_status()
-
-    @staticmethod
-    def _cmd_bubble(command: str, result: ExecResult) -> str:
-        if result.timed_out:
-            return f"$ {command}\n\n**timed out**"
-        if result.interrupted:
-            return f"$ {command}\n\n**interrupted**"
-        body = result.output if result.output else "(no output)"
-        return f"$ {command} — exit {result.exit_code}\n\n```\n{body}\n```"
-
-    @staticmethod
-    def _done_label(timings: dict | None) -> str:
-        if not timings:
-            return "AI"
-        prompt_n = int(timings.get("prompt_n", 0))
-        prompt_s = float(timings.get("prompt_ms", 0)) / 1000
-        prompt_tps = float(timings.get("prompt_per_second", 0))
-        return f"AI  ·  prompt {prompt_n:,} tok · {prompt_s:.1f}s · {prompt_tps:.0f} t/s"
+    # ------------------------------------------------------------ stop / busy
 
     def action_stop_stream(self) -> None:
         # A subagent view has no writable target and no cancellation of its own:
@@ -1120,26 +1168,44 @@ class ChatApp(App):
         # The visible read-only notice is the documented explanation.
         if not self.viewing_primary:
             return
-        if self._generating:
-            self._stop_event.set()
-        elif self._running_proc is not None:
-            self._cmd_interrupted = True
-            self._running_proc.kill()
-        else:
+        runtime = self._primary_runtime
+        if runtime is None or not (
+            runtime.state.generating or runtime.state.running_proc is not None
+        ):
             self._hide_suggestions()
+            return
+        runtime.request_stop()
+
+    @property
+    def _generating(self) -> bool:
+        """Whether the Primary turn is consuming a provider stream right now.
+
+        Derived from the run that owns the flag rather than mirrored into a
+        second boolean, so there is exactly one place it can be true.
+        """
+        runtime = self._primary_runtime
+        return runtime is not None and runtime.state.generating
+
+    @property
+    def _tool_rounds_active(self) -> bool:
+        """Whether the Primary turn is between completions, running its tools."""
+        runtime = self._primary_runtime
+        return runtime is not None and runtime.state.tool_rounds_active
 
     def _busy(self) -> str | None:
         """Why a profile change is refused right now, or ``None`` when idle.
 
         The current turn must keep one endpoint/model/credential identity, so a
         switch that is visible in the footer but does not affect the running
-        turn is refused outright rather than half-applied.
+        turn is refused outright rather than half-applied. A live agent batch
+        is a tool round: Primary stays in it until every result is back.
         """
-        if self._generating:
+        runtime = self._primary_runtime
+        if runtime is None:
+            return None
+        if runtime.state.generating:
             return BUSY_GENERATING
-        if self._tool_rounds_active:
-            return BUSY_TOOL_ROUND
-        return None
+        return BUSY_TOOL_ROUND
 
     def _save(self, settings: Settings) -> None:
         """Write ``settings`` with the complete live command policy."""
@@ -1326,3 +1392,42 @@ class ChatApp(App):
         """
         if confirmed:
             self.exit()
+
+    def exit(
+        self,
+        result: object | None = None,
+        return_code: int = 0,
+        message: RenderableType | None = None,
+    ) -> None:
+        """Signal every live runtime, then exit exactly as Textual would.
+
+        The one place the app leaves, so ``Ctrl+Q``, ``/exit``, the confirmed
+        quit, and a panic exit all stop the same runtimes and kill the same
+        child processes without a separate shutdown command. It does not await,
+        poll, or delay the exit: the runners' own ``finally`` blocks finish the
+        unwinding when Textual cancels them.
+        """
+        runtime = self._primary_runtime
+        if runtime is not None:
+            runtime.request_stop()
+        for managed in self._agents.values():
+            if managed.runtime is not None:
+                managed.runtime.request_stop()
+        super().exit(result, return_code, message)
+
+
+__all__ = [
+    "BUSY_GENERATING",
+    "BUSY_TOOL_ROUND",
+    "CONNECTION_ERROR",
+    "NO_PROFILE",
+    "PRIMARY_AGENT_ID",
+    "RENDER_ERROR",
+    "SPINNER_FRAMES",
+    "SUBAGENT_CLEAR_BLOCKED",
+    "SUBAGENT_READONLY",
+    "ChatApp",
+    "FetchServerInfo",
+    "FetchTokenCount",
+    "StreamReply",
+]

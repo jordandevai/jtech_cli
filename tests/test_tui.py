@@ -1,6 +1,7 @@
 """Tests for the Textual TUI: bubbles, status bar, notices, settings, and /clear."""
 
 import asyncio
+import json
 import threading
 import time
 
@@ -17,6 +18,7 @@ from jtech_cli.config import (
     Profile,
     ProfileError,
     Profiles,
+    ResolvedProfile,
     Settings,
     build_settings,
     load_cmd_policy,
@@ -37,9 +39,8 @@ from jtech_cli.tui_app import (
     RENDER_ERROR,
     SUBAGENT_CLEAR_BLOCKED,
     SUBAGENT_READONLY,
-    _StreamEnd,
-    _StreamInbox,
 )
+from jtech_cli.tui_runtime import AutonomousRuntime, _StreamEnd, _StreamInbox
 from jtech_cli.tui_widgets import (
     AgentSummary,
     AgentTaskSummary,
@@ -3511,11 +3512,32 @@ async def test_a_profile_switch_is_refused_while_streaming(tmp_path, monkeypatch
         await _wait_until(app, pilot, lambda: not app._generating)
 
 
+def park_in_tool_round(app: ChatApp) -> None:
+    """Install a Primary runtime parked between completions, as a batch is.
+
+    The real state object, not a stand-in boolean: ``_busy()`` reads the run
+    that owns the flag, so a test that fakes the flag would prove nothing.
+    """
+    state = app._primary_run_state(
+        ResolvedProfile(
+            name="local", base_url="http://host:9000/v1", model="qwen3", api_key="none"
+        )
+    )
+    state.tool_rounds_active = True
+    app._primary_runtime = AutonomousRuntime(
+        state,
+        host=app,
+        stream_reply_fn=app._stream_reply_fn,
+        cmd_policy=app.cmd,
+        project_root=app._project_root,
+    )
+
+
 async def test_a_profile_change_is_refused_during_a_tool_round(tmp_path):
     app = make_app(tmp_path, settings=two_profile_settings())
     async with app.run_test() as pilot:
         before = app.settings.profiles
-        app._tool_rounds_active = True
+        park_in_tool_round(app)
         try:
             await app._switch_profile("cloud")
             await pilot.pause()
@@ -3530,7 +3552,7 @@ async def test_a_profile_change_is_refused_during_a_tool_round(tmp_path):
             assert app.settings.profiles is before
             assert any("tool round" in bubble for bubble in bubbles(app))
         finally:
-            app._tool_rounds_active = False
+            app._primary_runtime = None
 
 
 async def test_one_autonomous_turn_uses_one_resolved_profile(tmp_path, monkeypatch):
@@ -4520,7 +4542,7 @@ async def test_escape_in_subagent_view_does_not_stop_hidden_primary_work(
         await pilot.press("escape")
         await settle(pilot)
 
-        assert not app._stop_event.is_set()
+        assert not app._primary_runtime.state.stop_event.is_set()
         assert app._generating
 
         gate.set()
@@ -4641,3 +4663,1032 @@ async def test_primary_status_stays_running_across_queued_turn_drain(
         assert statuses == ["running", "idle"]
         assert primary_summary(app).status == "idle"
         assert app._queue == []
+
+
+# ------------------------------------------------------- agent orchestration
+
+
+def dispatch_call(
+    key="coder",
+    label="Coder",
+    profile="local",
+    task_label="Task",
+    task="do the work",
+) -> str:
+    """Format one dispatch using the production protocol."""
+    return f"jtech_agent({key!r}, {label!r}, {profile!r}, {task_label!r}, {task!r})"
+
+
+class Conversation:
+    """A stream fake that answers each conversation from its own script.
+
+    Keyed by the system prompt's role — coordinator or worker — and then by how
+    many completions that conversation has already had, so one fixture can drive
+    Primary and several agents at once and record exactly what each was sent.
+    """
+
+    def __init__(self, primary: list[str], worker: list[str] | None = None) -> None:
+        self.primary = list(primary)
+        self.worker = list(worker or [])
+        self.requests: list[tuple[str, list[dict]]] = []
+        self.profiles: list[ResolvedProfile] = []
+        self._counts: dict[str, int] = {}
+
+    def __call__(self, profile, temperature, messages):
+        system = messages[0]["content"]
+        role = "worker" if "You are a subagent" in system else "primary"
+        index = self._counts.get(role, 0)
+        self._counts[role] = index + 1
+        self.requests.append((role, messages))
+        self.profiles.append(profile)
+        script = self.primary if role == "primary" else self.worker
+        yield script[index] if index < len(script) else "finished"
+
+    def sent_to(self, role: str) -> list[list[dict]]:
+        return [messages for name, messages in self.requests if name == role]
+
+
+def agent_summary(app: ChatApp, agent_id: str) -> AgentSummary:
+    return workspace_of(app).summary_for(agent_id)
+
+
+def agent_activity(app: ChatApp, agent_id: str) -> list[str]:
+    return activity_text(workspace_of(app).activity_for(agent_id))
+
+
+def agent_results(app: ChatApp) -> list[dict]:
+    """Every agent-result envelope in Primary's model-facing context."""
+    envelopes = []
+    for message in app.session.messages:
+        body = message.get("_model_content", "")
+        if body.startswith("[JTECH agent result]\n"):
+            envelopes.append(json.loads(body.split("\n", 1)[1]))
+    return envelopes
+
+
+async def run_primary(app, pilot, text="go", tries=100):
+    """Submit one Primary message and wait for its whole turn to settle."""
+    inp = app.query_one("#input", Input)
+    inp.value = text
+    await pilot.press("enter")
+    await _wait_until(app, pilot, lambda: app._primary_turn_depth == 0, tries=tries)
+    await settle(pilot)
+
+
+async def test_a_first_dispatch_creates_one_agent_view_session_and_task(
+    tmp_path, monkeypatch
+):
+    stream = Conversation([dispatch_call(), "all done"], ["worker answer"])
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", stream)
+    app = make_app(tmp_path)
+    async with app.run_test() as pilot:
+        await run_primary(app, pilot)
+
+        summary = agent_summary(app, "coder")
+        assert summary.label == "Coder"
+        assert summary.status == "completed"
+        assert [(t.label, t.status) for t in summary.tasks] == [("Task", "completed")]
+        # The task is the agent's first message, recorded once and shown once.
+        managed = app._agents["coder"]
+        assert [m["content"] for m in managed.session.messages] == [
+            "do the work",
+            "worker answer",
+        ]
+        assert agent_activity(app, "coder")[0] == "do the work"
+        worker_prompts = stream.sent_to("worker")
+        assert len(worker_prompts) == 1
+        assert "You are a subagent" in worker_prompts[0][0]["content"]
+        assert "### Available profiles" not in worker_prompts[0][0]["content"]
+
+
+async def test_the_coordinator_prompt_reaches_the_real_primary_request(
+    tmp_path, monkeypatch
+):
+    stream = Conversation(["done"])
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", stream)
+    app = make_app(tmp_path, settings=two_profile_settings())
+    async with app.run_test() as pilot:
+        await run_primary(app, pilot)
+    system = stream.sent_to("primary")[0][0]["content"]
+    assert "jtech_agent(" in system
+    assert "`local` — the profile this conversation runs on" in system
+    assert "`cloud`" in system
+
+
+async def test_a_repeated_key_continues_one_conversation(tmp_path, monkeypatch):
+    stream = Conversation(
+        [
+            dispatch_call(task_label="First", task="first task"),
+            dispatch_call(task_label="Second", task="second task"),
+            "all done",
+        ],
+        ["first answer", "second answer"],
+    )
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", stream)
+    app = make_app(tmp_path)
+    async with app.run_test() as pilot:
+        await run_primary(app, pilot)
+
+        # One agent, two tasks, one transcript, one session.
+        assert list(app._agents) == ["coder"]
+        summary = agent_summary(app, "coder")
+        assert [(t.label, t.status) for t in summary.tasks] == [
+            ("First", "completed"),
+            ("Second", "completed"),
+        ]
+        assert [m["content"] for m in app._agents["coder"].session.messages] == [
+            "first task",
+            "first answer",
+            "second task",
+            "second answer",
+        ]
+        # The second request carried the first exchange, so context survived.
+        second_request = stream.sent_to("worker")[1]
+        assert [m["content"] for m in second_request[1:]] == [
+            "first task",
+            "first answer",
+            "second task",
+        ]
+        assert agent_activity(app, "coder").count("second task") == 1
+
+
+async def test_a_label_or_profile_change_for_one_key_fails_without_mutating(
+    tmp_path, monkeypatch
+):
+    stream = Conversation(
+        [
+            dispatch_call(task_label="First"),
+            dispatch_call(label="Renamed", task_label="Second"),
+            dispatch_call(profile="cloud", task_label="Third"),
+            "all done",
+        ],
+        ["worker answer"],
+    )
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", stream)
+    app = make_app(tmp_path, settings=two_profile_settings())
+    async with app.run_test() as pilot:
+        await run_primary(app, pilot)
+
+        summary = agent_summary(app, "coder")
+        assert summary.label == "Coder"
+        assert [t.label for t in summary.tasks] == ["First"]
+        # One real run, two refusals — no second worker request was made.
+        assert len(stream.sent_to("worker")) == 1
+        results = agent_results(app)
+        assert [r["status"] for r in results] == ["completed", "failed", "failed"]
+        assert "keeps its label" in results[1]["content"]
+        assert "keeps its profile" in results[2]["content"]
+
+
+async def test_two_agents_never_share_a_session_or_a_transcript(
+    tmp_path, monkeypatch
+):
+    stream = Conversation(
+        [f'{dispatch_call(key="a", label="A")}\n{dispatch_call(key="b", label="B")}',
+         "all done"],
+        ["answer one", "answer two"],
+    )
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", stream)
+    app = make_app(tmp_path)
+    async with app.run_test() as pilot:
+        await run_primary(app, pilot)
+
+        first = app._agents["a"]
+        second = app._agents["b"]
+        assert first.session is not second.session
+        assert first.transcript is not second.transcript
+        one = " ".join(m["content"] for m in first.session.messages)
+        two = " ".join(m["content"] for m in second.session.messages)
+        assert ("answer one" in one) != ("answer one" in two)
+        assert set(agent_activity(app, "a")).isdisjoint(
+            set(agent_activity(app, "b")) - {"do the work"}
+        )
+
+
+async def test_subagent_sessions_never_touch_the_filesystem(tmp_path, monkeypatch):
+    stream = Conversation([dispatch_call(), "all done"], ["worker answer"])
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", stream)
+    worker_history = tmp_path / "never" / "session.jsonl"
+    monkeypatch.setattr(
+        "jtech_cli.session.default_history_path", lambda: worker_history
+    )
+    app = make_app(tmp_path)
+    async with app.run_test() as pilot:
+        await run_primary(app, pilot)
+        managed = app._agents["coder"]
+        assert managed.session.persist is False
+        assert len(managed.session.messages) == 2
+        assert not worker_history.exists()
+        assert not worker_history.parent.exists()
+
+
+async def test_a_failed_agent_stays_selectable_and_can_take_another_task(
+    tmp_path, monkeypatch
+):
+    calls = {"n": 0, "worker": 0}
+
+    def fake(profile, temperature, messages):
+        if "You are a subagent" in messages[0]["content"]:
+            calls["worker"] += 1
+            if calls["worker"] == 1:
+                raise RuntimeError("provider exploded")
+            yield "recovered"
+            return
+        calls["n"] += 1
+        if calls["n"] == 1:
+            yield dispatch_call(task_label="First")
+        elif calls["n"] == 2:
+            yield dispatch_call(task_label="Second")
+        else:
+            yield "all done"
+
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    app = make_app(tmp_path)
+    async with app.run_test() as pilot:
+        await run_primary(app, pilot)
+
+        summary = agent_summary(app, "coder")
+        assert [(t.label, t.status) for t in summary.tasks] == [
+            ("First", "failed"),
+            ("Second", "completed"),
+        ]
+        assert summary.status == "completed"
+        results = agent_results(app)
+        assert [r["status"] for r in results] == ["failed", "completed"]
+        assert "provider exploded" in results[0]["content"]
+        assert any(
+            "provider exploded" in line for line in agent_activity(app, "coder")
+        )
+        await select_agent(app, pilot, "coder")
+        assert visible_activity(app) is workspace_of(app).activity_for("coder")
+
+
+async def test_a_relaunch_restores_primary_history_only(tmp_path, monkeypatch):
+    stream = Conversation([dispatch_call(), "all done"], ["worker answer"])
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", stream)
+    session = Session(tmp_path / "s.jsonl")
+    app = make_app(tmp_path, session=session)
+    async with app.run_test() as pilot:
+        await run_primary(app, pilot)
+    assert agent_results(app)[0]["content"] == "worker answer"
+
+    restored = Session(tmp_path / "s.jsonl")
+    restored.load()
+    relaunched = make_app(tmp_path, session=restored)
+    async with relaunched.run_test() as pilot:
+        await settle(pilot)
+        # The result survives in Primary's context; the worker does not come back.
+        assert agent_results(relaunched)[0]["content"] == "worker answer"
+        assert relaunched._agents == {}
+        assert len(workspace_of(relaunched).query(_AgentListItem)) == 1
+
+
+async def test_dispatch_never_disturbs_the_composer_selection_or_queue(
+    tmp_path, monkeypatch
+):
+    gate = threading.Event()
+    calls = {"n": 0}
+
+    def fake(profile, temperature, messages):
+        system = messages[0]["content"]
+        if "You are a subagent" in system:
+            gate.wait(5)
+            yield "worker answer"
+            return
+        calls["n"] += 1
+        yield dispatch_call() if calls["n"] == 1 else "all done"
+
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    app = make_app(tmp_path)
+    async with app.run_test() as pilot:
+        inp = app.query_one("#input", Input)
+        inp.value = "go"
+        await pilot.press("enter")
+        await _wait_until(app, pilot, lambda: "coder" in app._agents)
+
+        assert app.viewing_primary
+        assert visible_activity(app) is chat_of(app)
+        inp.value = "a draft"
+        inp.value = "queued while busy"
+        await pilot.press("enter")
+        await _wait_until(app, pilot, lambda: app._queue == ["queued while busy"])
+        assert primary_summary(app).status == "waiting"
+
+        gate.set()
+        await _wait_until(app, pilot, lambda: app._primary_turn_depth == 0)
+        assert app._queue == []
+        assert primary_summary(app).status == "idle"
+
+
+# ---------------------------------------------------------------- profiles
+
+
+async def test_each_agent_uses_its_own_resolved_profile(tmp_path, monkeypatch):
+    stream = Conversation(
+        [
+            (
+                f'{dispatch_call(key="a", label="A", profile="local")}\n'
+                f'{dispatch_call(key="b", label="B", profile="cloud")}'
+            ),
+            "all done",
+        ],
+        ["one", "two"],
+    )
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", stream)
+    monkeypatch.setenv("CLOUD_API_KEY", "sk-secret")
+    app = make_app(tmp_path, settings=two_profile_settings())
+    async with app.run_test() as pilot:
+        await run_primary(app, pilot)
+
+        worker_profiles = [
+            profile
+            for profile, (role, _) in zip(
+                stream.profiles, stream.requests, strict=True
+            )
+            if role == "worker"
+        ]
+        assert {p.name for p in worker_profiles} == {"local", "cloud"}
+        by_name = {p.name: p for p in worker_profiles}
+        assert by_name["cloud"].model == "cloud-model"
+        assert by_name["cloud"].base_url == "https://api.example.com/v1"
+        assert by_name["local"].api_key == "none"
+        # The credential is never rendered, never returned, and never repr'd.
+        assert "sk-secret" not in repr(by_name["cloud"])
+        assert "sk-secret" not in "\n".join(bubbles(app))
+        assert "sk-secret" not in "\n".join(agent_activity(app, "b"))
+        assert "sk-secret" not in json.dumps(agent_results(app))
+        assert "sk-secret" not in app.query_one("#status", Static).content
+
+
+async def test_an_explicit_model_skips_discovery(tmp_path, monkeypatch):
+    stream = Conversation([dispatch_call(), "all done"], ["ok"])
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", stream)
+    probed: list[Profile] = []
+
+    def discover(profile):
+        probed.append(profile)
+        raise AssertionError("discovery must not run for a configured model")
+
+    app = make_app(tmp_path)
+    app._fetch_server_info_fn = discover
+    async with app.run_test() as pilot:
+        await run_primary(app, pilot)
+    assert probed == []
+    assert agent_results(app)[0]["status"] == "completed"
+
+
+async def test_an_empty_model_on_the_active_profile_uses_the_discovered_one(
+    tmp_path, monkeypatch
+):
+    stream = Conversation([dispatch_call(), "all done"], ["ok"])
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", stream)
+    settings = local_settings()
+    settings.profiles = Profiles(
+        items=(Profile(name="local", base_url="http://host:9000/v1"),),
+        active_name="local",
+    )
+    app = make_app(tmp_path, settings=settings)
+    app._fetch_server_info_fn = lambda profile: pytest.fail("no probe expected")
+    async with app.run_test() as pilot:
+        await run_primary(app, pilot)
+    worker_profile = next(
+        profile
+        for profile, (role, _) in zip(stream.profiles, stream.requests, strict=True)
+        if role == "worker"
+    )
+    assert worker_profile.model == "qwen3"
+
+
+async def test_an_empty_model_elsewhere_is_discovered_without_touching_primary(
+    tmp_path, monkeypatch
+):
+    stream = Conversation([dispatch_call(profile="cloud"), "all done"], ["ok"])
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", stream)
+    monkeypatch.setenv("CLOUD_API_KEY", "sk-secret")
+    cloud = Profile(
+        name="cloud",
+        base_url="https://api.example.com/v1",
+        api_key_env="CLOUD_API_KEY",
+    )
+    settings = Settings(profiles=Profiles(items=(LOCAL, cloud), active_name="local"))
+    threads: list[int] = []
+
+    def discover(profile):
+        threads.append(threading.get_ident())
+        return ServerInfo(models=["discovered-cloud"], context_length=999)
+
+    app = make_app(tmp_path, settings=settings)
+    app._fetch_server_info_fn = discover
+    async with app.run_test() as pilot:
+        await run_primary(app, pilot)
+        worker_profile = next(
+            profile
+            for profile, (role, _) in zip(
+                stream.profiles, stream.requests, strict=True
+            )
+            if role == "worker"
+        )
+        assert worker_profile.model == "discovered-cloud"
+        # Off the event loop, and the Primary footer keeps its own server.
+        assert threads and threads[0] != threading.get_ident()
+        assert app.server.models == ["qwen3"]
+        assert app.server.context_length == 4096
+        assert "discovered-cloud" not in app.query_one("#status", Static).content
+
+
+@pytest.mark.parametrize(
+    ("profile_name", "fragment"),
+    [
+        ("nope", "No profile named 'nope'"),
+        ("cloud", "$CLOUD_API_KEY"),
+    ],
+)
+async def test_a_profile_failure_fails_only_its_own_task(
+    tmp_path, monkeypatch, profile_name, fragment
+):
+    monkeypatch.delenv("CLOUD_API_KEY", raising=False)
+    stream = Conversation(
+        [
+            (
+                f'{dispatch_call(key="bad", label="Bad", profile=profile_name)}\n'
+                f'{dispatch_call(key="good", label="Good", profile="local")}'
+            ),
+            "all done",
+        ],
+        ["good answer"],
+    )
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", stream)
+    app = make_app(tmp_path, settings=two_profile_settings())
+    async with app.run_test() as pilot:
+        await run_primary(app, pilot)
+
+        results = agent_results(app)
+        assert [r["agent_key"] for r in results] == ["bad", "good"]
+        assert results[0]["status"] == "failed"
+        assert fragment in results[0]["content"]
+        assert results[1] == {
+            **results[1],
+            "status": "completed",
+            "content": "good answer",
+        }
+        assert agent_summary(app, "bad").status == "failed"
+        assert agent_summary(app, "good").status == "completed"
+        assert any(fragment in line for line in agent_activity(app, "bad"))
+
+
+async def test_an_unreachable_discovery_endpoint_fails_only_its_task(
+    tmp_path, monkeypatch
+):
+    stream = Conversation([dispatch_call(profile="cloud"), "all done"])
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", stream)
+    monkeypatch.setenv("CLOUD_API_KEY", "sk-secret")
+    cloud = Profile(
+        name="cloud",
+        base_url="https://api.example.com/v1",
+        api_key_env="CLOUD_API_KEY",
+    )
+    settings = Settings(profiles=Profiles(items=(LOCAL, cloud), active_name="local"))
+    app = make_app(tmp_path, settings=settings)
+    app._fetch_server_info_fn = lambda profile: ServerInfo(
+        error="URLError: connection refused"
+    )
+    async with app.run_test() as pilot:
+        await run_primary(app, pilot)
+    content = agent_results(app)[0]["content"]
+    assert "could not be reached" in content
+    assert "connection refused" in content
+    assert "sk-secret" not in content
+
+
+async def test_a_cli_override_is_advertised_once_and_dispatchable(
+    tmp_path, monkeypatch
+):
+    stream = Conversation([dispatch_call(profile="local"), "all done"], ["ok"])
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", stream)
+    settings = two_profile_settings()
+    settings.profile_override = Profile(
+        name="local", base_url="http://override:1/v1", model="override-model"
+    )
+    app = make_app(tmp_path, settings=settings)
+    async with app.run_test() as pilot:
+        await run_primary(app, pilot)
+
+    system = stream.sent_to("primary")[0][0]["content"]
+    listing = system[system.index("### Available profiles") :]
+    assert listing.count("`local`") == 1
+    assert listing.index("`local`") < listing.index("`cloud`")
+    worker_profile = next(
+        profile
+        for profile, (role, _) in zip(stream.profiles, stream.requests, strict=True)
+        if role == "worker"
+    )
+    assert worker_profile.base_url == "http://override:1/v1"
+    assert worker_profile.model == "override-model"
+
+
+async def test_each_continuation_re_resolves_the_named_profile(tmp_path, monkeypatch):
+    """A key keeps its profile *name*, not a pinned resolution: the second task
+    picks up whatever that name resolves to now."""
+    inside = threading.Event()
+    release = threading.Event()
+    models: list[str] = []
+    calls = {"n": 0, "worker": 0}
+
+    def fake(profile, temperature, messages):
+        if "You are a subagent" in messages[0]["content"]:
+            models.append(profile.model)
+            calls["worker"] += 1
+            if calls["worker"] == 1:
+                inside.set()
+                release.wait(5)
+            yield "worker answer"
+            return
+        calls["n"] += 1
+        if calls["n"] == 1:
+            yield dispatch_call(task_label="First")
+        elif calls["n"] == 2:
+            yield dispatch_call(task_label="Second")
+        else:
+            yield "all done"
+
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    settings = local_settings()
+    settings.profiles = Profiles(
+        items=(Profile(name="local", base_url="http://host:9000/v1"),),
+        active_name="local",
+    )
+    app = make_app(tmp_path, settings=settings)
+    async with app.run_test() as pilot:
+        inp = app.query_one("#input", Input)
+        inp.value = "go"
+        await pilot.press("enter")
+        await _wait_until(app, pilot, lambda: inside.is_set())
+        # The endpoint's uniquely discovered model changes between the tasks.
+        app.server.models = ["qwen4"]
+        release.set()
+        await _wait_until(app, pilot, lambda: app._primary_turn_depth == 0)
+        assert app._agents["coder"].profile_name == "local"
+
+    assert models == ["qwen3", "qwen4"]
+
+
+# ------------------------------------------------------------- parallelism
+
+
+async def test_distinct_calls_all_start_before_any_of_them_finishes(
+    tmp_path, monkeypatch
+):
+    """A gated fake: every worker must be inside its stream before any is
+    released. A sequential implementation deadlocks here and fails."""
+    release = threading.Event()
+    live = threading.Semaphore(0)
+    calls = {"n": 0}
+
+    def fake(profile, temperature, messages):
+        if "You are a subagent" in messages[0]["content"]:
+            live.release()
+            release.wait(5)
+            yield "worker answer"
+            return
+        calls["n"] += 1
+        if calls["n"] == 1:
+            yield "\n".join(
+                dispatch_call(key=key, label=key.upper()) for key in ("a", "b", "c")
+            )
+        else:
+            yield "all done"
+
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    app = make_app(tmp_path)
+    async with app.run_test() as pilot:
+        inp = app.query_one("#input", Input)
+        inp.value = "go"
+        await pilot.press("enter")
+
+        started = 0
+        for _ in range(100):
+            await pilot.pause(0.05)
+            while live.acquire(blocking=False):
+                started += 1
+            if started == 3:
+                break
+        assert started == 3, f"only {started} agents started before any finished"
+        assert all(agent_summary(app, key).status == "running" for key in "abc")
+        assert primary_summary(app).status == "waiting"
+
+        release.set()
+        await _wait_until(app, pilot, lambda: app._primary_turn_depth == 0)
+        assert [r["agent_key"] for r in agent_results(app)] == ["a", "b", "c"]
+        assert primary_summary(app).status == "idle"
+
+
+async def test_results_are_ordered_by_call_not_by_completion(tmp_path, monkeypatch):
+    """The first call finishes last; the coordinator still reads them in the
+    order it wrote them."""
+    slow = threading.Event()
+    calls = {"n": 0}
+    finished: list[str] = []
+
+    def fake(profile, temperature, messages):
+        system = messages[0]["content"]
+        if "You are a subagent" in system:
+            task = messages[1]["content"]
+            if task == "slow task":
+                slow.wait(5)
+            finished.append(task)
+            yield f"answer for {task}"
+            return
+        calls["n"] += 1
+        if calls["n"] == 1:
+            yield (
+                dispatch_call(key="a", label="A", task="slow task")
+                + "\n"
+                + dispatch_call(key="b", label="B", task="fast task")
+            )
+        else:
+            yield "all done"
+
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    app = make_app(tmp_path)
+    async with app.run_test() as pilot:
+        inp = app.query_one("#input", Input)
+        inp.value = "go"
+        await pilot.press("enter")
+        await _wait_until(app, pilot, lambda: finished == ["fast task"])
+        slow.set()
+        await _wait_until(app, pilot, lambda: app._primary_turn_depth == 0)
+
+    assert finished == ["fast task", "slow task"]
+    assert [r["agent_key"] for r in agent_results(app)] == ["a", "b"]
+    assert agent_results(app)[0]["content"] == "answer for slow task"
+
+
+async def test_one_failing_agent_does_not_cancel_its_siblings(tmp_path, monkeypatch):
+    calls = {"n": 0}
+
+    def fake(profile, temperature, messages):
+        system = messages[0]["content"]
+        if "You are a subagent" in system:
+            if messages[1]["content"] == "bad task":
+                raise RuntimeError("provider exploded")
+            yield "sibling answer"
+            return
+        calls["n"] += 1
+        if calls["n"] == 1:
+            yield (
+                dispatch_call(key="a", label="A", task="bad task")
+                + "\n"
+                + dispatch_call(key="b", label="B", task="good task")
+            )
+        else:
+            yield "all done"
+
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    app = make_app(tmp_path)
+    async with app.run_test() as pilot:
+        await run_primary(app, pilot)
+
+        results = agent_results(app)
+        assert [r["status"] for r in results] == ["failed", "completed"]
+        assert "provider exploded" in results[0]["content"]
+        assert results[1]["content"] == "sibling answer"
+        assert agent_summary(app, "a").status == "failed"
+        assert agent_summary(app, "b").status == "completed"
+        assert any("provider exploded" in line for line in agent_activity(app, "a"))
+
+
+async def test_one_agent_runs_its_own_tasks_sequentially(tmp_path, monkeypatch):
+    """A second call for a live key is refused rather than serialized: two
+    concurrent writers to one conversation is the thing being prevented."""
+    inside = threading.Event()
+    release = threading.Event()
+    calls = {"n": 0}
+
+    def fake(profile, temperature, messages):
+        if "You are a subagent" in messages[0]["content"]:
+            inside.set()
+            release.wait(5)
+            yield "worker answer"
+            return
+        calls["n"] += 1
+        if calls["n"] == 1:
+            yield dispatch_call(task_label="First")
+        elif calls["n"] == 2:
+            yield dispatch_call(task_label="Second")
+        else:
+            yield "all done"
+
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    app = make_app(tmp_path)
+    async with app.run_test() as pilot:
+        inp = app.query_one("#input", Input)
+        inp.value = "go"
+        await pilot.press("enter")
+        await _wait_until(app, pilot, lambda: inside.is_set())
+        # Reach into the live batch: a second task for the busy key is refused.
+        managed = app._agents["coder"]
+        assert managed.runtime is not None
+        release.set()
+        await _wait_until(app, pilot, lambda: app._primary_turn_depth == 0)
+        assert [t.label for t in agent_summary(app, "coder").tasks] == [
+            "First",
+            "Second",
+        ]
+
+
+# --------------------------------------------------------- approvals & exit
+
+
+async def test_one_modal_at_a_time_names_each_requesting_agent(
+    tmp_path, monkeypatch
+):
+    calls = {"n": 0}
+
+    def fake(profile, temperature, messages):
+        system = messages[0]["content"]
+        if "You are a subagent" in system:
+            worker_replies = [m for m in messages if m["role"] == "user"]
+            if len(worker_replies) == 1:
+                yield command_call("echo from-agent")
+            else:
+                yield "worker done"
+            return
+        calls["n"] += 1
+        if calls["n"] == 1:
+            yield (
+                dispatch_call(key="a", label="Agent A")
+                + "\n"
+                + dispatch_call(key="b", label="Agent B")
+            )
+        else:
+            yield "all done"
+
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    app = make_app_with_cmd(tmp_path, CmdPolicy(mode="ask", allow=[]))
+    titles: list[str] = []
+    async with app.run_test() as pilot:
+        inp = app.query_one("#input", Input)
+        inp.value = "go"
+        await pilot.press("enter")
+
+        for _ in range(2):
+            await _wait_until(
+                app, pilot, lambda: isinstance(app.screen, CommandPrompt), tries=100
+            )
+            assert (
+                sum(isinstance(screen, CommandPrompt) for screen in app.screen_stack)
+                == 1
+            )
+            titles.append(
+                str(app.screen.query_one(".dialog-title", Static).render())
+            )
+            # Waiting is the requester's own state: one agent's approval
+            # never parks another.
+            asking = "a" if "Agent A" in titles[-1] else "b"
+            assert [
+                key
+                for key in ("a", "b")
+                if agent_summary(app, key).status == "waiting"
+            ] == [asking]
+            await pilot.press("y")
+            await settle(pilot)
+
+        await _wait_until(app, pilot, lambda: app._primary_turn_depth == 0, tries=100)
+
+    assert sorted(titles) == [
+        "Run command for Agent A?",
+        "Run command for Agent B?",
+    ]
+    assert [r["status"] for r in agent_results(app)] == ["completed", "completed"]
+
+
+async def test_an_agent_waiting_for_the_lock_re_reads_the_saved_rule(
+    tmp_path, monkeypatch
+):
+    """The second agent must not be prompted for a command the first agent's
+    always-allow rule now covers."""
+    calls = {"n": 0}
+
+    def fake(profile, temperature, messages):
+        system = messages[0]["content"]
+        if "You are a subagent" in system:
+            if len([m for m in messages if m["role"] == "user"]) == 1:
+                yield command_call("echo shared")
+            else:
+                yield "worker done"
+            return
+        calls["n"] += 1
+        if calls["n"] == 1:
+            yield (
+                dispatch_call(key="a", label="Agent A")
+                + "\n"
+                + dispatch_call(key="b", label="Agent B")
+            )
+        else:
+            yield "all done"
+
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    app = make_app_with_cmd(tmp_path, CmdPolicy(mode="ask", allow=[]))
+    prompts = {"n": 0}
+    async with app.run_test() as pilot:
+        await _wait_until(app, pilot, lambda: True, tries=1)
+        inp = app.query_one("#input", Input)
+        inp.value = "go"
+        await pilot.press("enter")
+
+        await _wait_until(
+            app, pilot, lambda: isinstance(app.screen, CommandPrompt), tries=100
+        )
+        prompts["n"] += 1
+        await pilot.press("a")  # always allow
+        await _wait_until(app, pilot, lambda: app._primary_turn_depth == 0, tries=100)
+        if isinstance(app.screen, CommandPrompt):  # pragma: no cover - failure path
+            prompts["n"] += 1
+
+        assert prompts["n"] == 1
+        assert "echo:*" in app.cmd.allow
+        notices = agent_activity(app, "a") + agent_activity(app, "b")
+        assert sum("Always-allow saved: echo:*" in line for line in notices) == 1
+        assert [r["status"] for r in agent_results(app)] == ["completed", "completed"]
+
+
+async def test_escape_never_stops_a_subagent(tmp_path, monkeypatch):
+    release = threading.Event()
+    calls = {"n": 0}
+
+    def fake(profile, temperature, messages):
+        if "You are a subagent" in messages[0]["content"]:
+            release.wait(5)
+            yield "worker answer"
+            return
+        calls["n"] += 1
+        yield dispatch_call() if calls["n"] == 1 else "all done"
+
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    app = make_app(tmp_path)
+    async with app.run_test() as pilot:
+        inp = app.query_one("#input", Input)
+        inp.value = "go"
+        await pilot.press("enter")
+        await _wait_until(app, pilot, lambda: "coder" in app._agents)
+        worker = app._agents["coder"].runtime
+        assert worker is not None
+
+        await pilot.press("escape")
+        await select_agent(app, pilot, "coder")
+        await pilot.press("escape")
+        await settle(pilot)
+        assert not worker.state.stop_event.is_set()
+
+        release.set()
+        await _wait_until(app, pilot, lambda: app._primary_turn_depth == 0)
+        assert agent_results(app)[0]["status"] == "completed"
+
+
+async def test_exiting_signals_every_live_runtime(tmp_path, monkeypatch):
+    release = threading.Event()
+    calls = {"n": 0}
+
+    def fake(profile, temperature, messages):
+        if "You are a subagent" in messages[0]["content"]:
+            release.wait(5)
+            yield "worker answer"
+            return
+        calls["n"] += 1
+        yield dispatch_call() if calls["n"] == 1 else "all done"
+
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    app = make_app(tmp_path)
+    try:
+        async with app.run_test() as pilot:
+            inp = app.query_one("#input", Input)
+            inp.value = "go"
+            await pilot.press("enter")
+            await _wait_until(
+                app,
+                pilot,
+                lambda: app._agents.get("coder") is not None
+                and app._agents["coder"].runtime is not None
+                and app._agents["coder"].runtime.state.generating,
+            )
+            worker = app._agents["coder"].runtime
+            primary = app._primary_runtime
+            app.exit()
+            assert worker.state.stop_event.is_set()
+            assert primary is not None
+    finally:
+        release.set()
+
+
+async def test_a_subagent_command_is_killed_when_the_app_exits(
+    tmp_path, monkeypatch
+):
+    calls = {"n": 0}
+
+    def fake(profile, temperature, messages):
+        if "You are a subagent" in messages[0]["content"]:
+            yield command_call("sleep 30")
+            return
+        calls["n"] += 1
+        yield dispatch_call() if calls["n"] == 1 else "all done"
+
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    app = make_app_with_cmd(tmp_path, CmdPolicy(mode="yolo"))
+    async with app.run_test() as pilot:
+        inp = app.query_one("#input", Input)
+        inp.value = "go"
+        await pilot.press("enter")
+        await _wait_until(
+            app,
+            pilot,
+            lambda: app._agents.get("coder") is not None
+            and app._agents["coder"].runtime is not None
+            and app._agents["coder"].runtime.state.running_proc is not None,
+        )
+        proc = app._agents["coder"].runtime.state.running_proc
+        app.exit()
+        await settle(pilot)
+        assert proc.poll() is not None
+
+
+# ------------------------------------------------------------ result routing
+
+
+async def test_a_result_is_recorded_once_with_its_exact_identity(
+    tmp_path, monkeypatch
+):
+    stream = Conversation([dispatch_call(), "all done"], ["the worker answer"])
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", stream)
+    app = make_app(tmp_path)
+    async with app.run_test() as pilot:
+        await run_primary(app, pilot)
+
+        results = agent_results(app)
+        assert len(results) == 1
+        result = results[0]
+        assert result["agent_key"] == "coder"
+        assert result["agent_label"] == "Coder"
+        assert result["task_label"] == "Task"
+        assert result["status"] == "completed"
+        assert result["content"] == "the worker answer"
+        assert result["task_id"] == agent_summary(app, "coder").tasks[0].task_id
+        record = next(
+            m for m in app.session.messages
+            if m.get("_model_content", "").startswith("[JTECH agent result]")
+        )
+        assert record["role"] == "system"
+        assert record["_model_role"] == "user"
+        assert record["content"] == "Coder completed: Task"
+
+
+async def test_a_primary_history_failure_is_visible_but_keeps_the_result(
+    tmp_path, monkeypatch
+):
+    stream = Conversation([dispatch_call(), "all done"], ["worker answer"])
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", stream)
+    app = make_app(tmp_path)
+    original = app.session.add
+    failures = {"n": 0}
+
+    def failing(role, content, **kwargs):
+        # The message still joins the in-memory conversation; only the append
+        # to disk fails, exactly as a real OSError leaves it.
+        original(role, content, **kwargs)
+        if (kwargs.get("model_content") or "").startswith("[JTECH agent result]"):
+            failures["n"] += 1
+            raise OSError("disk full")
+
+    monkeypatch.setattr(app.session, "add", failing)
+    async with app.run_test() as pilot:
+        await run_primary(app, pilot)
+
+        assert failures["n"] == 1
+        assert any("Could not save history: disk full" in b for b in bubbles(app))
+        # The in-memory result still reached the next request.
+        last_request = stream.sent_to("primary")[-1]
+        assert any(
+            m["content"].startswith("[JTECH agent result]") for m in last_request
+        )
+
+
+async def test_primary_reports_waiting_while_its_own_command_awaits_approval(
+    tmp_path, monkeypatch
+):
+    """The requester is Primary here, so the same waiting rule applies to it."""
+    fake, _ = cmd_stream(command_call("echo needs-approval"), "done")
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    app = make_app_with_cmd(tmp_path, CmdPolicy(mode="ask", allow=[]))
+    async with app.run_test() as pilot:
+        inp = app.query_one("#input", Input)
+        inp.value = "go"
+        await pilot.press("enter")
+        await _wait_until(
+            app, pilot, lambda: isinstance(app.screen, CommandPrompt), tries=100
+        )
+        assert primary_summary(app).status == "waiting"
+        title = str(app.screen.query_one(".dialog-title", Static).render())
+        assert title == "Run command for Primary?"
+
+        await pilot.press("y")
+        await _wait_until(app, pilot, lambda: app._primary_turn_depth == 0, tries=100)
+        assert primary_summary(app).status == "idle"
