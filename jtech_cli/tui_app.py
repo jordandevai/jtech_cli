@@ -9,7 +9,7 @@ import subprocess
 import threading
 import time
 from collections import deque
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import ClassVar
@@ -55,6 +55,9 @@ from jtech_cli.tui_screens import (
     SettingsScreen,
 )
 from jtech_cli.tui_widgets import (
+    AgentStatus,
+    AgentSummary,
+    AgentWorkspace,
     InputToMultiline,
     MarkdownTail,
     MultilineCancel,
@@ -74,6 +77,11 @@ NO_PROFILE = "No API profile is configured — run /profiles to add one."
 BUSY_GENERATING = "A reply is streaming — press Esc to stop it before changing profiles."
 BUSY_TOOL_ROUND = "A tool round is running — wait for it to finish before changing profiles."
 SPINNER_FRAMES = "-\\|/"
+PRIMARY_AGENT_ID = "primary"
+SUBAGENT_READONLY = "Read only — subagents communicate with their dispatcher."
+SUBAGENT_CLEAR_BLOCKED = (
+    "Subagent activity is read only; switch to Primary to clear chat."
+)
 
 StreamReply = Callable[[ResolvedProfile, float, list[dict]], Iterator[StreamItem]]
 FetchServerInfo = Callable[[Profile], ServerInfo]
@@ -206,16 +214,134 @@ class ChatApp(App):
         self._suggestions: list[tuple[str, str]] = []
         self._suggestion_index = 0
         self._suggestion_navigated = False
+        # Ownership of the accepted Primary turn, not a limit or a round count:
+        # queued messages drain through nested ``_send_message()`` calls, so an
+        # inner turn must not paint ``idle`` while its outer drain is still
+        # running.
+        self._primary_turn_depth = 0
 
     def compose(self) -> ComposeResult:
         with Vertical():
-            yield Transcript(id="chat")
+            # The Primary transcript is created here, not by the workspace, so
+            # ``#chat`` stays the stable id every existing selector uses.
+            yield AgentWorkspace(
+                AgentSummary(PRIMARY_AGENT_ID, "Primary", "idle"),
+                Transcript(id="chat", classes="agent-activity"),
+                id="agent-workspace",
+            )
             yield Static(id="suggestions")
             yield _ChatInput(
                 id="input",
                 placeholder="Message… (Shift+Enter for newline · / for commands)",
             )
+            readonly = Static(SUBAGENT_READONLY, id="subagent-readonly")
+            readonly.display = False
+            yield readonly
             yield Static(id="status")
+
+    @property
+    def _workspace(self) -> AgentWorkspace:
+        """The mounted activity/sidebar split."""
+        return self.query_one("#agent-workspace", AgentWorkspace)
+
+    @property
+    def viewing_primary(self) -> bool:
+        """Whether the displayed activity stream is Primary's.
+
+        Derived from the workspace rather than mirrored into a second boolean,
+        so a selection change has exactly one place to be recorded.
+        """
+        workspace = self._workspace
+        return workspace.selected_agent_id == workspace.primary_agent_id
+
+    async def add_agent_view(
+        self,
+        summary: AgentSummary,
+        records: Sequence[TranscriptRecord] = (),
+    ) -> Transcript:
+        """Register one subagent's presentation and return its transcript.
+
+        The presentation seam a future orchestration runtime calls. It does no
+        scheduling, persistence, network I/O, or thread marshalling: callers
+        invoke it on Textual's event loop and retain the returned `Transcript`
+        as that agent's activity stream for the workspace lifetime.
+
+        Args:
+            summary: The new agent's presentation data.
+            records: Completed activity to seed.
+
+        Raises:
+            ValueError: if ``summary`` is invalid or already registered.
+        """
+        return await self._workspace.add_agent(summary, records)
+
+    def update_agent_view(self, summary: AgentSummary) -> None:
+        """Replace one registered agent's label, status, or tasks.
+
+        The presentation seam a future orchestration runtime calls on Textual's
+        event loop. It repaints one sidebar row and nothing else — no
+        transcript is replaced, reloaded, scrolled, shown, or hidden, and the
+        user's selection is never changed.
+
+        Raises:
+            ValueError: if ``summary`` is invalid.
+            KeyError: if its agent id is not registered.
+        """
+        self._workspace.update_agent(summary)
+
+    def on_agent_workspace_agent_selected(
+        self, event: AgentWorkspace.AgentSelected
+    ) -> None:
+        """Follow the visible activity stream with the composer's visibility.
+
+        Presentation only: the composer still targets Primary whatever is shown,
+        so this changes what is displayed and no runtime state at all.
+        """
+        self._show_primary_composer(
+            event.agent_id == event.workspace.primary_agent_id
+        )
+
+    def _show_primary_composer(self, show: bool) -> None:
+        """Show the Primary composer, or the read-only subagent notice.
+
+        Hiding is display-only: the input value and selection, the suggestion
+        data, the multi-line text and its unresolved future, the queue, and the
+        Primary session are all left exactly as they were, so returning to
+        Primary restores the draft the user left behind. A disabled ``Input`` is
+        deliberately not used — it still looks like a destination.
+        """
+        readonly = self.query_one("#subagent-readonly", Static)
+        suggestions = self.query_one("#suggestions", Static)
+        chat_input = self.query_one("#input", _ChatInput)
+        textarea = self._multiline_textarea
+        if not show:
+            suggestions.display = False
+            chat_input.display = False
+            if textarea is not None:
+                textarea.display = False
+            readonly.display = True
+            return
+        readonly.display = False
+        if textarea is not None:
+            # The same mounted editor and the same unresolved future: multi-line
+            # mode was never left, only hidden.
+            textarea.display = True
+            return
+        chat_input.display = True
+        # Rebuilt from the preserved value rather than kept as a stale painted
+        # menu, so the suggestions can never disagree with the input.
+        self._update_suggestions()
+
+    def _set_primary_agent_status(self, status: AgentStatus) -> None:
+        """Write one Primary status through the workspace's own summary.
+
+        The workspace stays the single source of truth for the summary, so an
+        orchestration-supplied Primary label or task list survives a local
+        status change with no synchronization code.
+        """
+        workspace = self._workspace
+        summary = workspace.summary_for(PRIMARY_AGENT_ID)
+        workspace.update_agent(dataclasses.replace(summary, status=status))
 
     async def on_mount(self) -> None:
         self.register_theme(JTECH_DARK)
@@ -531,15 +657,32 @@ class ChatApp(App):
             future.set_result(content)
 
     async def _send_message(self, content: str) -> None:
+        """Run one accepted Primary turn, or queue the message behind one.
+
+        The accepted turn owns the Primary ``running``/``idle`` status. Depth,
+        not a flag, because ``_stream_reply()`` drains the queue through nested
+        calls to this method: only the outermost accepted turn may report the
+        agent idle again, and every exit — a provider error, a rendering error,
+        cancellation, a command round, a nudge, or a drained queue — releases
+        exactly one acquired depth.
+        """
         content = content.strip()
         if not content:
             return
         if self._generating or self._tool_rounds_active:
             self._enqueue(content)
             return
-        self._record_message("user", content)
-        self.push_message("user", content)
-        await self._stream_reply()
+        self._primary_turn_depth += 1
+        if self._primary_turn_depth == 1:
+            self._set_primary_agent_status("running")
+        try:
+            self._record_message("user", content)
+            self.push_message("user", content)
+            await self._stream_reply()
+        finally:
+            self._primary_turn_depth -= 1
+            if self._primary_turn_depth == 0:
+                self._set_primary_agent_status("idle")
 
     def _resolve_turn_profile(self) -> ResolvedProfile:
         """Pin one endpoint, model, and credential for this whole user turn.
@@ -891,7 +1034,17 @@ class ChatApp(App):
         self._add_system(format_result(command, note=note))
 
     async def _prompt_for_command(self, command: str, reason: str) -> CmdChoice:
-        return await self.push_screen_wait(CommandPrompt(command, reason))
+        """Ask the user about one command, reporting Primary as waiting.
+
+        The surrounding accepted turn still owns the final transition to
+        ``idle``; this only marks the stretch where Primary cannot progress
+        without the user.
+        """
+        self._set_primary_agent_status("waiting")
+        try:
+            return await self.push_screen_wait(CommandPrompt(command, reason))
+        finally:
+            self._set_primary_agent_status("running")
 
     def _add_allow_rule(self, rule: str | None) -> None:
         if not rule or rule in self.cmd.allow:
@@ -962,6 +1115,11 @@ class ChatApp(App):
         return f"AI  ·  prompt {prompt_n:,} tok · {prompt_s:.1f}s · {prompt_tps:.0f} t/s"
 
     def action_stop_stream(self) -> None:
+        # A subagent view has no writable target and no cancellation of its own:
+        # stopping the hidden Primary turn from here would be invisible work.
+        # The visible read-only notice is the documented explanation.
+        if not self.viewing_primary:
+            return
         if self._generating:
             self._stop_event.set()
         elif self._running_proc is not None:
@@ -1090,8 +1248,9 @@ class ChatApp(App):
         if name != self.theme:
             self.theme = name
             # Live bubbles follow the theme through CSS; completed history is
-            # rendered content, so it has to be rebuilt for the new colors.
-            self.query_one("#chat", Transcript).refresh_theme()
+            # rendered content, so it has to be rebuilt for the new colors —
+            # in every registered stream, hidden ones included.
+            self._workspace.refresh_theme()
 
     def _on_settings_saved(self) -> None:
         self._switch_theme()
@@ -1114,6 +1273,9 @@ class ChatApp(App):
         self._render_status()
 
     def action_clear_chat(self) -> None:
+        if not self.viewing_primary:
+            self.notify(SUBAGENT_CLEAR_BLOCKED)
+            return
         self.commands.handle("/clear")
 
     def action_settings(self) -> None:
@@ -1132,8 +1294,12 @@ class ChatApp(App):
         fields are not the chat composer, so a global shortcut must not erase an
         unsaved profile or settings edit: the confirmation opens above it and
         leaves both that modal and the suspended draft untouched.
+
+        A selected subagent hides the Primary composer for the same reason: a
+        draft the user cannot see must not be cleared by a key they pressed to
+        copy or to leave, so that branch goes straight to the confirmation.
         """
-        if len(self.screen_stack) == 1:
+        if len(self.screen_stack) == 1 and self.viewing_primary:
             textarea = self._multiline_textarea
             if textarea is not None:
                 if textarea.text != "":

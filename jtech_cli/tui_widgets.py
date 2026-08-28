@@ -17,14 +17,14 @@ from rich.style import Style
 from rich.text import Text
 from textual.app import ComposeResult
 from textual.binding import Binding
-from textual.containers import VerticalScroll
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.geometry import Size
 from textual.message import Message
 from textual.selection import Selection
 from textual.strip import Strip
 from textual.theme import Theme
 from textual.widget import Widget
-from textual.widgets import Input, Markdown, Static, TextArea
+from textual.widgets import Input, ListItem, ListView, Markdown, Static, TextArea
 
 
 @runtime_checkable
@@ -843,3 +843,397 @@ class Transcript(VerticalScroll):
         for widget in (entry.label, entry.body):
             if widget.parent is not None:
                 widget.remove()
+
+
+# --- agent workspace -------------------------------------------------------
+
+AgentStatus = Literal["idle", "running", "waiting", "completed", "failed"]
+
+# Status is carried by shape, not color: a theme change, a monochrome terminal,
+# or a color-blind reader must not erase it. This mapping is the single source
+# of that signal for both validation and rendering.
+_AGENT_STATUS_GLYPHS: dict[str, str] = {
+    "idle": "○",
+    "running": "●",
+    "waiting": "◌",
+    "completed": "✓",
+    "failed": "!",
+}
+
+_SELECTED_MARKER = "▸ "
+_UNSELECTED_MARKER = "  "
+# Two columns past the agent marker, so a task label lands exactly two columns
+# deeper than its agent label without a tree connector or a second cursor.
+_TASK_MARKER = "    "
+
+
+@dataclass(frozen=True, slots=True)
+class AgentTaskSummary:
+    """One task row beneath its owning agent, as presentation data only.
+
+    Args:
+        task_id: Opaque orchestration-owned identity, unique within its agent.
+        label: The single line drawn for this task; it is ellipsized, never
+            wrapped, at the sidebar edge.
+        status: One of the five declared `AgentStatus` values.
+    """
+
+    task_id: str
+    label: str
+    status: AgentStatus
+
+
+@dataclass(frozen=True, slots=True)
+class AgentSummary:
+    """One agent row and its tasks, as presentation data only.
+
+    This type crosses the orchestration-to-presentation boundary and nothing
+    else: it carries no prompt, credential, session, command policy, task
+    output, or mutable runtime object.
+
+    Args:
+        agent_id: Opaque orchestration-owned identity, unique within one
+            workspace and stable for that workspace's lifetime. No DOM id is
+            ever derived from it.
+        label: The single line drawn for this agent.
+        status: One of the five declared `AgentStatus` values.
+        tasks: Presentation-only task rows, drawn in the supplied order. The
+            workspace neither sorts nor re-parents them.
+    """
+
+    agent_id: str
+    label: str
+    status: AgentStatus
+    tasks: tuple[AgentTaskSummary, ...] = ()
+
+
+def _status_glyph(status: str) -> str:
+    """Return the fixed glyph for ``status``.
+
+    Raises:
+        ValueError: if ``status`` is not one of the five declared values. An
+            unknown status is reported rather than drawn as a blank or
+            substituted glyph, which would silently erase the status signal.
+    """
+    try:
+        return _AGENT_STATUS_GLYPHS[status]
+    except KeyError:
+        raise ValueError(f"Unknown agent status: {status!r}") from None
+
+
+def _validate_agent_summary(summary: AgentSummary) -> None:
+    """Check one summary completely, before anything is mutated for it.
+
+    This is the only validation on the orchestration-to-presentation boundary,
+    shared by insertion and update, so neither path can accept data the other
+    would reject. Nothing here strips, generates, repairs, or substitutes
+    caller data.
+
+    Raises:
+        ValueError: if an id or label is empty, a status is unknown, or two
+            tasks of this agent share a task id.
+    """
+    if not summary.agent_id:
+        raise ValueError("An agent summary needs a non-empty agent id")
+    if not summary.label:
+        raise ValueError(f"Agent {summary.agent_id!r} needs a non-empty label")
+    _status_glyph(summary.status)
+    seen: set[str] = set()
+    for task in summary.tasks:
+        if not task.task_id:
+            raise ValueError(
+                f"A task of agent {summary.agent_id!r} needs a non-empty task id"
+            )
+        if not task.label:
+            raise ValueError(
+                f"Task {task.task_id!r} of agent {summary.agent_id!r} needs a "
+                "non-empty label"
+            )
+        _status_glyph(task.status)
+        if task.task_id in seen:
+            raise ValueError(
+                f"Agent {summary.agent_id!r} has a duplicate task id: "
+                f"{task.task_id!r}"
+            )
+        seen.add(task.task_id)
+
+
+def render_agent_summary(summary: AgentSummary, *, selected: bool) -> Text:
+    """Render one agent block: its own line, then one line per task.
+
+    Pure by design — no I/O and no app state — so the hierarchy and the status
+    glyphs are testable without mounting a TUI. Every agent line starts at the
+    same column whether or not it is selected, so the two-column marker never
+    shifts the hierarchy; every task line is indented two columns further.
+
+    Args:
+        summary: The agent to draw. Its tasks are drawn in the supplied order.
+        selected: Whether this agent's activity stream is the visible one. This
+            is the selected marker, not the ListView keyboard highlight.
+
+    Raises:
+        ValueError: if the agent or one of its tasks carries an unknown status.
+    """
+    marker = _SELECTED_MARKER if selected else _UNSELECTED_MARKER
+    lines = [f"{marker}{_status_glyph(summary.status)} {summary.label}"]
+    lines.extend(
+        f"{_TASK_MARKER}{_status_glyph(task.status)} {task.label}"
+        for task in summary.tasks
+    )
+    return Text("\n".join(lines))
+
+
+class _AgentListItem(ListItem):
+    """One selectable sidebar row: an agent plus its non-selectable tasks.
+
+    Tasks are lines in this row's single renderable rather than child
+    ``ListItem``s, so Textual's own list navigation selects agents only and no
+    second task cursor has to exist.
+    """
+
+    def __init__(self, summary: AgentSummary, *, selected: bool) -> None:
+        super().__init__(classes="agent-list-item")
+        self._summary = summary
+        self._text = Static(
+            render_agent_summary(summary, selected=selected),
+            classes="agent-list-text",
+        )
+
+    @property
+    def agent_id(self) -> str:
+        """The opaque agent id this row was created for and never leaves."""
+        return self._summary.agent_id
+
+    def compose(self) -> ComposeResult:
+        yield self._text
+
+    def update_summary(self, summary: AgentSummary, *, selected: bool) -> None:
+        """Repaint this row from ``summary``.
+
+        Raises:
+            ValueError: if ``summary`` describes a different agent. A row is
+                bound to one agent for its lifetime; rebinding it would move an
+                agent's tasks and status under another agent's identity.
+        """
+        if summary.agent_id != self._summary.agent_id:
+            raise ValueError(
+                f"Cannot rebind the sidebar row for {self._summary.agent_id!r} "
+                f"to {summary.agent_id!r}"
+            )
+        self._summary = summary
+        self._text.update(render_agent_summary(summary, selected=selected))
+
+
+class AgentWorkspace(Horizontal):
+    """The activity/sidebar split: one stable `Transcript` per agent.
+
+    Every registered agent keeps its own transcript for the workspace lifetime.
+    Selecting an agent changes only which transcript is displayed — it copies no
+    records, reloads no history, rebuilds no live stream handle, and retargets
+    nothing. Each agent therefore keeps its own content, live tail, and scroll
+    position while another agent is visible.
+
+    Orchestration owns agents, tasks, and statuses; this widget owns navigation
+    and visibility only. It never infers an agent from prose, polls a file, or
+    inspects a worker.
+    """
+
+    class AgentSelected(Message):
+        """The visible activity stream changed to ``agent_id``."""
+
+        def __init__(self, workspace: AgentWorkspace, agent_id: str) -> None:
+            super().__init__()
+            self.workspace = workspace
+            self.agent_id = agent_id
+
+        @property
+        def control(self) -> AgentWorkspace:
+            return self.workspace
+
+    def __init__(
+        self,
+        primary: AgentSummary,
+        primary_transcript: Transcript,
+        **kwargs,
+    ) -> None:
+        """Compose the workspace around an already-created Primary transcript.
+
+        Args:
+            primary: The Primary agent summary. It is selected on mount and is
+                the only agent present until orchestration registers more.
+            primary_transcript: The caller's own Primary `Transcript`, so the
+                stable ``#chat`` id and every selector built on it stay valid.
+
+        Raises:
+            ValueError: if ``primary`` fails boundary validation.
+        """
+        super().__init__(**kwargs)
+        _validate_agent_summary(primary)
+        self._summaries: dict[str, AgentSummary] = {primary.agent_id: primary}
+        self._activities: dict[str, Transcript] = {
+            primary.agent_id: primary_transcript
+        }
+        self._items: dict[str, _AgentListItem] = {
+            primary.agent_id: _AgentListItem(primary, selected=True)
+        }
+        self._primary_agent_id = primary.agent_id
+        self._selected_agent_id = primary.agent_id
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="activity-stack"):
+            yield self._activities[self._primary_agent_id]
+        with Vertical(id="agent-sidebar"):
+            yield Static("Agents", id="agent-sidebar-title")
+            yield ListView(self._items[self._primary_agent_id], id="agent-list")
+
+    @property
+    def primary_agent_id(self) -> str:
+        """The agent whose composer, session, and runtime the app owns."""
+        return self._primary_agent_id
+
+    @property
+    def selected_agent_id(self) -> str:
+        """The agent whose activity stream is currently displayed."""
+        return self._selected_agent_id
+
+    @property
+    def selected_activity(self) -> Transcript:
+        """The displayed transcript. Presentation only: it owns nothing."""
+        return self._activities[self._selected_agent_id]
+
+    def summary_for(self, agent_id: str) -> AgentSummary:
+        """The current summary for ``agent_id``.
+
+        Raises:
+            KeyError: if no such agent is registered.
+        """
+        try:
+            return self._summaries[agent_id]
+        except KeyError:
+            raise KeyError(f"Unknown agent id: {agent_id!r}") from None
+
+    def activity_for(self, agent_id: str) -> Transcript:
+        """The stable transcript registered for ``agent_id``.
+
+        Raises:
+            KeyError: if no such agent is registered.
+        """
+        try:
+            return self._activities[agent_id]
+        except KeyError:
+            raise KeyError(f"Unknown agent id: {agent_id!r}") from None
+
+    async def add_agent(
+        self,
+        summary: AgentSummary,
+        records: Sequence[TranscriptRecord] = (),
+    ) -> Transcript:
+        """Register one agent and return the transcript the caller must retain.
+
+        The returned object is that agent's activity stream for the workspace
+        lifetime; every later update for the agent goes to it directly, never to
+        whichever transcript happens to be selected.
+
+        Adding an agent does not select or focus it, and it does not disturb the
+        current selection. Call this on Textual's event loop, with the workspace
+        already mounted; a violation of that contract surfaces as the normal
+        mount error rather than being queued or dropped.
+
+        Args:
+            summary: The new agent's presentation data.
+            records: Completed activity to seed, rendered in one pass.
+
+        Raises:
+            ValueError: if ``summary`` fails boundary validation, or if its
+                agent id is already registered.
+        """
+        _validate_agent_summary(summary)
+        if summary.agent_id in self._summaries:
+            raise ValueError(f"Agent {summary.agent_id!r} is already registered")
+        transcript = Transcript(classes="agent-activity")
+        transcript.display = False
+        item = _AgentListItem(summary, selected=False)
+        await self.query_one("#activity-stack", Vertical).mount(transcript)
+        await self.query_one("#agent-list", ListView).append(item)
+        if records:
+            transcript.load(records)
+        self._summaries[summary.agent_id] = summary
+        self._activities[summary.agent_id] = transcript
+        self._items[summary.agent_id] = item
+        return transcript
+
+    def update_agent(self, summary: AgentSummary) -> None:
+        """Replace one agent's stored summary and repaint its sidebar row.
+
+        This is presentation only: it never replaces, reloads, clears, scrolls,
+        shows, or hides a transcript, and it never changes the selection.
+
+        Raises:
+            ValueError: if ``summary`` fails boundary validation.
+            KeyError: if its agent id is not registered.
+        """
+        _validate_agent_summary(summary)
+        if summary.agent_id not in self._summaries:
+            raise KeyError(f"Unknown agent id: {summary.agent_id!r}")
+        self._summaries[summary.agent_id] = summary
+        self._items[summary.agent_id].update_summary(
+            summary, selected=summary.agent_id == self._selected_agent_id
+        )
+
+    def select_agent(self, agent_id: str) -> None:
+        """Show ``agent_id``'s activity stream and mark it selected.
+
+        Selecting the already selected agent is an idempotent no-op, so it
+        cannot discard a selection the user just made inside the visible
+        transcript.
+
+        A real change clears the screen-level arbitrary text selection first:
+        that selection lives in `Screen.selections`, not in a transcript, so
+        leaving it intact would let a copy pull text out of an attached but
+        invisible agent. Nothing else is cleared — not the composer value, not
+        its widget-owned selection, not any transcript content.
+
+        Raises:
+            KeyError: if no such agent is registered. There is no fallback to
+                Primary or to the first agent.
+        """
+        if agent_id not in self._summaries:
+            raise KeyError(f"Unknown agent id: {agent_id!r}")
+        previous_id = self._selected_agent_id
+        if agent_id == previous_id:
+            return
+        self.screen.clear_selection()
+        self._activities[previous_id].display = False
+        self._activities[agent_id].display = True
+        self._selected_agent_id = agent_id
+        self._items[previous_id].update_summary(
+            self._summaries[previous_id], selected=False
+        )
+        self._items[agent_id].update_summary(
+            self._summaries[agent_id], selected=True
+        )
+        self.post_message(self.AgentSelected(self, agent_id))
+
+    def refresh_theme(self) -> None:
+        """Re-render completed history for every agent, hidden ones included.
+
+        A hidden transcript that skipped a theme change would reveal stale
+        colors the moment it is selected.
+        """
+        for transcript in self._activities.values():
+            transcript.refresh_theme()
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        """Commit a keyboard or mouse selection to the visible activity stream.
+
+        Only ``Selected`` is acted on: ``Highlighted`` is keyboard navigation,
+        not commitment, so arrowing through agents never changes what is shown.
+
+        Raises:
+            TypeError: if the sidebar somehow holds a row this workspace did not
+                create, which would mean its agent identity is unknown.
+        """
+        item = event.item
+        if not isinstance(item, _AgentListItem):
+            raise TypeError(f"The agent sidebar holds an unexpected row: {item!r}")
+        self.select_agent(item.agent_id)
