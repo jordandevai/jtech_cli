@@ -869,13 +869,14 @@ class ChatApp(App):
             try:
                 managed = await self._begin_agent_task(call, task_id)
             except _DispatchRejected as rejection:
-                outcomes[index] = AgentOutcome(
-                    agent_key=call.agent_key,
-                    agent_label=call.agent_label,
-                    task_id=task_id,
-                    task_label=call.task_label,
-                    status="failed",
-                    content=str(rejection),
+                outcomes[index] = self._setup_outcome(call, task_id, str(rejection))
+                continue
+            except Exception as error:  # noqa: BLE001 - one call, not the batch
+                # Setting one agent up is that call's own work. An unexpected
+                # failure here must not take its siblings down with it, so it
+                # becomes that call's failed result like any other.
+                outcomes[index] = self._setup_outcome(
+                    call, task_id, f"{type(error).__name__}: {error}"
                 )
                 continue
             started.append((index, managed, call, task_id))
@@ -915,12 +916,51 @@ class ChatApp(App):
                 )
                 continue
             outcomes[index] = result
-        # Every call has an outcome by construction: it was rejected, it
-        # returned one, or its exception was converted above. Assert it rather
-        # than filtering, which would silently hand the coordinator a shorter
-        # batch than it dispatched.
-        assert all(outcome is not None for outcome in outcomes)
-        return tuple(outcomes)  # type: ignore[arg-type]
+        # Every call has an outcome by construction: it was rejected, its setup
+        # failed, it returned one, or its exception was converted above.
+        # Checked, not filtered — a filter would silently hand the coordinator
+        # a shorter batch than it dispatched — and checked at runtime rather
+        # than asserted, because assertions vanish under `python -O`.
+        settled: list[AgentOutcome] = []
+        for index, outcome in enumerate(outcomes):
+            if outcome is None:
+                raise RuntimeError(
+                    f"dispatch call {index} for agent {calls[index].agent_key!r} "
+                    "produced no outcome"
+                )
+            settled.append(outcome)
+        return tuple(settled)
+
+    def _setup_outcome(
+        self, call: AgentDispatch, task_id: str, content: str
+    ) -> AgentOutcome:
+        """Report one call that never reached a runtime, failing any row it made.
+
+        A rejection creates nothing, so there is usually no row to correct. An
+        unexpected setup failure can leave a task already committed to a live
+        agent: that row is marked failed here rather than left running for the
+        rest of the session.
+
+        The result carries the identity the *call* asked for, so the model can
+        match every outcome to the call it wrote. A label conflict is exactly
+        the case where the existing agent's label differs, and answering a
+        rejected ``Renamed`` call with ``Coder`` would hide which call failed.
+        Where setup got far enough to touch an agent, the guards above have
+        already proved the two labels equal.
+        """
+        managed = self._agents.get(call.agent_key)
+        if managed is not None and any(
+            task.task_id == task_id for task in managed.tasks
+        ):
+            self._set_agent_task_status(call.agent_key, task_id, "failed")
+        return AgentOutcome(
+            agent_key=call.agent_key,
+            agent_label=call.agent_label,
+            task_id=task_id,
+            task_label=call.task_label,
+            status="failed",
+            content=content,
+        )
 
     async def _begin_agent_task(
         self, call: AgentDispatch, task_id: str
@@ -939,11 +979,15 @@ class ChatApp(App):
         managed = self._agents.get(call.agent_key)
         if managed is None:
             session = Session(persist=False)
-            session.add("user", call.task)
             transcript = await self.add_agent_view(
                 AgentSummary(call.agent_key, call.agent_label, "running", (task,)),
                 (TranscriptRecord(role="user", content=call.task),),
             )
+            # Same rule as a continuation: the assignment joins the worker's
+            # conversation only once its presentation exists. The seeded
+            # transcript record is that message's presentation, not a second
+            # model message.
+            session.add("user", call.task)
             managed = _ManagedAgent(
                 agent_key=call.agent_key,
                 agent_label=call.agent_label,
@@ -971,14 +1015,23 @@ class ChatApp(App):
                 f"Agent {call.agent_key!r} is still working on its current task. "
                 "Wait for its result before sending it another one."
             )
-        managed.session.add("user", call.task)
-        managed.transcript.append(TranscriptRecord(role="user", content=call.task))
-        managed.tasks.append(task)
+        # Presentation first, model context last. The sidebar and transcript
+        # writes are the fallible ones, so the task row is committed only after
+        # the sidebar accepted it and the assignment joins the worker's
+        # conversation only after both succeeded: a setup that fails must never
+        # leave an unanswered instruction in the context of the agent's next
+        # task.
         self.update_agent_view(
             AgentSummary(
-                call.agent_key, managed.agent_label, "running", tuple(managed.tasks)
+                call.agent_key,
+                managed.agent_label,
+                "running",
+                (*managed.tasks, task),
             )
         )
+        managed.tasks.append(task)
+        managed.transcript.append(TranscriptRecord(role="user", content=call.task))
+        managed.session.add("user", call.task)
         return managed
 
     async def _dispatch_one(
@@ -1085,6 +1138,15 @@ class ChatApp(App):
         The single synchronization point: no timer polls a runtime field, and
         nothing else reads one to paint with.
         """
+        if not self.is_running:
+            # The app has already left. Every runtime is still unwinding its
+            # own ``finally`` — releasing the generating flag, clearing a
+            # process — and those notifications land here after the widgets
+            # are gone. There is nothing to paint and nothing left to read
+            # what would be recorded, so this is a finished state rather than
+            # a failure to report. Same rule as the unmounted live bubble a
+            # ``/clear`` leaves behind mid-stream.
+            return
         if run.kind == "primary":
             self._prompt_tokens = run.prompt_tokens
             self.ctx.last_reply = run.last_reply

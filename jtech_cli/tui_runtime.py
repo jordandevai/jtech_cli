@@ -16,7 +16,10 @@ command, round, repetition, retry, concurrency, or elapsed-time budget here.
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
+import os
+import signal
 import subprocess
 import threading
 import time
@@ -42,7 +45,12 @@ from jtech_cli.cmd_tools import (
 )
 from jtech_cli.config import ResolvedProfile
 from jtech_cli.llm_client import StreamItem
-from jtech_cli.prompts import COMMAND_DECLINED_PROMPT, NUDGE_PROMPT
+from jtech_cli.prompts import (
+    COMMAND_DECLINED_PROMPT,
+    NUDGE_PROMPT,
+    PromptResourceError,
+    PromptSourceError,
+)
 from jtech_cli.session import Session
 from jtech_cli.tui_widgets import (
     MarkdownTail,
@@ -53,6 +61,7 @@ from jtech_cli.tui_widgets import (
 
 CONNECTION_ERROR = "Connection failed — check the endpoint in /profiles"
 RENDER_ERROR = "Could not render the reply — it was not added to the conversation"
+PROMPT_ERROR = "The system prompt could not be composed — check /system and /prompt"
 SPINNER_FRAMES = "-\\|/"
 
 MIXED_TOOLS_ERROR = (
@@ -314,6 +323,45 @@ class _StreamInbox:
         return batch
 
 
+def _kill_command_group(proc: subprocess.Popen[str]) -> None:
+    """Kill the whole process group ``proc`` leads, not just the shell.
+
+    ``bash -c`` is a shell, so a pipeline stage, a background job, or any other
+    descendant survives a signal aimed only at the shell's own pid — and keeps
+    reading and writing the project after the CLI reported a timeout or exited.
+    It also keeps the command's stdout pipe open, so the parent's
+    ``communicate()`` blocks on a command the user already stopped.
+
+    Commands are started with ``start_new_session=True``, so the shell is a
+    session and group leader and its pid *is* its group id: nothing outside the
+    command can be in the group this signals.
+    """
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        # The group is already gone. Nothing survived it, so nothing to stop.
+        pass
+
+
+async def _abandon_launch(launch: asyncio.Future[subprocess.Popen[str]]) -> None:
+    """Stop a command whose owner was cancelled while it was still starting.
+
+    Cancelling ``asyncio.to_thread()`` abandons the *await*, not the thread:
+    the ``Popen`` still completes, and this coroutine was the only thing that
+    would ever have owned the child. Without this, an exit landing inside the
+    launch window leaves a command running with nobody responsible for it.
+    """
+    try:
+        proc = await launch
+    except OSError:
+        # The child was never created, so there is nothing to stop. The error
+        # itself has no reader left: the run that asked for the command is
+        # already unwinding.
+        return
+    _kill_command_group(proc)
+    await asyncio.to_thread(proc.wait)
+
+
 class AutonomousRuntime:
     """One conversation's unlimited model/command loop and its rendering."""
 
@@ -373,7 +421,7 @@ class AutonomousRuntime:
             state.stop_event.set()
         elif state.running_proc is not None:
             state.command_interrupted = True
-            state.running_proc.kill()
+            _kill_command_group(state.running_proc)
 
     # ------------------------------------------------------------- tool loop
 
@@ -454,8 +502,27 @@ class AutonomousRuntime:
     # ------------------------------------------------------------- streaming
 
     async def _stream_once(self) -> _CompletionOutcome:
-        """Consume one provider stream into this run's transcript."""
+        """Consume one provider stream into this run's transcript.
+
+        The request is prepared first, before a single piece of live state
+        exists. Composing the prompt is fallible, and a failure after the
+        generating flag, the AI entry, and the label timer were opened would
+        latch all three: a bubble stuck on "live" forever and a run that never
+        releases its turn. Nothing that can fail is done after that point
+        without a ``finally`` that closes it.
+        """
         state = self._state
+        try:
+            # Snapshotted on the event loop: a provider thread must never read
+            # a live Session.messages list the loop can mutate underneath it.
+            messages = state.session.messages_with_system(state.system_prompt())
+        except (PromptResourceError, PromptSourceError) as error:
+            failure = f"{PROMPT_ERROR}\n\n{error}"
+            state.transcript.append(
+                TranscriptRecord(role="system", content=failure, error=True)
+            )
+            return _CompletionOutcome("failed", error=failure)
+
         parts: list[str] = []
         timings: dict | None = None
         error: Exception | None = None
@@ -571,9 +638,6 @@ class AutonomousRuntime:
         # says "nobody is reading the inbox any more", which is true on every
         # exit, not only the ones the user asked for.
         abandoned = threading.Event()
-        # Snapshotted here, on the event loop: a provider thread must never
-        # read a live Session.messages list the loop can mutate underneath it.
-        messages = state.session.messages_with_system(state.system_prompt())
         profile = state.profile
         temperature = state.temperature
 
@@ -732,15 +796,34 @@ class AutonomousRuntime:
         self._set_phase("command")
         state.command_interrupted = False
         try:
-            try:
-                proc = await asyncio.to_thread(
-                    subprocess.Popen,
-                    ["bash", "-c", command],
-                    cwd=self._project_root,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
+            # Kept as a task, not a bare await: cancellation must be able to
+            # come back for the child this is about to create.
+            launch = asyncio.ensure_future(
+                asyncio.to_thread(
+                    functools.partial(
+                        subprocess.Popen,
+                        ["bash", "-c", command],
+                        cwd=self._project_root,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                        # Its own session, so the command owns a process group
+                        # this runtime can stop whole. Without it, stopping the
+                        # shell orphans everything the command started.
+                        start_new_session=True,
+                    )
                 )
+            )
+            try:
+                # Shielded, so a cancellation arriving mid-launch reaches this
+                # coroutine while the launch itself still finishes and stays
+                # claimable below.
+                proc = await asyncio.shield(launch)
+            except asyncio.CancelledError:
+                # Shielded again: a second cancellation while unwinding must
+                # not be what leaves a command running.
+                await asyncio.shield(_abandon_launch(launch))
+                raise
             except OSError as error:
                 return ExecResult(127, str(error))
             self._set_running_proc(proc)
@@ -750,7 +833,7 @@ class AutonomousRuntime:
                         proc.communicate, timeout=self._cmd.timeout
                     )
                 except subprocess.TimeoutExpired as error:
-                    proc.kill()
+                    _kill_command_group(proc)
                     await asyncio.to_thread(proc.wait)
                     partial, truncated = truncate_output(
                         timeout_partial_output(error), self._cmd.max_output
