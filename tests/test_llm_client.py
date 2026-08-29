@@ -4,6 +4,7 @@ import threading
 from types import SimpleNamespace
 
 import pytest
+from openai import APIConnectionError, APIStatusError
 
 from jtech_cli import llm_client
 from jtech_cli.config import ResolvedProfile
@@ -41,8 +42,32 @@ def _usage_chunk(prompt_tokens):
     return SimpleNamespace(choices=[], usage=SimpleNamespace(prompt_tokens=prompt_tokens))
 
 
-def fake_openai(monkeypatch, chunks=(), fail_on_stream_options=False):
-    """Replace the SDK constructor; return the list of clients it builds."""
+class _Refused(APIStatusError):
+    """A server answering an error status because it has no ``stream_options``.
+
+    Built without a transport object: the production code branches on the type,
+    and constructing a real one would tie this test to whichever HTTP client the
+    SDK currently vendors.
+    """
+
+    def __init__(self) -> None:
+        Exception.__init__(self, "stream_options is not supported")
+
+
+class _Unreachable(APIConnectionError):
+    """The endpoint is down. Same reason for skipping the parent constructor."""
+
+    def __init__(self) -> None:
+        Exception.__init__(self, "Connection error.")
+
+
+def fake_openai(monkeypatch, chunks=(), fail_on_stream_options=False, raises=None):
+    """Replace the SDK constructor; return the list of clients it builds.
+
+    ``fail_on_stream_options`` refuses only the usage request, as a server or an
+    old SDK does; pass an exception to choose which refusal. ``raises`` fails
+    every call, standing in for a transport that is down.
+    """
     built = []
 
     class _Client:
@@ -62,8 +87,14 @@ def fake_openai(monkeypatch, chunks=(), fail_on_stream_options=False):
 
         def create(self, **kwargs):
             self.calls.append(kwargs)
+            if raises is not None:
+                raise raises
             if fail_on_stream_options and "stream_options" in kwargs:
-                raise TypeError("stream_options unsupported")
+                raise (
+                    TypeError("stream_options unsupported")
+                    if fail_on_stream_options is True
+                    else fail_on_stream_options
+                )
             self.sent = kwargs
             return iter(list(chunks))
 
@@ -147,6 +178,30 @@ def test_stream_options_failure_retries_without_them(monkeypatch):
     assert "stream_options" not in client.calls[1]
     assert client.calls[1]["model"] == "qwen3"
     assert client.calls[1]["temperature"] == 0.7
+
+
+def test_a_server_rejecting_the_usage_option_still_retries(monkeypatch):
+    """The other legitimate refusal: an error status rather than a `TypeError`."""
+    built = fake_openai(monkeypatch, [_chunk("hi")], fail_on_stream_options=_Refused())
+    assert "".join(stream_reply(LOCAL, 0.7, [])) == "hi"
+
+    client = built[0]
+    assert "stream_options" in client.calls[0]
+    assert "stream_options" not in client.calls[1]
+
+
+def test_a_transport_failure_is_not_swallowed_by_the_usage_retry(monkeypatch):
+    """The retry exists for a refused option, not for an endpoint that is down.
+
+    Catching every exception turned one connection failure into two requests and
+    reported the second one's error, from a request the caller never asked for.
+    """
+    built = fake_openai(monkeypatch, raises=_Unreachable())
+
+    with pytest.raises(APIConnectionError):
+        list(stream_reply(LOCAL, 0.7, []))
+
+    assert len(built[0].calls) == 1, built[0].calls
 
 
 def test_stream_reply_emits_usage_from_the_choiceless_final_chunk(monkeypatch):

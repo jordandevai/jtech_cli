@@ -34,13 +34,13 @@ from textual.widgets import Markdown
 
 from jtech_cli.cmd_tools import (
     AgentDispatch,
+    BoundedOutput,
     CmdPolicy,
     ExecResult,
     ToolProtocolError,
     duplicate_agent_keys,
     format_result,
     parse_jtech_reply,
-    truncate_output,
 )
 from jtech_cli.config import ResolvedProfile
 from jtech_cli.llm_client import StreamItem
@@ -108,8 +108,10 @@ def parse_errors_message(errors: Sequence[ToolProtocolError]) -> str:
     # requested syntax example becomes a command that runs. Each error carries
     # its own reason and its own remedy; this only says nothing ran.
     lines = [
-        "Tool protocol error: no call from this response was executed. "
-        "Address each issue below:"
+        (
+            "Tool protocol error: no call from this response was executed. "
+            "Address each issue below:"
+        )
     ]
     lines.extend(f"- line {error.line}: {error.message}" for error in errors)
     return "\n".join(lines)
@@ -333,8 +335,8 @@ def _kill_command_group(proc: subprocess.Popen[str]) -> None:
     descendant survives a signal aimed only at the shell's own pid — and keeps
     reading and writing the project after the CLI reported the command
     stopped, or after the CLI itself exited. It also keeps the command's
-    stdout pipe open, so the parent's ``communicate()`` blocks on a command
-    the user already stopped.
+    stdout pipe open, so the parent's drain never reaches EOF on a command the
+    user already stopped.
 
     Commands are started with ``start_new_session=True``, so the shell is a
     session and group leader and its pid *is* its group id: nothing outside the
@@ -345,6 +347,42 @@ def _kill_command_group(proc: subprocess.Popen[str]) -> None:
     except ProcessLookupError:
         # The group is already gone. Nothing survived it, so nothing to stop.
         pass
+
+
+#: Read size for the command pipe. Large enough that a chatty command costs few
+#: syscalls, small enough that it is noise next to any sane ``max_output``.
+_READ_CHUNK = 65536
+
+
+def _drain_output(proc: subprocess.Popen[str], max_output: int) -> tuple[str, bool]:
+    """Read one command's combined output to EOF, keeping only what fits.
+
+    Replaces ``communicate()``, which returns only at exit and therefore held
+    the entire stream in memory. With no execution deadline left to bound it,
+    a verbose or endless command could grow the CLI until it died; the cap was
+    applied to the result, far too late to prevent that.
+
+    Safe against the classic pipe deadlock by construction: ``stderr`` is
+    redirected into ``stdout``, so there is exactly one pipe and no second one
+    left unread while this blocks on the first.
+
+    Runs on a worker thread. If the run is cancelled, the group is killed
+    elsewhere, this reaches EOF, and the thread finishes on its own.
+    """
+    collected = BoundedOutput(max_output)
+    stdout = proc.stdout
+    if stdout is None:
+        raise RuntimeError("the command was started without a stdout pipe")
+    with stdout:
+        while True:
+            chunk = stdout.read(_READ_CHUNK)
+            if not chunk:
+                break
+            collected.add(chunk)
+    # Closing the pipe and reaping the child are the rest of what
+    # ``communicate()`` did; nothing else here is responsible for them.
+    proc.wait()
+    return collected.result()
 
 
 async def _abandon_launch(launch: asyncio.Future[subprocess.Popen[str]]) -> None:
@@ -823,7 +861,9 @@ class AutonomousRuntime:
 
         There is no elapsed-time deadline. The command ends when it exits,
         when the user stops it, or when this run is cancelled: a build or a
-        test suite takes as long as it takes.
+        test suite takes as long as it takes. Its output is drained as it
+        arrives and held within ``max_output``, so running without a deadline
+        costs bounded memory rather than unbounded.
         """
         state = self._state
         self._set_phase("command")
@@ -862,7 +902,9 @@ class AutonomousRuntime:
             self._set_running_proc(proc)
             try:
                 try:
-                    out, _ = await asyncio.to_thread(proc.communicate)
+                    text, truncated = await asyncio.to_thread(
+                        _drain_output, proc, self._cmd.max_output
+                    )
                 except asyncio.CancelledError:
                     # Cancelling the await does not stop the child, and the
                     # ``finally`` below is about to release ownership of it —
@@ -878,12 +920,9 @@ class AutonomousRuntime:
                     _kill_command_group(proc)
                     await asyncio.shield(asyncio.to_thread(proc.wait))
                     raise
-                out = out or ""
                 if state.command_interrupted:
                     state.command_interrupted = False
-                    text, truncated = truncate_output(out, self._cmd.max_output)
                     return ExecResult(130, text, interrupted=True, truncated=truncated)
-                text, truncated = truncate_output(out, self._cmd.max_output)
                 return ExecResult(proc.returncode, text, truncated=truncated)
             finally:
                 self._set_running_proc(None)

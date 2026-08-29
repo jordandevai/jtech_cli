@@ -8,6 +8,7 @@ import pytest
 from jtech_cli import cmd_tools
 from jtech_cli.cmd_tools import (
     AgentDispatch,
+    BoundedOutput,
     CmdPolicy,
     ShellParseError,
     _find_exec_commands,
@@ -787,6 +788,98 @@ def test_truncate_output_head_and_tail():
     assert out.endswith("T")
     assert "truncated" in out
     assert truncate_output("short", 10) == ("short", False)
+
+
+def feed(text: str, limit: int, chunk: int) -> tuple[str, bool]:
+    """Push ``text`` through a `BoundedOutput` in ``chunk``-sized pieces."""
+    collector = BoundedOutput(limit)
+    for start in range(0, len(text), chunk):
+        collector.add(text[start : start + chunk])
+    return collector.result()
+
+
+@pytest.mark.parametrize(
+    "text, limit",
+    [
+        ("", 100),
+        ("short", 100),
+        ("exactly-ten", 11),                       # exactly at the cap
+        ("x" * 101, 100),                          # one over
+        ("H" * 50 + "M" * 100 + "T" * 50, 100),
+        ("A" * 5000, 100),
+        ("\n\n\nleading", 100),                    # strip() territory
+        ("trailing\n\n\n", 100),
+        ("\n\nboth\n\n", 100),
+        ("\n" * 200 + "buried" + "\n" * 200, 20),   # newline runs past the cap
+        ("\n" * 5000 + "buried", 20),               # a run far past it
+        ("head" + "\n" * 5000 + "tail", 20),
+        ("a\n\nb" * 400, 50),                      # interior newlines survive
+        ("mid\nnewlines\nhere", 6),
+        ("x" * 300, 2),                            # the smallest sane cap
+    ],
+)
+@pytest.mark.parametrize("chunk", [1, 3, 7, 64, 4096])
+def test_bounded_output_matches_whole_string_truncation(text, limit, chunk):
+    """The streaming collector and `truncate_output` must be interchangeable.
+
+    Parametrized over chunk sizes because the split points are the risk: a
+    boundary can land inside the head, inside the dropped middle, inside the
+    tail, or inside a trailing newline run that is not trailing after all.
+    """
+    assert feed(text, limit, chunk) == truncate_output(text, limit)
+
+
+def test_bounded_output_retains_only_the_cap():
+    """The point of the class: a huge stream costs memory proportional to the cap.
+
+    Asserted on what is retained, not on process RSS, which no test can pin down.
+    """
+    limit = 100
+    collector = BoundedOutput(limit)
+    for _ in range(2000):
+        collector.add("x" * 1000)  # 2,000,000 characters
+    retained = collector._head_len + len(collector._tail)
+    assert retained <= 2 * limit, retained
+
+    out, truncated = collector.result()
+    assert truncated
+    assert len(out) <= limit + len(str(2_000_000 - limit)) + 40
+    assert out == truncate_output("x" * 2_000_000, limit)[0]
+
+
+def test_bounded_output_never_materializes_a_long_newline_run():
+    """A newline run is content only once something follows it.
+
+    Building the whole run at that moment would reintroduce the spike this
+    class exists to prevent, so only what the windows can hold is built.
+    """
+    limit = 100
+    collector = BoundedOutput(limit)
+    collector.add("start")
+    for _ in range(2000):
+        collector.add("\n" * 1000)  # 2,000,000 newlines, held back as a count
+    assert collector._head_len + len(collector._tail) <= 2 * limit
+    collector.add("end")
+    assert collector._head_len + len(collector._tail) <= 2 * limit
+
+    assert collector.result() == truncate_output(
+        "start" + "\n" * 2_000_000 + "end", limit
+    )
+
+
+def test_bounded_output_caps_where_truncate_output_does_not():
+    """Documented, deliberate divergence at a one-character cap.
+
+    `truncate_output` slices its tail as ``text[-0:]`` — the whole string — so
+    that one input caps nothing. Copying it here would reinstate exactly the
+    unbounded retention this class exists to prevent.
+    """
+    text = "x" * 5000
+    assert truncate_output(text, 1)[0].endswith(text)
+    capped, truncated = feed(text, 1, 64)
+    assert truncated
+    assert capped == truncate_output(text, 1)[0].replace(text, "")
+    assert len(capped) < 40
 
 
 def test_format_result_note():

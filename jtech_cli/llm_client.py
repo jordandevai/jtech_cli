@@ -5,7 +5,7 @@ from __future__ import annotations
 import threading
 from collections.abc import Iterator
 
-from openai import OpenAI
+from openai import APIStatusError, OpenAI
 
 from jtech_cli.config import ResolvedProfile
 
@@ -66,16 +66,22 @@ def stream_reply(
     ``prompt_per_second``, ...).
     """
     client = make_client(profile)
-    kwargs = dict(
-        model=profile.model,
-        messages=messages,
-        stream=True,
-        temperature=temperature,
-    )
+    kwargs = {
+        "model": profile.model,
+        "messages": messages,
+        "stream": True,
+        "temperature": temperature,
+    }
     try:
         kwargs["stream_options"] = {"include_usage": True}
         stream = client.chat.completions.create(**kwargs)
-    except Exception:
+    except (APIStatusError, TypeError):
+        # The two ways asking for usage can be refused, and only those: the
+        # server answered with an error status because it does not implement
+        # ``stream_options``, or the installed SDK is old enough not to accept
+        # the argument at all. A connection failure, a timeout, or a bug in
+        # this module is not a reason to silently re-request — it now
+        # propagates to the caller that knows how to report it.
         stream = client.chat.completions.create(
             model=profile.model,
             messages=messages,

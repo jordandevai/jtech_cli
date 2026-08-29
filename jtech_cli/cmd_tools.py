@@ -1020,6 +1020,15 @@ class ExecResult:
     truncated: bool = False
 
 
+def _truncation_marker(dropped: int) -> str:
+    """The separator standing in for the characters a cap removed.
+
+    One definition, because two producers emit it: whole-string truncation and
+    the streaming collector below. They must be indistinguishable to a reader.
+    """
+    return f"\n…[{dropped} chars truncated]…\n"
+
+
 def truncate_output(text: str, max_output: int) -> tuple[str, bool]:
     """Cap output at ``max_output`` chars, keeping head and tail."""
     text = text.strip("\n")
@@ -1027,7 +1036,95 @@ def truncate_output(text: str, max_output: int) -> tuple[str, bool]:
         return text, False
     half = max_output // 2
     dropped = len(text) - max_output
-    return text[:half] + f"\n…[{dropped} chars truncated]…\n" + text[-half:], True
+    return text[:half] + _truncation_marker(dropped) + text[-half:], True
+
+
+class BoundedOutput:
+    """Accumulate a command's output within a fixed memory budget.
+
+    `truncate_output` needs the whole string, so capturing output for it means
+    holding all of it: with no execution deadline, a verbose or endless command
+    would grow the process until it died. This keeps the same head, the same
+    tail, and the same dropped count while retaining ``O(limit)`` characters
+    however much the command prints.
+
+    For every ``limit >= 2`` the result is byte-for-byte what
+    ``truncate_output(whole, limit)`` returns for the same bytes, so the two are
+    interchangeable at the boundary. That includes ``strip("\n")``: leading
+    newlines are discarded on arrival and trailing ones are held back until
+    something proves them interior, which is what makes the character counts
+    agree.
+
+    At ``limit == 1`` they differ, and deliberately. ``truncate_output`` slices
+    its tail as ``text[-0:]``, which is the whole string, so a one-character cap
+    returns everything — the one input where it does not cap at all. Reproducing
+    that here would reintroduce the unbounded retention this class exists to
+    prevent, so the tail is empty instead. No configuration path produces that
+    value on purpose.
+
+    Args:
+        limit: The same ``max_output`` cap ``truncate_output`` takes.
+    """
+
+    def __init__(self, limit: int) -> None:
+        self._limit = limit
+        self._head: list[str] = []
+        self._head_len = 0
+        self._tail = ""
+        self._length = 0
+        # Newlines seen at the end so far. They are content only if a later
+        # chunk turns out to follow them; otherwise they are what strip removes.
+        self._pending_newlines = 0
+        self._started = False
+
+    def add(self, chunk: str) -> None:
+        """Take one chunk of output, keeping at most ``limit`` head and tail."""
+        if not self._started:
+            chunk = chunk.lstrip("\n")
+            if not chunk:
+                return
+            self._started = True
+        body = chunk.rstrip("\n")
+        trailing = len(chunk) - len(body)
+        if not body:
+            self._pending_newlines += trailing
+            return
+        run = self._pending_newlines
+        self._pending_newlines = trailing
+        if run:
+            # Newlines held back earlier turn out to be interior after all.
+            # Past the cap only their count survives, so only that many are
+            # built: rendering a million-newline run in full would spike memory
+            # exactly the way whole-stream buffering did.
+            self._keep("\n" * min(run, self._limit), total=run)
+        self._keep(body)
+
+    def _keep(self, text: str, *, total: int | None = None) -> None:
+        """Record ``total`` characters of content, of which ``text`` is retained.
+
+        ``total`` differs from ``len(text)`` only for a newline run longer than
+        the cap, where the count is the whole of what survives.
+        """
+        self._length += len(text) if total is None else total
+        room = self._limit - self._head_len
+        if room > 0:
+            kept = text[:room]
+            self._head.append(kept)
+            self._head_len += len(kept)
+        # Slicing per chunk rather than per character: the work is bounded by
+        # the cap, and chunks arrive in fixed sizes.
+        self._tail = (self._tail + text)[-self._limit :] if self._limit else ""
+
+    def result(self) -> tuple[str, bool]:
+        """The capped text and whether anything was dropped."""
+        if self._length <= self._limit:
+            # Everything that survived stripping is still in the head window.
+            return "".join(self._head), False
+        half = self._limit // 2
+        dropped = self._length - self._limit
+        head = "".join(self._head)[:half]
+        tail = self._tail[len(self._tail) - half :] if half else ""
+        return head + _truncation_marker(dropped) + tail, True
 
 
 def execute(
@@ -1049,6 +1146,10 @@ def execute(
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
+            # A non-zero exit is this function's result, reported to the model
+            # as such. Raising on it would turn every failing build into an
+            # exception the caller has to translate back into the same value.
+            check=False,
         )
     except OSError as e:
         return ExecResult(127, str(e))
