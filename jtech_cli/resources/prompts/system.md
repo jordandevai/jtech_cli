@@ -41,8 +41,9 @@ Let me check that for you
 ---
 
 The first column is the rule, and a wrapper is what breaks it. Indenting the
-call, fencing it with backticks or tildes, putting it in backticks, bolding
-it, or making it a list or quote item all mean the same thing: the call is not
+call, fencing it with backticks or tildes, putting it in backticks, bolding it,
+striking it through, or making it a list, task, table, or quote item — any
+Markdown around the call at all — mean the same thing: the call is not
 executed, and you are told so instead of getting output. Emit it bare.
 
 ## Shell commands

@@ -101,11 +101,14 @@ _EXIT_PHASE: dict[RunExit, RunPhase] = {
 
 def parse_errors_message(errors: Sequence[ToolProtocolError]) -> str:
     """The model-facing diagnostic for a reply the runtime refuses to execute."""
+    # The headline names no cause: a batch is either all syntax errors or all
+    # wrapped calls that are themselves well-formed, and calling the second
+    # kind malformed sends the model to rewrite syntax that was already right.
+    # Each error states its own reason, in more detail than a headline could.
     lines = [
         (
-            "Tool protocol error: this response contains malformed tool calls, "
-            "so no call from it was executed. Correct these and emit the calls "
-            "again:"
+            "Tool protocol error: no call from this response was executed. "
+            "Correct these and emit the calls again:"
         )
     ]
     lines.extend(f"- line {error.line}: {error.message}" for error in errors)

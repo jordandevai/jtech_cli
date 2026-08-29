@@ -339,11 +339,14 @@ def _tool_name_at(text: str, position: int) -> str | None:
     return None
 
 
-#: Characters that may surround a wrapped call without being part of it:
-#: list bullets and their numbering, quote markers, emphasis, and code spans.
-#: Deliberately excludes letters — prose is how the protocol gets discussed,
-#: and a sentence naming a tool must stay a sentence.
-_DECORATION_CHARS = frozenset(" \t>`*_-+.)#0123456789")
+#: A leading GFM task-list marker, up to and including the checkbox. Removed
+#: as a whole token because a checked box carries a letter, and the rule below
+#: — decoration is anything that is not a letter — has to stay letter-free to
+#: keep prose out. Enumerating decoration instead was the earlier approach and
+#: it leaked: every Markdown flavour spells a wrapper with different
+#: punctuation (task boxes, strikethrough, table cells), so the set was never
+#: finished. Naming what decoration is *not* has one edge, and this is it.
+_TASK_LIST_MARKER = re.compile(r"^[\s>]*[-*+]\s+\[[ xX]\]")
 _HTML_CODE_TAG = re.compile(r"</?code\b[^>]*>", re.IGNORECASE)
 #: An opening code fence: three or more backticks or tildes. Both the marker
 #: character and its length are state, because a longer fence quotes a shorter
@@ -366,14 +369,18 @@ def _wrapped_call_name(line: str) -> str | None:
     ``None`` for exactly those shapes and leaves them silent, which is the
     failure this whole path exists to prevent.
 
-    What discriminates is the *prefix*: HTML code tags and Markdown underscore
-    escaping are undone, then everything before the tool name must be
-    decoration. Letters are not decoration, so a mention inside a sentence —
-    ``Run this next: jtech_cmd("ls")`` — is commentary, and stays commentary.
+    What discriminates is the *prefix*: HTML code tags, a task-list marker, and
+    Markdown underscore escaping are removed, and then no letter may stand
+    between the start of the line and the tool name. Punctuation is how every
+    wrapper is spelled — bullets, quote markers, emphasis, strikethrough, code
+    spans, table cells — so it is all decoration by construction, while a
+    mention inside a sentence (``Run this next: jtech_cmd("ls")``) keeps its
+    letters and stays commentary.
     """
     text = _HTML_CODE_TAG.sub("", line.replace("\\_", "_"))
+    text = _TASK_LIST_MARKER.sub("", text, count=1)
     for start, char in enumerate(text):
-        if char in _DECORATION_CHARS:
+        if not char.isalpha():
             continue
         name = _tool_name_at(text, start)
         if name is None:

@@ -264,6 +264,10 @@ BT3, BT4 = "`" * 3, "`" * 4
             "two wrapped calls sharing a line",
             f'{BT3}\n{command_call("echo x")} {command_call("echo y")}\n{BT3}',
         ),
+        ("unchecked task-list item", f'- [ ] {command_call("echo x")}'),
+        ("checked task-list item", f'- [x] {command_call("echo x")}'),
+        ("strikethrough", f'~~{command_call("echo x")}~~'),
+        ("table cell", f'| {command_call("echo x")} |'),
     ],
 )
 async def test_a_wrapped_call_continues_the_turn_instead_of_ending_it(name, wrapped):

@@ -87,6 +87,16 @@ def test_a_fenced_call_is_reported_rather_than_silently_dropped():
         '> jtech_cmd("ls")',
         '**jtech_cmd("ls")**',
         '`jtech_cmd("ls")`',
+        '### jtech_cmd("ls")',
+        # GFM: a task box carries a letter, strikethrough and table cells
+        # carry punctuation no allowlist of decoration ever finished naming.
+        '- [ ] jtech_cmd("ls")',
+        '- [x] jtech_cmd("ls")',
+        '* [X] jtech_cmd("ls")',
+        '  - [ ] jtech_cmd("ls")',
+        '> - [x] jtech_cmd("ls")',
+        '~~jtech_cmd("ls")~~',
+        '| jtech_cmd("ls") |',
         'jtech\\_cmd("ls")',
         'Here:\n<code>jtech_cmd("ls")</code>',
         '```jtech_cmd("ls")',
@@ -106,16 +116,19 @@ def test_a_lone_decorated_call_is_reported_not_executed(reply):
         'Run this next: jtech_cmd("ls")\n\nThen continue.',
         'The tool is called as jtech_cmd("ls") in this CLI.',
         '- To run a command, emit `jtech_cmd("ls")` on its own line.',
+        '- [ ] Then call jtech_cmd("ls") yourself.',
         'Run this:\n\n```cmd\npwd\n```',
         '```\n_JTECH_CMD = "jtech_cmd"\n```',
+        '```\n    self.result = jtech_cmd("ls")\n```',
         "Nothing to run here.",
     ],
 )
 def test_a_mention_inside_prose_stays_ordinary_commentary(reply):
-    """Only a line that is a call and nothing else is a near miss.
+    """A letter between the line's start and the tool name means prose.
 
-    Prose around the call is how the protocol gets discussed at all, so a
-    sentence that merely names a tool must never become a diagnostic.
+    Prose is how the protocol gets discussed at all, so a sentence that merely
+    names a tool must never become a diagnostic — including a sentence that
+    happens to sit in a list item or a fenced block of source.
     """
     parsed = parse_jtech_reply(reply)
     assert parsed.commands == []
@@ -156,7 +169,11 @@ def test_every_markdown_code_block_form_is_inert_and_reported(name, reply):
 @pytest.mark.parametrize(
     ("name", "reply", "tool"),
     [
-        ("multiline command", f'{BT3}\njtech_cmd("""pwd\nls -la""")\n{BT3}', "jtech_cmd"),
+        (
+            "multiline command",
+            f'{BT3}\njtech_cmd("""pwd\nls -la""")\n{BT3}',
+            "jtech_cmd",
+        ),
         ("multiline task",
          f'{BT3}\njtech_agent("a", "A", "local", "t", """Do\nthis""")\n{BT3}',
          "jtech_agent"),
