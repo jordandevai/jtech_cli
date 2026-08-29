@@ -33,7 +33,7 @@ from jtech_cli.tui_runtime import (
     RunOutcome,
     _CompletionOutcome,
 )
-from jtech_cli.tui_widgets import Transcript
+from jtech_cli.tui_widgets import MarkdownTail, Transcript
 
 PROFILE = ResolvedProfile(
     name="local", base_url="http://host:9000/v1", model="qwen3", api_key="none"
@@ -137,6 +137,23 @@ def make_runtime(app, stream, *, host=None, cmd=None, root=None, **state_kwargs)
 def transcript_text(app) -> str:
     chat = app.query_one("#chat", Transcript)
     return "\n".join(record.content for record in chat.history.records)
+
+
+def live_entries(app) -> list[tuple[str, str]]:
+    """Label and *currently drawn* body of every live tail entry, in order.
+
+    Reads the widgets rather than the records: what a finalized entry recorded
+    and what it is still showing are exactly what can disagree here.
+    """
+    return [
+        (
+            str(entry.label.render()),
+            entry.body._markdown
+            if isinstance(entry, MarkdownTail)
+            else str(entry.body.render()),
+        )
+        for entry in app.query_one("#chat", Transcript)._tail
+    ]
 
 
 def model_messages(session: Session) -> list[dict]:
@@ -266,6 +283,8 @@ BT3, BT4 = "`" * 3, "`" * 4
         ),
         ("unchecked task-list item", f'- [ ] {command_call("echo x")}'),
         ("checked task-list item", f'- [x] {command_call("echo x")}'),
+        ("checked ordered task item", f'1. [x] {command_call("echo x")}'),
+        ("checked ordered task item, paren", f'1) [X] {command_call("echo x")}'),
         ("strikethrough", f'~~{command_call("echo x")}~~'),
         ("table cell", f'| {command_call("echo x")} |'),
     ],
@@ -659,20 +678,6 @@ async def test_a_stopped_command_cannot_leave_a_background_job_writing(tmp_path)
     assert not marker.exists()
 
 
-async def test_a_timeout_kills_the_whole_group_too(tmp_path):
-    marker = tmp_path / "leaked.txt"
-    command = f"( sleep 3; echo LEAKED > {marker} ) & sleep 30"
-    stream, _ = scripted_stream(command_call(command), "done")
-    async with _Harness().run_test() as pilot:
-        runtime, _ = make_runtime(
-            pilot.app, stream, cmd=CmdPolicy(mode="yolo", timeout=1), root=tmp_path
-        )
-        outcome = await asyncio.wait_for(runtime.run(), timeout=30)
-        await asyncio.sleep(4)
-    assert outcome.final_text == "done"
-    assert not marker.exists()
-
-
 async def test_a_command_owns_its_own_process_group(tmp_path):
     """The group this runtime signals contains the command and nothing else.
 
@@ -688,6 +693,161 @@ async def test_a_command_owns_its_own_process_group(tmp_path):
         assert os.getpgid(proc.pid) != os.getpgid(0)
         runtime.request_stop()
         await asyncio.wait_for(task, timeout=20)
+
+
+# ------------------------------------------- command transcript lifecycle
+
+
+class _GatedProc:
+    """A process whose exit the test releases.
+
+    ``communicate()`` deliberately takes no ``timeout``: a production call that
+    still supplied one would raise ``TypeError`` here rather than making this a
+    slow test that has to outlive a deadline to prove it is gone.
+    """
+
+    def __init__(self, released: threading.Event, output: str) -> None:
+        self._released = released
+        self._output = output
+        self.pid = os.getpid()
+        self.returncode = 0
+
+    def communicate(self):
+        assert self._released.wait(20), "the test never released the process"
+        return self._output, None
+
+    def wait(self):
+        return self.returncode
+
+    def poll(self):
+        return self.returncode
+
+
+async def test_an_authorized_command_is_visible_while_it_runs(tmp_path):
+    """The reported defect: nothing in the stream acknowledged the command
+    until the process exited, so an executed call looked like it never fired."""
+    gate = tmp_path / "gate"
+    command = f"until [ -e {gate} ]; do sleep 0.05; done; echo released"
+    stream, _ = scripted_stream(command_call(command), "done")
+    async with _Harness().run_test() as pilot:
+        runtime, _ = make_runtime(pilot.app, stream, root=tmp_path)
+        task = asyncio.create_task(runtime.run())
+        await wait_for_shell(runtime, pilot)
+
+        running = [
+            (label, body)
+            for label, body in live_entries(pilot.app)
+            if command in body
+        ]
+        assert len(running) == 1, running
+        assert running[0][0] == "SYSTEM"
+        assert "running…" in running[0][1]
+
+        gate.write_text("go")
+        outcome = await asyncio.wait_for(task, timeout=20)
+        await pilot.pause()
+
+        assert outcome.final_text == "done"
+        # One lifecycle, one entry: the running placeholder became the result
+        # rather than being joined by a second presentation of the same run.
+        shown = [
+            record.content
+            for record in pilot.app.query_one("#chat", Transcript).history.records
+            if record.content.startswith(f"$ {command}")
+        ]
+        assert len(shown) == 1, shown
+        assert "running…" not in shown[0]
+        assert "exit 0" in shown[0]
+        assert "released" in shown[0]
+
+
+async def test_a_command_has_no_elapsed_time_deadline(tmp_path):
+    """No duration turns a running command into a result: it waits for the exit."""
+    released = threading.Event()
+    proc = _GatedProc(released, "late output")
+    session = Session(persist=False)
+    stream, _ = scripted_stream(command_call("build"), "done")
+    async with _Harness().run_test() as pilot:
+        runtime, _ = make_runtime(pilot.app, stream, session=session, root=tmp_path)
+        with mock.patch.object(tui_runtime.subprocess, "Popen", lambda *a, **k: proc):
+            task = asyncio.create_task(runtime.run())
+            await wait_for_shell(runtime, pilot)
+            for _ in range(5):
+                await pilot.pause(0.05)
+            assert not task.done(), "the run stopped waiting for a live command"
+            assert "running…" in "".join(
+                body for _, body in live_entries(pilot.app)
+            )
+
+            released.set()
+            outcome = await asyncio.wait_for(task, timeout=20)
+        await pilot.pause()
+
+    assert outcome.final_text == "done"
+    assert any("late output" in message["content"] for message in model_messages(session))
+
+
+async def test_a_cancelled_run_leaves_no_running_placeholder(tmp_path):
+    """A placeholder is presentation state; it leaves with the run that opened
+    it rather than being finalized into a result the command never reported."""
+    stream, _ = scripted_stream(command_call("sleep 60"), "done")
+    async with _Harness().run_test() as pilot:
+        runtime, _ = make_runtime(pilot.app, stream, root=tmp_path)
+        task = asyncio.create_task(runtime.run())
+        await wait_for_shell(runtime, pilot)
+        assert any("running…" in body for _, body in live_entries(pilot.app))
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await pilot.pause()
+
+        assert live_entries(pilot.app) == []
+        assert "running…" not in transcript_text(pilot.app)
+
+
+async def test_a_finished_command_redraws_even_while_compaction_waits(tmp_path):
+    """Finalizing records the value; only the body update redraws it.
+
+    A still-removable notice ahead of the command holds the whole finalized
+    prefix in the tail, so an implementation that skipped the update would go
+    on showing ``running…`` after the process had already exited.
+    """
+    stream, _ = scripted_stream(command_call("echo done-out"), "done")
+    async with _Harness().run_test() as pilot:
+        chat = pilot.app.query_one("#chat", Transcript)
+        notice = chat.begin_plain("system", "Queued", label="Queued")
+
+        runtime, _ = make_runtime(pilot.app, stream, root=tmp_path)
+        await runtime.run()
+        await pilot.pause()
+
+        drawn = [body for _, body in live_entries(pilot.app)]
+        assert "running…" not in "\n".join(drawn)
+        assert any("done-out" in body and "exit 0" in body for body in drawn)
+
+        chat.remove(notice)
+        await pilot.pause()
+        assert "done-out" in transcript_text(pilot.app)
+
+
+async def test_a_subagent_command_entry_stays_in_its_own_transcript(tmp_path):
+    """The entry is written to this run's injected transcript and nowhere else."""
+    stream, _ = scripted_stream(command_call("echo agent-out"), "done")
+    async with _Harness().run_test() as pilot:
+        agent_chat = Transcript(id="agent")
+        await pilot.app.mount(agent_chat)
+
+        runtime, _ = make_runtime(pilot.app, stream, kind="subagent", root=tmp_path)
+        runtime.state.transcript = agent_chat
+        await runtime.run()
+        await pilot.pause()
+
+        agent_text = "\n".join(r.content for r in agent_chat.history.records)
+        assert "$ echo agent-out" in agent_text
+        assert "agent-out" in agent_text
+        assert "agent-out" not in transcript_text(pilot.app)
+        assert live_entries(pilot.app) == []
 
 
 # ------------------------------------------------- prompt composition

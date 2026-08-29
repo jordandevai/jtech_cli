@@ -25,7 +25,6 @@ import bashlex
 from bashlex.errors import ParsingError
 
 VALID_CMD_MODES = ("ask", "auto", "yolo", "off")
-DEFAULT_TIMEOUT = 60
 DEFAULT_MAX_OUTPUT = 12000
 
 # Read-only seed for a fresh config: nothing that writes or talks to a network.
@@ -74,7 +73,6 @@ class CmdPolicy:
 
     mode: str = "ask"
     allow: list[str] = field(default_factory=lambda: list(DEFAULT_ALLOW))
-    timeout: int = DEFAULT_TIMEOUT
     max_output: int = DEFAULT_MAX_OUTPUT
 
 
@@ -339,14 +337,15 @@ def _tool_name_at(text: str, position: int) -> str | None:
     return None
 
 
-#: A leading GFM task-list marker, up to and including the checkbox. Removed
-#: as a whole token because a checked box carries a letter, and the rule below
-#: — decoration is anything that is not a letter — has to stay letter-free to
-#: keep prose out. Enumerating decoration instead was the earlier approach and
-#: it leaked: every Markdown flavour spells a wrapper with different
-#: punctuation (task boxes, strikethrough, table cells), so the set was never
-#: finished. Naming what decoration is *not* has one edge, and this is it.
-_TASK_LIST_MARKER = re.compile(r"^[\s>]*[-*+]\s+\[[ xX]\]")
+#: A leading GFM task-list marker, up to and including the checkbox, on either
+#: list kind: a bullet or an ordered ``1.``/``1)``. Removed as a whole token
+#: because a checked box carries a letter, and the rule below — decoration is
+#: anything that is not a letter — has to stay letter-free to keep prose out.
+#: Enumerating decoration instead was the earlier approach and it leaked: every
+#: Markdown flavour spells a wrapper with different punctuation (task boxes,
+#: strikethrough, table cells), so the set was never finished. Naming what
+#: decoration is *not* has one edge, and the checkbox is all of it.
+_TASK_LIST_MARKER = re.compile(r"^[\s>]*(?:[-*+]|\d{1,9}[.)])\s+\[[ xX]\]")
 _HTML_CODE_TAG = re.compile(r"</?code\b[^>]*>", re.IGNORECASE)
 #: An opening code fence: three or more backticks or tildes. Both the marker
 #: character and its length are state, because a longer fence quotes a shorter
@@ -1017,23 +1016,8 @@ def decide(command: str, policy: CmdPolicy, root: Path) -> Decision:
 class ExecResult:
     exit_code: int
     output: str
-    timed_out: bool = False
     interrupted: bool = False
     truncated: bool = False
-
-
-def timeout_partial_output(exc: subprocess.TimeoutExpired) -> str:
-    """Partial stdout captured before a TimeoutExpired, decoded to text.
-
-    ``exc.output`` is bytes on POSIX even with ``text=True`` (subprocess joins
-    the partial chunks with ``b''``), so decode defensively.
-    """
-    out = exc.output
-    if out is None:
-        return ""
-    if isinstance(out, bytes):
-        out = out.decode(errors="replace")
-    return out
 
 
 def truncate_output(text: str, max_output: int) -> tuple[str, bool]:
@@ -1049,10 +1033,15 @@ def truncate_output(text: str, max_output: int) -> tuple[str, bool]:
 def execute(
     command: str,
     root: Path,
-    timeout: int = DEFAULT_TIMEOUT,
     max_output: int = DEFAULT_MAX_OUTPUT,
 ) -> ExecResult:
-    """Run one command with ``bash -c`` in ``root``, capturing combined output."""
+    """Run one command with ``bash -c`` in ``root``, capturing combined output.
+
+    The command has no elapsed-time deadline: it runs until it exits. A build,
+    a test suite, or a migration takes as long as it needs, and killing one at
+    an arbitrary age turned a legitimate operation into a truncated failure the
+    model then had to reason from.
+    """
     try:
         proc = subprocess.run(
             ["bash", "-c", command],
@@ -1060,13 +1049,7 @@ def execute(
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
-            timeout=timeout,
         )
-    except subprocess.TimeoutExpired as e:
-        # Keep partial output like the TUI's _exec_command: it tells the model
-        # how far the command got before being killed.
-        out, truncated = truncate_output(timeout_partial_output(e), max_output)
-        return ExecResult(124, out, timed_out=True, truncated=truncated)
     except OSError as e:
         return ExecResult(127, str(e))
     out, truncated = truncate_output(proc.stdout or "", max_output)
@@ -1079,9 +1062,6 @@ def format_result(command: str, *, result: ExecResult | None = None, note: str |
         return f"$ {command}\n→ {note}"
     if result is None:
         raise ValueError("provide either result or note")
-    if result.timed_out:
-        body = f"\n{result.output}" if result.output else ""
-        return f"$ {command}\n→ timed out (killed){body}"
     if result.interrupted:
         body = f"\n{result.output}" if result.output else ""
         return f"$ {command}\n→ interrupted by user{body}"

@@ -621,7 +621,7 @@ def test_a_read_failure_is_refused_with_the_path(tmp_path):
 
 def test_every_profile_save_carries_the_command_policy_through(tmp_path):
     path = tmp_path / "config.toml"
-    policy = CmdPolicy(mode="yolo", allow=["cargo build:*"], timeout=7, max_output=99)
+    policy = CmdPolicy(mode="yolo", allow=["cargo build:*"], max_output=99)
     settings = build_settings(config_path=path)
     settings.profiles = Profiles().add(LOCAL, activate=True)
     save_settings(settings, path, cmd=policy)
@@ -632,7 +632,6 @@ def test_every_profile_save_carries_the_command_policy_through(tmp_path):
     loaded = load_cmd_policy(path)
     assert loaded.mode == "yolo"
     assert loaded.allow == ["cargo build:*"]
-    assert loaded.timeout == 7
     assert loaded.max_output == 99
     assert build_settings(config_path=path).profiles.active == CLOUD
 

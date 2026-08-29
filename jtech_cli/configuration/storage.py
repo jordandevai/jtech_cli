@@ -10,7 +10,6 @@ from pathlib import Path
 from jtech_cli.cmd_tools import (
     DEFAULT_ALLOW,
     DEFAULT_MAX_OUTPUT,
-    DEFAULT_TIMEOUT,
     VALID_CMD_MODES,
     CmdPolicy,
 )
@@ -323,13 +322,14 @@ def load_cmd_policy(path: Path = CONFIG_PATH) -> CmdPolicy:
     allow = table.get("allow", DEFAULT_ALLOW)
     if not isinstance(allow, list) or not all(isinstance(item, str) for item in allow):
         allow = list(DEFAULT_ALLOW)
-    timeout = table.get("timeout", DEFAULT_TIMEOUT)
-    if not isinstance(timeout, int) or timeout <= 0:
-        timeout = DEFAULT_TIMEOUT
     max_output = table.get("max_output", DEFAULT_MAX_OUTPUT)
     if not isinstance(max_output, int) or max_output <= 0:
         max_output = DEFAULT_MAX_OUTPUT
-    return CmdPolicy(mode=mode, allow=list(allow), timeout=timeout, max_output=max_output)
+    # A ``timeout`` written by an older CLI is read by nothing: commands have no
+    # elapsed-time deadline any more. Ignoring the key rather than rejecting it
+    # keeps an upgrade from blocking startup; the next intentional save rewrites
+    # ``[cmd]`` without it. Loading stays read-only.
+    return CmdPolicy(mode=mode, allow=list(allow), max_output=max_output)
 
 
 def save_settings(settings: Settings, path: Path = CONFIG_PATH, *, cmd: CmdPolicy) -> None:
@@ -379,7 +379,6 @@ def save_settings(settings: Settings, path: Path = CONFIG_PATH, *, cmd: CmdPolic
             "[cmd]",
             f"mode = {_toml_str(cmd.mode)}",
             f"allow = {json.dumps(cmd.allow, ensure_ascii=False)}",
-            f"timeout = {cmd.timeout}",
             f"max_output = {cmd.max_output}",
         ]
     )

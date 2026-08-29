@@ -1883,15 +1883,20 @@ async def test_failed_command_result_continues_the_loop(tmp_path, monkeypatch):
     assert any("recovered-out" in m for m in sys_msgs)
 
 
-async def test_cmd_timeout_feeds_partial_output(tmp_path, monkeypatch):
-    """A command killed by the timeout feeds its partial output to the model."""
-    app = make_app_with_cmd(tmp_path, CmdPolicy(mode="yolo", timeout=1))
+async def test_a_running_command_is_shown_then_replaced_by_its_result(tmp_path, monkeypatch):
+    """The reported defect, end to end: an executing command looked inert.
+
+    Nothing was drawn until the process exited, so a `jtech_cmd(...)` the app
+    had already parsed and started read as a call that never fired.
+    """
+    app = make_app_with_cmd(tmp_path, CmdPolicy(mode="yolo"))
+    command = "sleep 60"
     calls = {"n": 0}
 
     def fake(profile, temperature, messages):
         calls["n"] += 1
         if calls["n"] == 1:
-            yield command_call("echo got-far; sleep 5")
+            yield command_call(command)
         else:
             yield "final"
 
@@ -1900,16 +1905,32 @@ async def test_cmd_timeout_feeds_partial_output(tmp_path, monkeypatch):
         inp = app.query_one("#input", Input)
         inp.value = "go"
         await pilot.press("enter")
+        await _wait_until(
+            app, pilot, lambda: app._primary_runtime.state.running_proc is not None
+        )
+
+        # Visible while the process is still alive, not after it exits.
+        running = [b for b in bubbles(app) if b.startswith(f"$ {command}")]
+        assert len(running) == 1, running
+        assert "running…" in running[0]
+
+        # The existing stop path, exactly as a user reaches it.
+        await pilot.press("escape")
         await _wait_until(app, pilot, lambda: calls["n"] >= 2, tries=100)
-
-        sys_msgs = [m["content"] for m in app.session.messages if m["role"] == "system"]
-        assert any("timed out" in m and "got-far" in m for m in sys_msgs)
-        assert any("timed out" in b for b in bubbles(app))
-
-        # let the tool turn finish before teardown: a still-live
-        # stream would race _render_status against the unmounting widgets
         await _wait_until(app, pilot, lambda: not app._tool_rounds_active, tries=100)
         await pilot.pause()
+
+        # One presentation for the whole lifecycle: the running entry became the
+        # result rather than being joined by a second bubble for the same run.
+        shown = [b for b in bubbles(app) if b.startswith(f"$ {command}")]
+        assert len(shown) == 1, shown
+        assert "running…" not in shown[0]
+        assert "interrupted" in shown[0]
+
+        sys_msgs = [m["content"] for m in app.session.messages if m["role"] == "system"]
+        assert any("interrupted by user" in m for m in sys_msgs)
+        assert not any("running…" in m for m in sys_msgs)
+        assert any("final" in b for b in bubbles(app))
 
 
 async def test_queue_drains_after_esc_stop(tmp_path, monkeypatch):

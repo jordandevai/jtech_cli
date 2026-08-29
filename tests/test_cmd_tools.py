@@ -5,10 +5,10 @@ from pathlib import Path
 
 import pytest
 
+from jtech_cli import cmd_tools
 from jtech_cli.cmd_tools import (
     AgentDispatch,
     CmdPolicy,
-    ExecResult,
     ShellParseError,
     _find_exec_commands,
     acting_reason,
@@ -22,7 +22,6 @@ from jtech_cli.cmd_tools import (
     matches_allow,
     parse_jtech_reply,
     split_segments,
-    timeout_partial_output,
     truncate_output,
 )
 
@@ -95,6 +94,14 @@ def test_a_fenced_call_is_reported_rather_than_silently_dropped():
         '* [X] jtech_cmd("ls")',
         '  - [ ] jtech_cmd("ls")',
         '> - [x] jtech_cmd("ls")',
+        # A task box rides an ordered list too, and only the checked box
+        # carries the letter the prefix rule stops on.
+        '1. [ ] jtech_cmd("ls")',
+        '1. [x] jtech_cmd("ls")',
+        '1) [X] jtech_cmd("ls")',
+        '10. [x] jtech_cmd("ls")',
+        '  3. [x] jtech_cmd("ls")',
+        '> 2) [x] jtech_cmd("ls")',
         '~~jtech_cmd("ls")~~',
         '| jtech_cmd("ls") |',
         'jtech\\_cmd("ls")',
@@ -117,6 +124,7 @@ def test_a_lone_decorated_call_is_reported_not_executed(reply):
         'The tool is called as jtech_cmd("ls") in this CLI.',
         '- To run a command, emit `jtech_cmd("ls")` on its own line.',
         '- [ ] Then call jtech_cmd("ls") yourself.',
+        '1. [x] Then call jtech_cmd("ls") yourself.',
         'Run this:\n\n```cmd\npwd\n```',
         '```\n_JTECH_CMD = "jtech_cmd"\n```',
         '```\n    self.result = jtech_cmd("ls")\n```',
@@ -731,54 +739,44 @@ def test_dynamic_program_name_is_blocked_in_every_mode():
 # ---------------------------------------------------------------- execution
 
 def test_execute_captures_output(tmp_path):
-    r = execute("echo hello", tmp_path, timeout=10)
+    r = execute("echo hello", tmp_path)
     assert r.exit_code == 0
     assert r.output == "hello"
-    assert not r.timed_out
 
 
 def test_execute_exit_code(tmp_path):
-    r = execute("exit 3", tmp_path, timeout=10)
+    r = execute("exit 3", tmp_path)
     assert r.exit_code == 3
 
 
 def test_execute_runs_in_root(tmp_path):
     (tmp_path / "marker.txt").write_text("here")
-    r = execute("cat marker.txt", tmp_path, timeout=10)
+    r = execute("cat marker.txt", tmp_path)
     assert r.output == "here"
 
 
-def test_execute_timeout(tmp_path):
-    r = execute("sleep 5", tmp_path, timeout=1)
-    assert r.timed_out
-    assert r.exit_code == 124
+def test_execute_sets_no_deadline(tmp_path, monkeypatch):
+    """No elapsed duration ends a command: a build runs as long as it needs.
 
+    Asserted on the call rather than by outlasting a wall clock, so the contract
+    is proved without a slow test.
+    """
+    seen: dict = {}
 
-def test_execute_timeout_keeps_partial_output(tmp_path):
-    """Output printed before the kill is retained so the model can see progress."""
-    r = execute("echo got-far; sleep 5", tmp_path, timeout=1)
-    assert r.timed_out
-    assert r.exit_code == 124
-    assert "got-far" in r.output
+    def fake_run(argv, **kwargs):
+        seen["argv"] = argv
+        seen["kwargs"] = kwargs
+        return subprocess.CompletedProcess(argv, 0, stdout="X" * 40)
 
+    monkeypatch.setattr(cmd_tools.subprocess, "run", fake_run)
+    r = execute("build", tmp_path, max_output=10)
 
-def test_timeout_partial_output_decoding():
-    """TimeoutExpired carries bytes even with text=True; decode defensively."""
-    assert timeout_partial_output(subprocess.TimeoutExpired("c", 1, output=b"x\n")) == "x\n"
-    assert timeout_partial_output(subprocess.TimeoutExpired("c", 1, output="x\n")) == "x\n"
-    assert timeout_partial_output(subprocess.TimeoutExpired("c", 1)) == ""
-
-
-def test_format_result_timeout_includes_partial():
-    """A timed-out result feeds its partial output back, like an interrupted one."""
-    out = format_result("sleep 5", result=ExecResult(124, "got-far", timed_out=True))
-    assert "timed out" in out
-    assert "got-far" in out
-    # no partial output -> the plain note, unchanged
-    assert (
-        format_result("sleep 5", result=ExecResult(124, "", timed_out=True))
-        == "$ sleep 5\n→ timed out (killed)"
-    )
+    assert "timeout" not in seen["kwargs"]
+    assert seen["argv"] == ["bash", "-c", "build"]
+    assert seen["kwargs"]["cwd"] == tmp_path
+    assert seen["kwargs"]["stderr"] is subprocess.STDOUT
+    assert r.truncated
+    assert "truncated" in r.output
 
 
 def test_truncate_output_head_and_tail():
@@ -796,7 +794,7 @@ def test_format_result_note():
 
 
 def test_format_result_exec():
-    r = execute("echo out", Path("/tmp"), timeout=10)
+    r = execute("echo out", Path("/tmp"))
     msg = format_result("echo out", result=r)
     assert msg.startswith("$ echo out\nexit 0\n")
     assert "out" in msg

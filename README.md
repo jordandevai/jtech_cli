@@ -175,7 +175,13 @@ error rather than resolved by guessing which endpoint was meant.
   an unshaded "AI" Markdown bubble, so code blocks are syntax-highlighted in
   place. While streaming, the AI label shows a spinner, elapsed time, and a
   live character count — all ticked by a 1s timer, so they keep moving even
-  when the stream is silent. Command output appears as dim "SYSTEM" messages.
+  when the stream is silent.
+- **Command entries**: an authorized command appears immediately as a dim
+  "SYSTEM" entry showing the command and `running…`, and that same entry
+  becomes its captured output once the process exits. Shell commands have no
+  elapsed-time deadline — a build, a test suite, or a migration runs as long
+  as it needs. Stop Primary's command with `Esc`, or exit the app to stop
+  every runtime's command at once.
 - **Reasoning bubbles**: thinking models' reasoning tokens stream into a
   separate dim "REASONING" bubble, never mixed into the answer bubble.
   `reasoning` (or `/set reasoning`) selects the display mode:

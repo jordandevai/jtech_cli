@@ -40,7 +40,6 @@ from jtech_cli.cmd_tools import (
     duplicate_agent_keys,
     format_result,
     parse_jtech_reply,
-    timeout_partial_output,
     truncate_output,
 )
 from jtech_cli.config import ResolvedProfile
@@ -101,15 +100,16 @@ _EXIT_PHASE: dict[RunExit, RunPhase] = {
 
 def parse_errors_message(errors: Sequence[ToolProtocolError]) -> str:
     """The model-facing diagnostic for a reply the runtime refuses to execute."""
-    # The headline names no cause: a batch is either all syntax errors or all
-    # wrapped calls that are themselves well-formed, and calling the second
-    # kind malformed sends the model to rewrite syntax that was already right.
-    # Each error states its own reason, in more detail than a headline could.
+    # The headline names neither a cause nor a remedy. A batch is either all
+    # syntax errors or all wrapped calls that are themselves well-formed, and
+    # the two need opposite corrections: re-emit the call, or stop trying to
+    # emit it at all because it was only ever an example. Prescribing one here
+    # overrides the other — telling a model to "emit the calls again" is how a
+    # requested syntax example becomes a command that runs. Each error carries
+    # its own reason and its own remedy; this only says nothing ran.
     lines = [
-        (
-            "Tool protocol error: no call from this response was executed. "
-            "Correct these and emit the calls again:"
-        )
+        "Tool protocol error: no call from this response was executed. "
+        "Address each issue below:"
     ]
     lines.extend(f"- line {error.line}: {error.message}" for error in errors)
     return "\n".join(lines)
@@ -331,9 +331,10 @@ def _kill_command_group(proc: subprocess.Popen[str]) -> None:
 
     ``bash -c`` is a shell, so a pipeline stage, a background job, or any other
     descendant survives a signal aimed only at the shell's own pid — and keeps
-    reading and writing the project after the CLI reported a timeout or exited.
-    It also keeps the command's stdout pipe open, so the parent's
-    ``communicate()`` blocks on a command the user already stopped.
+    reading and writing the project after the CLI reported the command
+    stopped, or after the CLI itself exited. It also keeps the command's
+    stdout pipe open, so the parent's ``communicate()`` blocks on a command
+    the user already stopped.
 
     Commands are started with ``start_new_session=True``, so the shell is a
     session and group leader and its pid *is* its group id: nothing outside the
@@ -785,8 +786,32 @@ class AutonomousRuntime:
                 self._note_command(command, authorization.reason)
                 self._add_system(COMMAND_DECLINED_PROMPT)
                 continue
-            result = await self._exec_command(command)
-            self._show("system", self._cmd_bubble(command, result))
+            # Opened before the process is awaited: an authorized command has
+            # to look acknowledged from the moment it starts. Until it exits,
+            # nothing else in this run's own stream says it is running.
+            entry = self._state.transcript.begin_markdown(
+                "system", f"$ {command}\n\nrunning…"
+            )
+            try:
+                result = await self._exec_command(command)
+                presentation = self._cmd_bubble(command, result)
+                # Finalizing records the value; it does not redraw the widget,
+                # and compaction stops behind any removable notice still ahead
+                # of this entry, so the body is what has to be updated or the
+                # visible tail keeps saying "running…" after the process ended.
+                # Gated on the state because /clear may have unmounted the body
+                # while the command was still running.
+                if entry.state == "live":
+                    await entry.body.update(presentation)
+            except asyncio.CancelledError:
+                # Teardown. The placeholder is presentation only, so it leaves
+                # with the run rather than being finalized into a result the
+                # command never reported.
+                self._state.transcript.remove(entry)
+                raise
+            self._state.transcript.finalize(
+                entry, TranscriptRecord(role="system", content=presentation)
+            )
             self._add_system(format_result(command, result=result))
 
     def _note_command(self, command: str, note: str) -> None:
@@ -794,7 +819,12 @@ class AutonomousRuntime:
         self._add_system(format_result(command, note=note))
 
     async def _exec_command(self, command: str) -> ExecResult:
-        """Run one command in a worker; a stop and a timeout keep partial output."""
+        """Run one command in a worker; a stop keeps the output it produced.
+
+        There is no elapsed-time deadline. The command ends when it exits,
+        when the user stops it, or when this run is cancelled: a build or a
+        test suite takes as long as it takes.
+        """
         state = self._state
         self._set_phase("command")
         state.command_interrupted = False
@@ -832,9 +862,7 @@ class AutonomousRuntime:
             self._set_running_proc(proc)
             try:
                 try:
-                    out, _ = await asyncio.to_thread(
-                        proc.communicate, timeout=self._cmd.timeout
-                    )
+                    out, _ = await asyncio.to_thread(proc.communicate)
                 except asyncio.CancelledError:
                     # Cancelling the await does not stop the child, and the
                     # ``finally`` below is about to release ownership of it —
@@ -850,13 +878,6 @@ class AutonomousRuntime:
                     _kill_command_group(proc)
                     await asyncio.shield(asyncio.to_thread(proc.wait))
                     raise
-                except subprocess.TimeoutExpired as error:
-                    _kill_command_group(proc)
-                    await asyncio.to_thread(proc.wait)
-                    partial, truncated = truncate_output(
-                        timeout_partial_output(error), self._cmd.max_output
-                    )
-                    return ExecResult(124, partial, timed_out=True, truncated=truncated)
                 out = out or ""
                 if state.command_interrupted:
                     state.command_interrupted = False
@@ -871,8 +892,6 @@ class AutonomousRuntime:
 
     @staticmethod
     def _cmd_bubble(command: str, result: ExecResult) -> str:
-        if result.timed_out:
-            return f"$ {command}\n\n**timed out**"
         if result.interrupted:
             return f"$ {command}\n\n**interrupted**"
         body = result.output if result.output else "(no output)"

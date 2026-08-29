@@ -304,7 +304,7 @@ def test_rerunning_setup_preserves_the_cmd_policy(tmp_path, monkeypatch):
     save_settings(
         settings,
         path,
-        cmd=CmdPolicy(mode="yolo", allow=["cargo build:*"], timeout=5, max_output=99),
+        cmd=CmdPolicy(mode="yolo", allow=["cargo build:*"], max_output=99),
     )
     _stub_probe(monkeypatch, _fake_info(["m"]))
 
@@ -313,7 +313,6 @@ def test_rerunning_setup_preserves_the_cmd_policy(tmp_path, monkeypatch):
     policy = load_cmd_policy(path)
     assert policy.mode == "yolo"
     assert policy.allow == ["cargo build:*"]
-    assert policy.timeout == 5
     assert policy.max_output == 99
 
 

@@ -342,7 +342,6 @@ def test_load_cmd_policy_missing_file(tmp_path):
     p = load_cmd_policy(tmp_path / "nope.toml")
     assert p.mode == "ask"
     assert p.allow == list(DEFAULT_ALLOW)
-    assert p.timeout == 60
     assert p.max_output == 12000
 
 
@@ -350,12 +349,11 @@ def test_load_cmd_policy_valid(tmp_path):
     path = tmp_path / "config.toml"
     path.write_text(
         '[server]\nbase_url = "http://x:1/v1"\n\n[cmd]\n'
-        'mode = "yolo"\nallow = ["git status:*", "ls:*"]\ntimeout = 5\nmax_output = 100\n'
+        'mode = "yolo"\nallow = ["git status:*", "ls:*"]\nmax_output = 100\n'
     )
     p = load_cmd_policy(path)
     assert p.mode == "yolo"
     assert p.allow == ["git status:*", "ls:*"]
-    assert p.timeout == 5
     assert p.max_output == 100
 
 
@@ -367,18 +365,41 @@ def test_load_cmd_policy_explicit_empty_allow(tmp_path):
 
 def test_load_cmd_policy_invalid_falls_back(tmp_path):
     path = tmp_path / "config.toml"
-    path.write_text('[cmd]\nmode = "bogus"\nallow = "nope"\ntimeout = -1\nmax_output = "big"\n')
+    path.write_text('[cmd]\nmode = "bogus"\nallow = "nope"\nmax_output = "big"\n')
     p = load_cmd_policy(path)
     assert p.mode == "ask"
     assert p.allow == list(DEFAULT_ALLOW)
-    assert p.timeout == 60
     assert p.max_output == 12000
+
+
+def test_load_cmd_policy_ignores_a_legacy_timeout_key(tmp_path):
+    """Every generated config carries `[cmd].timeout`; upgrading must still start.
+
+    The key is non-operative rather than migrated in place: loading is read-only,
+    so the next intentional save is what drops it.
+    """
+    path = tmp_path / "config.toml"
+    path.write_text(
+        '[server]\nbase_url = "http://x:1/v1"\n\n[cmd]\n'
+        'mode = "yolo"\nallow = ["ls:*"]\ntimeout = 60\nmax_output = 100\n'
+    )
+    p = load_cmd_policy(path)
+    assert not hasattr(p, "timeout")
+    assert (p.mode, p.allow, p.max_output) == ("yolo", ["ls:*"], 100)
+    assert "timeout" in path.read_text()  # loading rewrote nothing
+
+    save_settings(settings_with(), path, cmd=p)
+    text = path.read_text()
+    assert "timeout" not in text
+    assert 'mode = "yolo"' in text
+    assert 'allow = ["ls:*"]' in text
+    assert "max_output = 100" in text
 
 
 def test_save_settings_with_cmd_roundtrip(tmp_path):
     path = tmp_path / "config.toml"
     s = settings_with(cmd_mode="auto")
-    cmd = CmdPolicy(mode="auto", allow=["ls:*", "git status:*"], timeout=30, max_output=2000)
+    cmd = CmdPolicy(mode="auto", allow=["ls:*", "git status:*"], max_output=2000)
     save_settings(s, path, cmd=cmd)
     text = path.read_text()
     assert "[cmd]" in text
@@ -387,7 +408,6 @@ def test_save_settings_with_cmd_roundtrip(tmp_path):
     loaded = load_cmd_policy(path)
     assert loaded.mode == "auto"
     assert loaded.allow == ["ls:*", "git status:*"]
-    assert loaded.timeout == 30
     assert loaded.max_output == 2000
 
 
@@ -433,7 +453,7 @@ def test_persist_settings_syncs_cmd_mode_without_a_policy_in_hand(tmp_path):
     path = tmp_path / "config.toml"
     save_settings(
         settings_with(), path,
-        cmd=CmdPolicy(mode="ask", allow=["cargo build:*"], timeout=7),
+        cmd=CmdPolicy(mode="ask", allow=["cargo build:*"], max_output=7000),
     )
     ctx = CommandContext(
         session=Session(tmp_path / "s.jsonl", persist=False),
@@ -447,4 +467,4 @@ def test_persist_settings_syncs_cmd_mode_without_a_policy_in_hand(tmp_path):
     policy = load_cmd_policy(path)
     assert policy.mode == "yolo"            # the live setting reached the file
     assert policy.allow == ["cargo build:*"]  # the rest was carried through
-    assert policy.timeout == 7
+    assert policy.max_output == 7000

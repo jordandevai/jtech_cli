@@ -76,8 +76,9 @@ class CommandContext:
         try:
             cmd = self.cmd
             if cmd is None:
-                # No policy in hand: carry the file's existing allow/timeout
-                # through, so a settings write never drops the [cmd] table.
+                # No policy in hand: carry the file's existing allowlist and
+                # output limit through, so a settings write never drops the
+                # [cmd] table.
                 cmd = load_cmd_policy(self.config_path)
             # The live setting is the source of truth for the mode either way.
             cmd.mode = self.settings.cmd_mode

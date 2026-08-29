@@ -208,7 +208,8 @@ class SettingsScreen(_ChatModal[None]):
         try:
             cmd = self._cmd
             if cmd is None:
-                # Preserve allow/timeout entries when no policy was injected.
+                # Preserve the allowlist and output limit when no policy was
+                # injected.
                 cmd = load_cmd_policy(self._config_path)
             cmd.mode = self._settings.cmd_mode
             save_settings(self._settings, self._config_path, cmd=cmd)
