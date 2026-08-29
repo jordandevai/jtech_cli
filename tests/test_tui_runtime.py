@@ -247,6 +247,44 @@ async def test_a_malformed_reply_executes_nothing_and_asks_again():
     assert "line 2" in observation
 
 
+BT3, BT4 = "`" * 3, "`" * 4
+
+
+@pytest.mark.parametrize(
+    ("name", "wrapped"),
+    [
+        ("fenced call", f'Sure!\n\n{BT3}\n{command_call("echo x")}\n{BT3}'),
+        ("fenced multiline call", f'{BT3}\njtech_cmd("""pwd\nls""")\n{BT3}'),
+        ("four-space indented call", f'Sure!\n\n    {command_call("echo x")}'),
+        (
+            "longer fence quoting a shorter one",
+            f'{BT4}\n{BT3}\n{command_call("echo x")}\n{BT3}\n{BT4}',
+        ),
+        (
+            "two wrapped calls sharing a line",
+            f'{BT3}\n{command_call("echo x")} {command_call("echo y")}\n{BT3}',
+        ),
+    ],
+)
+async def test_a_wrapped_call_continues_the_turn_instead_of_ending_it(name, wrapped):
+    """The failure this path exists for: a wrapped call read as a final answer.
+
+    The reply carries no executable call, so without a diagnostic the loop
+    takes it for prose and the turn stops with the model's work unstarted.
+    Each shape here must instead cost a round and come back corrected.
+    """
+    stream, calls = scripted_stream(wrapped, command_call("echo x"), "done")
+    session = Session(persist=False)
+    async with _Harness().run_test() as pilot:
+        runtime, host = make_runtime(pilot.app, stream, session=session)
+        outcome = await runtime.run()
+    assert outcome.final_text == "done", name
+    assert host.authorized == ["echo x"], name
+    assert calls["n"] == 3, name
+    conversation = "\n".join(message["content"] for message in model_messages(session))
+    assert "did not run" in conversation, name
+
+
 async def test_a_mixed_reply_executes_neither_kind():
     stream, _ = scripted_stream(
         f'{command_call("echo x")}\n{dispatch_call()}', "recovered"

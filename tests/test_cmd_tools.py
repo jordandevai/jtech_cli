@@ -64,6 +64,144 @@ def test_prose_and_markdown_examples_are_not_executable():
     assert parse_jtech_reply('<code>pwd\njtech_cmd("ls")</code>').commands == []
 
 
+def test_a_fenced_call_is_reported_rather_than_silently_dropped():
+    """The shape that ended a turn in silence: a wrapped, well-formed call.
+
+    It still must not execute — being told why it did not is what was missing,
+    because a reply with no call and no diagnostic is a final answer.
+    """
+    reply = 'Sure! Let me look.\n\n```\njtech_cmd("ls -la")\n```\n'
+    parsed = parse_jtech_reply(reply)
+    assert parsed.commands == []
+    assert [error.tool_name for error in parsed.errors] == ["jtech_cmd"]
+    assert parsed.errors[0].line == 4
+    assert "did not run" in parsed.errors[0].message
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        '- jtech_cmd("ls")',
+        '* jtech_cmd("ls")',
+        '1. jtech_cmd("ls")',
+        '> jtech_cmd("ls")',
+        '**jtech_cmd("ls")**',
+        '`jtech_cmd("ls")`',
+        'jtech\\_cmd("ls")',
+        'Here:\n<code>jtech_cmd("ls")</code>',
+        '```jtech_cmd("ls")',
+        '```\njtech_cmd("ls"\n```',
+        'Here is the plan.\n\n```bash\njtech_cmd("ls")\n```',
+    ],
+)
+def test_a_lone_decorated_call_is_reported_not_executed(reply):
+    parsed = parse_jtech_reply(reply)
+    assert parsed.commands == []
+    assert [error.tool_name for error in parsed.errors] == ["jtech_cmd"]
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        'Run this next: jtech_cmd("ls")\n\nThen continue.',
+        'The tool is called as jtech_cmd("ls") in this CLI.',
+        '- To run a command, emit `jtech_cmd("ls")` on its own line.',
+        'Run this:\n\n```cmd\npwd\n```',
+        '```\n_JTECH_CMD = "jtech_cmd"\n```',
+        "Nothing to run here.",
+    ],
+)
+def test_a_mention_inside_prose_stays_ordinary_commentary(reply):
+    """Only a line that is a call and nothing else is a near miss.
+
+    Prose around the call is how the protocol gets discussed at all, so a
+    sentence that merely names a tool must never become a diagnostic.
+    """
+    parsed = parse_jtech_reply(reply)
+    assert parsed.commands == []
+    assert parsed.errors == []
+
+
+BT3, BT4, TL3, TL4 = "`" * 3, "`" * 4, "~" * 3, "~" * 4
+
+
+@pytest.mark.parametrize(
+    ("name", "reply"),
+    [
+        ("longer backtick fence quotes a shorter one",
+         f'{BT4}\n{BT3}\njtech_cmd("echo x")\n{BT3}\n{BT4}'),
+        ("longer tilde fence quotes a shorter one",
+         f'{TL4}\n{TL3}\njtech_cmd("echo x")\n{TL3}\n{TL4}'),
+        ("tilde fence", f'{TL3}\njtech_cmd("echo x")\n{TL3}'),
+        ("fence carrying an info string", f'{BT3}python\njtech_cmd("echo x")\n{BT3}'),
+        ("fence indented inside a list item",
+         f'- Example:\n\n  {BT3}\n  jtech_cmd("echo x")\n  {BT3}\n'),
+        ("four-space indented code block", 'Example:\n\n    jtech_cmd("echo x")\n'),
+        ("tab indented code block", 'Example:\n\n\tjtech_cmd("echo x")\n'),
+    ],
+)
+def test_every_markdown_code_block_form_is_inert_and_reported(name, reply):
+    """A code block is a code block however Markdown spells it.
+
+    Closing a four-backtick fence on a three-backtick line, or missing tildes
+    and indentation entirely, hands the block's contents to the scanner as
+    executable text — the model can then be made to run a command by quoting
+    one.
+    """
+    parsed = parse_jtech_reply(reply)
+    assert parsed.commands == [], name
+    assert [error.tool_name for error in parsed.errors] == ["jtech_cmd"], name
+
+
+@pytest.mark.parametrize(
+    ("name", "reply", "tool"),
+    [
+        ("multiline command", f'{BT3}\njtech_cmd("""pwd\nls -la""")\n{BT3}', "jtech_cmd"),
+        ("multiline task",
+         f'{BT3}\njtech_agent("a", "A", "local", "t", """Do\nthis""")\n{BT3}',
+         "jtech_agent"),
+        ("two calls sharing a line",
+         f'{BT3}\njtech_cmd("ls") jtech_cmd("pwd")\n{BT3}', "jtech_cmd"),
+    ],
+)
+def test_a_wrapped_call_is_reported_whatever_shape_it_takes(name, reply, tool):
+    """Recognition must not depend on the wrapped call parsing on one line.
+
+    These are supported shapes — the system prompt documents multiline calls
+    and several calls per line — so failing to recognize them wrapped leaves
+    the reply with no call and no diagnostic, which ends the turn in silence.
+    """
+    parsed = parse_jtech_reply(reply)
+    assert parsed.commands == [], name
+    assert parsed.dispatches == [], name
+    assert [error.tool_name for error in parsed.errors] == [tool], name
+
+
+def test_a_call_must_start_at_column_zero_to_run():
+    """Indentation is a code block, so it cannot also be permitted whitespace."""
+    assert parse_jtech_reply('jtech_cmd("ls")').commands == ["ls"]
+    assert parse_jtech_reply('jtech_cmd("""pwd\nls""")').commands == ["pwd\nls"]
+    assert parse_jtech_reply('jtech_cmd("ls") jtech_cmd("pwd")').commands == [
+        "ls",
+        "pwd",
+    ]
+    indented = parse_jtech_reply('  jtech_cmd("ls")')
+    assert indented.commands == []
+    assert [error.tool_name for error in indented.errors] == ["jtech_cmd"]
+
+
+def test_a_wrapped_example_never_blocks_a_real_call_in_the_same_reply():
+    """A near miss is reported only when the reply ran nothing.
+
+    Something executed means the turn continues and the model sees output, so
+    a diagnostic would cost a round without preventing any silence.
+    """
+    reply = 'Like this:\n\n```\njtech_cmd("ls")\n```\n\njtech_cmd("pwd")'
+    parsed = parse_jtech_reply(reply)
+    assert parsed.commands == ["pwd"]
+    assert parsed.errors == []
+
+
 def test_command_prefix_can_include_commentary_after_blank_line():
     reply = 'jtech_cmd("pwd && ls -la")\n\nLet me inspect the project structure next.'
     parsed = parse_jtech_reply(reply)
@@ -184,9 +322,17 @@ def test_dispatch_fields_are_stripped_not_truncated():
 
 
 def test_dispatch_examples_inside_code_blocks_stay_inert():
+    """Inert means not executed — for a fenced call it does not mean unreported.
+
+    A fence around a whole, well-formed call is the model asking for a tool it
+    will not get, so it is refused out loud. An inline mention inside a
+    sentence is ordinary prose and stays silent.
+    """
     fenced = f"Example:\n\n```\n{DISPATCH}\n```\n"
     assert parse_jtech_reply(fenced).dispatches == []
-    assert parse_jtech_reply(fenced).errors == []
+    assert [error.tool_name for error in parse_jtech_reply(fenced).errors] == [
+        "jtech_agent"
+    ]
     inline = f"Call it like {DISPATCH} when you delegate."
     assert parse_jtech_reply(inline).dispatches == []
     assert parse_jtech_reply(inline).errors == []

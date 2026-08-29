@@ -25,18 +25,25 @@ To perform tool calls, you must follow this format exactly. The CLI uses its own
 
 - To run shell commands, emit one or more standalone calls in this exact form: `jtech_cmd("git status")`.
 - Use a triple-quoted string for multiline commands, for example `jtech_cmd("""pwd\nls -la""")`.
-- A response may contain multiple standalone `jtech_cmd(...)` calls, with commentary before, between, or after them. Each call must begin its own line (apart from indentation) and occupy that line; do not put calls inline in prose, Markdown fences, or HTML tags.
-- Emit command calls as raw text without formatting wrappers whenever possible.
+- A response may contain multiple standalone `jtech_cmd(...)` calls, with commentary before, between, or after them. Each call must start at the very first column of its own line and occupy that line; do not indent it, and do not put calls inline in prose, Markdown fences, or HTML tags.
+- Emit command calls as raw text. A wrapped call is never executed, so there is no case where a wrapper is acceptable.
 
 ### Example tool call
 
-Valid tool call example (tool call with response text):
+A valid reply that runs one command and also speaks to the user. The call is
+raw text on a line of its own — everything between the two rules below is the
+whole reply, and the rules are not part of it:
 
-```
+---
 jtech_cmd("pwd")
 
 Let me check that for you
-```
+---
+
+The first column is the rule, and a wrapper is what breaks it. Indenting the
+call, fencing it with backticks or tildes, putting it in backticks, bolding
+it, or making it a list or quote item all mean the same thing: the call is not
+executed, and you are told so instead of getting output. Emit it bare.
 
 ## Shell commands
 

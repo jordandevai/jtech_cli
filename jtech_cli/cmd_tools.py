@@ -339,6 +339,88 @@ def _tool_name_at(text: str, position: int) -> str | None:
     return None
 
 
+#: Characters that may surround a wrapped call without being part of it:
+#: list bullets and their numbering, quote markers, emphasis, and code spans.
+#: Deliberately excludes letters — prose is how the protocol gets discussed,
+#: and a sentence naming a tool must stay a sentence.
+_DECORATION_CHARS = frozenset(" \t>`*_-+.)#0123456789")
+_HTML_CODE_TAG = re.compile(r"</?code\b[^>]*>", re.IGNORECASE)
+#: An opening code fence: three or more backticks or tildes. Both the marker
+#: character and its length are state, because a longer fence quotes a shorter
+#: one — a three-backtick line inside a four-backtick block is content, and
+#: closing on it hands the rest of the block to the scanner as executable text.
+_FENCE_OPEN = re.compile(r"^(`{3,}|~{3,})")
+#: Why a recognized call did not run, as the model is told it.
+_FENCE_CONTEXT = "was written inside a code fence"
+_HTML_CODE_CONTEXT = "was written inside an HTML code block"
+_DECORATION_CONTEXT = "was indented or wrapped in Markdown formatting"
+
+
+def _wrapped_call_name(line: str) -> str | None:
+    """The tool this line opens a call to behind decoration, else ``None``.
+
+    Recognition stops at the opening ``(``: it deliberately does not parse the
+    call. A wrapped call may be multiline, may share its line with a second
+    call, or may be malformed, and every one of those is still the model
+    asking for a tool it will not get. Requiring a complete parse here returns
+    ``None`` for exactly those shapes and leaves them silent, which is the
+    failure this whole path exists to prevent.
+
+    What discriminates is the *prefix*: HTML code tags and Markdown underscore
+    escaping are undone, then everything before the tool name must be
+    decoration. Letters are not decoration, so a mention inside a sentence —
+    ``Run this next: jtech_cmd("ls")`` — is commentary, and stays commentary.
+    """
+    text = _HTML_CODE_TAG.sub("", line.replace("\\_", "_"))
+    for start, char in enumerate(text):
+        if char in _DECORATION_CHARS:
+            continue
+        name = _tool_name_at(text, start)
+        if name is None:
+            return None
+        # A bare word is prose ("jtech_cmd runs shell commands"); the opening
+        # paren is what makes the line a call the model expected to run.
+        after = _skip_ws(text, start + len(name))
+        return name if after < len(text) and text[after] == "(" else None
+    return None
+
+
+def _near_miss_message(tool_name: str, context: str) -> str:
+    """What the model must change to turn a wrapped call into a running one."""
+    return (
+        f"{tool_name} {context}, so it did not run. A call executes only as "
+        "raw text starting at the very first column of its own line, with no "
+        "indent, fence, code span, list marker, quote marker, or emphasis "
+        "around it. If you meant to show the syntax rather than run it, "
+        "describe it in a sentence instead."
+    )
+
+
+def _near_miss_errors(
+    text: str, skipped: Sequence[tuple[int, str]], base_line: int
+) -> list[ToolProtocolError]:
+    """Diagnostics for calls that were skipped because something wrapped them.
+
+    Only for a reply that ran nothing: silence is the failure being prevented,
+    and a reply that executed a call is never silent.
+    """
+    errors: list[ToolProtocolError] = []
+    for position, context in skipped:
+        line_end = text.find("\n", position)
+        line = text[position:] if line_end < 0 else text[position:line_end]
+        tool_name = _wrapped_call_name(line)
+        if tool_name is None:
+            continue
+        errors.append(
+            ToolProtocolError(
+                tool_name,
+                base_line + text.count("\n", 0, position) + 1,
+                _near_miss_message(tool_name, context),
+            )
+        )
+    return errors
+
+
 def _unwrap_html_code(text: str) -> tuple[str, int]:
     """Remove one whole-response HTML code wrapper, and count the lines it hid.
 
@@ -360,11 +442,22 @@ def _unwrap_html_code(text: str) -> tuple[str, int]:
 
 
 def _scan_source(reply: str) -> tuple[str, int]:
-    """The text to scan, and how many reply lines precede its first line."""
-    stripped = reply.strip()
-    lead = len(reply) - len(reply.lstrip())
-    text, wrapper_lines = _unwrap_html_code(stripped)
-    return text, reply.count("\n", 0, lead) + wrapper_lines
+    """The text to scan, and how many reply lines precede its first line.
+
+    Only whole blank lines come off the front. A call's column is part of the
+    contract, so trimming the first line's own indentation would quietly move
+    it to column zero and run an indented code block that happened to be all
+    the model said.
+    """
+    trailing = reply.rstrip()
+    lead = 0
+    while True:
+        line_end = trailing.find("\n", lead)
+        if line_end < 0 or trailing[lead:line_end].strip():
+            break
+        lead = line_end + 1
+    text, wrapper_lines = _unwrap_html_code(trailing[lead:])
+    return text, trailing.count("\n", 0, lead) + wrapper_lines
 
 
 def _parse_call_at(text: str, start: int) -> _ToolCall:
@@ -437,17 +530,19 @@ def _parse_call_line(text: str, start: int) -> tuple[list[_ToolCall], int] | Non
     Returns the calls and the next scan position, or ``None`` when the line is
     not a tool-call candidate at all — that is ordinary commentary.
 
+    The call must start at column zero. Indentation is not decoration the
+    scanner can see past: four spaces *is* a Markdown code block, and no
+    amount of fence tracking catches a code block that has no fence. Making
+    the first column the whole rule keeps one contract for the model to follow
+    and leaves an indented call to the near-miss diagnostic.
+
     Raises:
         _CallSyntaxError: if a candidate line is malformed or carries trailing
             text that is not another call.
     """
-    line_end = text.find("\n", start)
-    if line_end < 0:
-        line_end = len(text)
-    line = text[start:line_end]
-    position = start + len(line) - len(line.lstrip(" \t"))
-    if _tool_name_at(text, position) is None:
+    if _tool_name_at(text, start) is None:
         return None
+    position = start
 
     calls: list[_ToolCall] = []
     while True:
@@ -473,16 +568,24 @@ def _parse_call_line(text: str, start: int) -> tuple[list[_ToolCall], int] | Non
 def parse_jtech_reply(reply: str) -> ParsedReply:
     """Parse standalone tool-call lines anywhere in a reply.
 
-    A call must begin a line (apart from indentation) and occupy the rest of
-    that line, although several calls may share one line. This permits
-    commentary before, between, and after calls without executing inline
-    examples. Markdown fences and HTML ``<code>`` blocks are inert; a
-    whole-response ``<code>`` wrapper remains supported for either tool.
+    A call must start at column zero and occupy the rest of that line,
+    although several calls may share one line. This permits commentary before,
+    between, and after calls without executing inline examples. Code blocks
+    are inert in every form Markdown gives them — backtick and tilde fences of
+    any marker length, and indentation, which needs no fence at all — as are
+    HTML ``<code>`` blocks; a whole-response ``<code>`` wrapper remains
+    supported for either tool.
 
     A line that opens with a tool name but is malformed, mis-typed, wrongly
     sized, or followed by other text becomes a :class:`ToolProtocolError`
     rather than silently reverting to commentary — the model asked for a tool
     and is told exactly why it did not run.
+
+    A reply that runs nothing gets the same treatment for a call some wrapper
+    hid: an indented, fenced, bulleted, quoted, or emphasized call is still
+    refused, but it is reported rather than dropped, because a reply with no
+    call and no diagnostic reads as a final answer and ends the turn in
+    silence.
     """
     text, base_line = _scan_source(reply)
     if not text:
@@ -492,12 +595,17 @@ def parse_jtech_reply(reply: str) -> ParsedReply:
     dispatches: list[AgentDispatch] = []
     errors: list[ToolProtocolError] = []
     spans: list[tuple[int, int]] = []
+    # Position and wrapper kind of every line the scan passes over. Recorded
+    # unconditionally because the scan owns the fence/HTML state a second pass
+    # would have to duplicate; nothing is parsed unless the reply ran nothing.
+    skipped: list[tuple[int, str]] = []
 
     def line_of(position: int) -> int:
         return base_line + text.count("\n", 0, position) + 1
 
     position = 0
-    in_fence = False
+    # The open fence's marker character and length, or None outside a fence.
+    fence: tuple[str, int] | None = None
     in_html_code = False
     while position < len(text):
         line_end = text.find("\n", position)
@@ -507,22 +615,30 @@ def parse_jtech_reply(reply: str) -> ParsedReply:
         stripped = line.strip()
         lower = stripped.lower()
 
-        if in_fence:
-            if stripped.startswith("```"):
-                in_fence = False
+        if fence is not None:
+            marker, size = fence
+            # A closing fence is the same character, at least as long as the
+            # opening one, and carries nothing else on its line.
+            if len(stripped) >= size and set(stripped) == {marker}:
+                fence = None
+            skipped.append((position, _FENCE_CONTEXT))
             position = line_end + (line_end < len(text))
             continue
         if in_html_code:
             if "</code>" in lower:
                 in_html_code = False
+            skipped.append((position, _HTML_CODE_CONTEXT))
             position = line_end + (line_end < len(text))
             continue
-        if stripped.startswith("```"):
-            in_fence = True
+        opening = _FENCE_OPEN.match(stripped)
+        if opening is not None:
+            fence = (stripped[0], len(opening.group()))
+            skipped.append((position, _FENCE_CONTEXT))
             position = line_end + (line_end < len(text))
             continue
         if "<code" in lower:
             in_html_code = "</code>" not in lower
+            skipped.append((position, _HTML_CODE_CONTEXT))
             position = line_end + (line_end < len(text))
             continue
 
@@ -535,6 +651,7 @@ def parse_jtech_reply(reply: str) -> ParsedReply:
             position = line_end + (line_end < len(text))
             continue
         if parsed_line is None:
+            skipped.append((position, _DECORATION_CONTEXT))
             position = line_end + (line_end < len(text))
             continue
         line_calls, next_position = parsed_line
@@ -552,7 +669,15 @@ def parse_jtech_reply(reply: str) -> ParsedReply:
         position = next_position
 
     if not spans:
-        return ParsedReply(commands, text, dispatches, errors)
+        # Nothing executed, so nothing keeps the turn alive. An existing
+        # diagnostic already says why; otherwise a wrapped call is the one
+        # remaining explanation worth giving.
+        return ParsedReply(
+            commands,
+            text,
+            dispatches,
+            errors or _near_miss_errors(text, skipped, base_line),
+        )
 
     masked = list(text)
     for start, end in spans:
