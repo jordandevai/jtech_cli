@@ -129,6 +129,7 @@ class SettingsScreen(_ChatModal[None]):
     )
     _HINT_IDLE = "↑/↓ move · Enter edit · Esc close"
     _HINT_EDITING = "Enter save · Esc cancel"
+    _HINT_PROMPT_EDITING = "Enter save · Shift+Enter newline · Esc cancel"
 
     def __init__(
         self,
@@ -178,11 +179,13 @@ class SettingsScreen(_ChatModal[None]):
         editor: _FieldInput | _PromptEditor
         if key == "system_prompt":
             editor = _PromptEditor(self._row_value(key), id="settings-field")
+            hint = self._HINT_PROMPT_EDITING
         else:
             editor = _FieldInput(self._row_value(key), id="settings-field")
+            hint = self._HINT_EDITING
         await self.query_one("#settings-editor", Vertical).mount(editor)
         self._row = key
-        self._set_hint(self._HINT_EDITING)
+        self._set_hint(hint)
         editor.focus()
 
     def on_field_commit(self, _event: FieldCommit) -> None:

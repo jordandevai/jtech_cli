@@ -191,9 +191,14 @@ error rather than resolved by guessing which endpoint was meant.
   - `tail` — show only the last 500 characters of the reasoning
   - `always` — keep the full reasoning visible after the reply
 - **Pinned input**: a single bordered input line at the bottom, above the
-  status line. Press `Enter`/`Ctrl+Enter` to submit, or `Shift+Enter` to open
-  the multi-line editor pre-filled with the current text (typing `'''` is an
-  alias); in multi-line mode `Ctrl+Enter` submits and `Esc` cancels.
+  status line. `Enter` submits and `Shift+Enter` inserts a newline. The first
+  `Shift+Enter` opens the multi-line editor and creates the line in the same
+  keypress, carrying the current text across unchanged; in the editor `Enter`
+  submits, `Shift+Enter` adds another line, and `Esc` cancels.
+- **Multi-line paste**: pasting text that contains a line break — from the
+  terminal or from `Ctrl+V` — opens the multi-line editor with every line
+  intact, replacing the selection if there is one. A paste never submits by
+  itself; review or edit it, then press `Enter`.
 - **Esc to stop**: pressing `Esc` while a reply is streaming aborts the
   generation and discards the partial bubble (with a dim "Generation stopped."
   note). It applies to Primary's own work, and only while Primary is selected;
@@ -245,9 +250,8 @@ error rather than resolved by guessing which endpoint was meant.
 
 | Key | Action |
 | --- | --- |
-| `Enter` / `Ctrl+Enter` | Submit input |
-| `Shift+Enter` | Open multi-line editor (current text pre-filled) |
-| `'''` | Begin / end multi-line input |
+| `Enter` | Submit input · submit the multi-line editor |
+| `Shift+Enter` | Insert a newline (the first one opens the multi-line editor) |
 | `Esc` | Cancel multi-line editor · stop a reply while it streams |
 | `Ctrl+S` | Open settings dialog |
 | `Ctrl+L` | Clear the chat (refused while a subagent is selected) |
@@ -263,7 +267,7 @@ error rather than resolved by guessing which endpoint was meant.
 | `/help` | Show help |
 | `/clear` | Clear history |
 | `/read PATH[:LINE]` | Print a file with line numbers (`main.py:10-40`) |
-| `/write PATH` | Write content to a file |
+| `/write PATH` | Write content to a file (`Shift+Enter` newline, `Enter` writes) |
 | `/diff PATH` | Create a temp copy of a file to diff against |
 | `/set KEY VALUE` | Change a global setting: temperature / theme / reasoning / cmd_mode / debug_level |
 | `/settings` | Open the settings dialog (also Ctrl+S) |
@@ -276,8 +280,8 @@ error rather than resolved by guessing which endpoint was meant.
 | `/stats` | Show history size, tokens, and context usage |
 | `/render` | Re-render the last reply as Markdown |
 
-Multi-line input: press `Shift+Enter` (or type `'''`), edit, then `Ctrl+Enter`
-with `'''` on its own line to finish.
+Multi-line input: press `Shift+Enter` to add a line, then `Enter` to send. No
+closing line is needed.
 
 ## Project structure
 

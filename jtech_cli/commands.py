@@ -31,18 +31,25 @@ from jtech_cli.prompts import INSTRUCTIONS_HELP, PromptSourceError
 from jtech_cli.session import Session
 from jtech_cli.theme import VALID_THEMES
 
-EnterMultiline = Callable[[str], Awaitable[str]]
+# ``None`` is a cancelled editor. It is not ``""``: an empty submission is a
+# real instruction, and only the caller can decide what each one means.
+EnterMultiline = Callable[[], Awaitable[str | None]]
 SwitchProfile = Callable[[str], Awaitable[None]]
 EffectivePrompt = Callable[[], str]
 Handler = Callable[["CommandContext", str], None | Awaitable[None]]
 
-WRITE_USAGE = "Usage: /write PATH  then paste content, end with a line containing only: END"
+WRITE_USAGE = "Usage: /write PATH  then edit content — Shift+Enter newline, Enter write"
 NO_PROFILE = "No API profile is configured — run /profiles to add one."
 
 
-async def _no_multiline(_terminator: str) -> str:
-    """Default multi-line reader: no editor available (standalone/test contexts)."""
-    return ""
+async def _no_multiline() -> str | None:
+    """Refuse to answer for a host that provides no multi-line editor.
+
+    Returning ``""`` would be a fabricated empty submission and ``None`` a
+    fabricated cancellation; both are silent wrong answers to "what did the
+    user type", and one of them writes a file.
+    """
+    raise RuntimeError("Multi-line input is unavailable in this context.")
 
 
 async def _no_profile_switch(_name: str) -> None:
@@ -149,8 +156,11 @@ def build_registry(ctx: CommandContext) -> CommandRegistry:
         if not arg:
             c.print(WRITE_USAGE)
             return
-        c.print("Paste content, then end with a line containing only: END")
-        content = await ctx.enter_multiline("END")
+        c.print("Enter content — Shift+Enter adds a newline, Enter writes the file.")
+        content = await ctx.enter_multiline()
+        if content is None:
+            c.print("Write cancelled.")
+            return
         c.print(file_tools.cmd_write(arg, content))
 
     def cmd_diff(_: CommandContext, arg: str) -> None:

@@ -3,7 +3,7 @@
 import pytest
 from rich.console import Console
 
-from jtech_cli.commands import CommandContext, build_registry
+from jtech_cli.commands import CommandContext, _no_multiline, build_registry
 from jtech_cli.config import Profile, ProfileError, Profiles, Settings
 from jtech_cli.prompts import DEFAULT_SYSTEM_PROMPT
 from jtech_cli.session import Session
@@ -22,7 +22,7 @@ def local_settings(**kwargs) -> Settings:
     return Settings(profiles=Profiles(items=(LOCAL,), active_name="local"), **kwargs)
 
 
-async def _multiline_stub(_terminator: str) -> str:
+async def _multiline_stub() -> str:
     return "pasted"
 
 
@@ -193,15 +193,55 @@ def test_set_theme_persists(tmp_path):
 
 
 async def test_write_uses_multiline_reader(tmp_path):
-    captured = []
-    async def reader(term):
-        captured.append(term)
+    calls = []
+    async def reader():
+        calls.append(None)
         return "hello\nworld"
     ctx, _console = make_ctx(tmp_path, multiline=reader)
     reg = build_registry(ctx)
     await reg.handle(f"/write {tmp_path / 'out.txt'}")
-    assert captured == ["END"]
+    assert len(calls) == 1
     assert (tmp_path / "out.txt").read_text() == "hello\nworld"
+
+
+async def test_write_cancelled_never_reaches_the_writer(tmp_path, monkeypatch):
+    """``None`` is a cancel: the file writer must not be called at all."""
+    written = []
+    monkeypatch.setattr(
+        "jtech_cli.commands.file_tools.cmd_write",
+        lambda path_arg, content: written.append((path_arg, content)) or "",
+    )
+    async def reader():
+        return None
+    target = tmp_path / "out.txt"
+    ctx, console = make_ctx(tmp_path, multiline=reader)
+    reg = build_registry(ctx)
+    await reg.handle(f"/write {target}")
+    assert written == []
+    assert not target.exists()
+    assert "Write cancelled." in output(console)
+
+
+async def test_write_empty_submission_still_writes_an_empty_file(tmp_path):
+    """Submitting an empty editor is a real instruction, unlike cancelling."""
+    async def reader():
+        return ""
+    target = tmp_path / "out.txt"
+    ctx, console = make_ctx(tmp_path, multiline=reader)
+    reg = build_registry(ctx)
+    await reg.handle(f"/write {target}")
+    assert target.read_text() == ""
+    assert "Write cancelled." not in output(console)
+
+
+async def test_write_without_an_editor_raises_instead_of_guessing(tmp_path):
+    """A host that injected no editor gets an error, not a fabricated result."""
+    target = tmp_path / "out.txt"
+    ctx, _console = make_ctx(tmp_path, multiline=_no_multiline)
+    reg = build_registry(ctx)
+    with pytest.raises(RuntimeError, match="Multi-line input is unavailable"):
+        await reg.handle(f"/write {target}")
+    assert not target.exists()
 
 
 def test_read_prints_file(tmp_path):

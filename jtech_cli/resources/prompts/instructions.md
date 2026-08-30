@@ -4,7 +4,7 @@ Available slash commands:
   /help              Show this help
   /clear             Clear conversation history
   /read PATH[:LINE]  Print a file with line numbers. Line range like main.py:10-40 or main.py:10
-  /write PATH        Write content to a file. Paste content, then end with a line containing only: END
+  /write PATH        Write content to a file. Shift+Enter adds a newline, Enter writes it
   /diff PATH         Show a diff between PATH and a temp copy (useful before applying changes)
   /set KEY VALUE     Change a global setting: temperature, theme, reasoning, cmd_mode,
                      debug_level. The endpoint and model belong to a profile, not here.
@@ -69,10 +69,11 @@ Available slash commands:
 
 Keys:
   /                  Command menu: type /, then ↑/↓ to pick, Enter runs it, Tab completes
-  Enter / Ctrl+Enter Submit input (single-line mode)
-  Shift+Enter        Open the multi-line editor, pre-filled with the current text
-  '''                Begin / end multi-line input (alias for Shift+Enter)
-  Ctrl+Enter         Submit accumulated multi-line text
+  Enter              Submit the input, or the multi-line editor
+  Shift+Enter        Insert a newline; the first one opens the multi-line editor
+                     and carries the current text across unchanged
+  Paste              Pasted text containing a line break opens the multi-line
+                     editor with every line intact; it never submits by itself
    Esc                Cancel the multi-line editor; stop a reply while it streams
    Enter (AI is       Queue the message: shown as a dim "Queued" line (count in
    replying)           the status bar); queued messages send in order once the

@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 
 import pytest
+from textual import events
 from textual.containers import Vertical
 from textual.geometry import Offset
 from textual.widgets import Input, ListView, Markdown, Static, TextArea
@@ -436,22 +437,61 @@ async def test_settings_esc_cancels_edit_then_closes(tmp_path):
 
 
 async def test_settings_system_prompt_edits_multiline(tmp_path):
+    """The newline is typed, not assigned: Shift+Enter makes it, Enter saves."""
     app = make_app(tmp_path)
+    before = app.settings.system_prompt
     async with app.run_test(size=(80, 24)) as pilot:
-        app.action_settings()
-        await pilot.pause()
+        ta = await open_prompt_editor(app, pilot)
+        ta.text = "line one"
+        ta.selection = AreaSelection.cursor((0, len("line one")))
+        await settle(pilot)
 
-        await pilot.press("down", "down", "down")  # System prompt is row 3
-        await pilot.pause()
+        await pilot.press("shift+enter")
+        await type_text(pilot, "line two")
+        await settle(pilot)
+
+        # Shift+Enter edits; it must not save or close.
+        assert ta.text == "line one\nline two"
+        assert app.screen.query_one("#settings-field", TextArea) is ta
+        assert app.settings.system_prompt == before
+        assert not (tmp_path / "config.toml").exists()
+        assert hint_text(app) == SettingsScreen._HINT_PROMPT_EDITING
+
         await pilot.press("enter")
-        await pilot.pause()
-        ta = app.screen.query_one("#settings-field", TextArea)
-        ta.text = "line one\nline two"
-        await pilot.press("enter")
-        await pilot.pause()
+        await settle(pilot)
         assert app.settings.system_prompt == "line one\nline two"
         assert app.settings.prompt_source == "inline"
         assert not app.screen.query_one("#settings-editor", Vertical).children
+
+
+async def test_settings_single_line_row_keeps_its_own_hint(tmp_path):
+    app = make_app(tmp_path)
+    async with app.run_test(size=(80, 24)) as pilot:
+        app.action_settings()
+        await settle(pilot)
+        await pilot.press("enter")  # Temperature is a single-line row
+        await settle(pilot)
+
+        assert app.screen.query_one("#settings-field", Input) is not None
+        assert hint_text(app) == SettingsScreen._HINT_EDITING
+
+
+async def test_settings_prompt_editor_keeps_every_pasted_line(tmp_path):
+    """Native TextArea paste already preserves lines; no custom handler here."""
+    app = make_app(tmp_path)
+    async with app.run_test(size=(80, 24)) as pilot:
+        ta = await open_prompt_editor(app, pilot)
+        ta.text = ""
+        await settle(pilot)
+
+        app.post_message(events.Paste("line one\nline two"))
+        await settle(pilot)
+        assert ta.text == "line one\nline two"
+        assert app.settings.system_prompt != "line one\nline two"
+
+        await pilot.press("enter")
+        await settle(pilot)
+        assert app.settings.system_prompt == "line one\nline two"
 
 
 async def test_input_works_after_opening_and_closing_settings(tmp_path, monkeypatch):
@@ -535,13 +575,102 @@ async def _enter_multiline(app, pilot, trigger: str) -> "TextArea":
     return app.query_one("#multiline-input", TextArea)
 
 
+async def type_text(pilot, text: str) -> None:
+    """Type ``text`` a key at a time, so the widget sees real key events."""
+    for char in text:
+        await pilot.press("space" if char == " " else char)
+
+
+async def open_prompt_editor(app, pilot) -> "TextArea":
+    """Open the settings system-prompt row in its multi-line editor."""
+    app.action_settings()
+    for _ in range(6):
+        await pilot.pause()
+    await pilot.press("down", "down", "down")  # System prompt is row 3
+    for _ in range(6):
+        await pilot.pause()
+    await pilot.press("enter")
+    for _ in range(6):
+        await pilot.pause()
+    return app.screen.query_one("#settings-field", TextArea)
+
+
+async def deliver_paste(app, pilot, source: str, text: str) -> None:
+    """Paste ``text`` the way the terminal or Ctrl+V would deliver it."""
+    if source == "terminal":
+        app.post_message(events.Paste(text))
+    else:
+        app.copy_to_clipboard(text)
+        await settle(pilot)
+        await pilot.press("ctrl+v")
+    await settle(pilot)
+
+
+def select_input_range(inp: Input, start: int, end: int) -> None:
+    """Select ``value[start:end]``; pass start > end for a reverse drag."""
+    inp.selection = InputSelection(start, end)
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+async def test_multiline_shift_enter_replaces_the_selection(tmp_path, reverse):
+    """Shift+Enter is an edit: the selection becomes the newline, undoably."""
+    app = make_app(tmp_path)
+    async with app.run_test(size=(80, 24)) as pilot:
+        ta = await _enter_multiline(app, pilot, "'''")
+        ta.text = "alpha beta"
+        head, tail = (0, 6), (0, 10)
+        ta.selection = AreaSelection(tail, head) if reverse else AreaSelection(head, tail)
+        await settle(pilot)
+
+        await pilot.press("shift+enter")
+        await settle(pilot)
+
+        assert ta.text == "alpha \n"
+        assert ta.selection == AreaSelection.cursor((1, 0))
+        assert app.session.messages == []
+
+        await pilot.press("ctrl+z")
+        await settle(pilot)
+        assert ta.text == "alpha beta"
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+async def test_prompt_editor_shift_enter_replaces_the_selection(tmp_path, reverse):
+    """The settings editor shares the same newline action, undo included."""
+    app = make_app(tmp_path)
+    before = app.settings.system_prompt
+    async with app.run_test(size=(80, 24)) as pilot:
+        ta = await open_prompt_editor(app, pilot)
+        ta.text = "alpha beta"
+        head, tail = (0, 6), (0, 10)
+        ta.selection = AreaSelection(tail, head) if reverse else AreaSelection(head, tail)
+        await settle(pilot)
+
+        await pilot.press("shift+enter")
+        await settle(pilot)
+
+        assert ta.text == "alpha \n"
+        assert ta.selection == AreaSelection.cursor((1, 0))
+        assert app.settings.system_prompt == before
+
+        await pilot.press("ctrl+z")
+        await settle(pilot)
+        assert ta.text == "alpha beta"
+
+
 async def test_heredoc_multiline_sends_message(tmp_path, monkeypatch):
     app = make_app(tmp_path)
     monkeypatch.setattr("jtech_cli.tui.stream_reply", lambda profile, temperature, messages: iter(["ok"]))
     async with app.run_test() as pilot:
         ta = await _enter_multiline(app, pilot, "'''")
-        ta.text = "line one\nline two\n'''"
-        await pilot.press("ctrl+enter")
+        await type_text(pilot, "line one")
+        await pilot.press("shift+enter")
+        await type_text(pilot, "line two")
+        await settle(pilot)
+        assert ta.text == "line one\nline two"
+        assert app.session.messages == []
+
+        await pilot.press("enter")
         for _ in range(10):
             await pilot.pause()
 
@@ -557,14 +686,98 @@ async def test_write_multiline_writes_file(tmp_path):
     app = make_app(tmp_path)
     async with app.run_test() as pilot:
         ta = await _enter_multiline(app, pilot, f"/write {tmp_path / 'out.txt'}")
-        ta.text = "hello\nworld\nEND"
-        await pilot.press("ctrl+enter")
+        await type_text(pilot, "hello")
+        await pilot.press("shift+enter")
+        await type_text(pilot, "world")
+        await settle(pilot)
+        assert ta.text == "hello\nworld"
+
+        await pilot.press("enter")
         for _ in range(10):
             await pilot.pause()
 
         assert (tmp_path / "out.txt").read_text() == "hello\nworld"
         assert app.query_one("#input", Input) is not None
         assert not list(app.query("#multiline-input"))
+
+
+async def test_write_multiline_esc_writes_nothing(tmp_path):
+    """Esc is a cancel, not an empty submission: no create, no truncate."""
+    app = make_app(tmp_path)
+    async with app.run_test() as pilot:
+        missing = tmp_path / "missing.txt"
+        existing = tmp_path / "existing.txt"
+        existing.write_text("keep me")
+
+        await _enter_multiline(app, pilot, f"/write {missing}")
+        await type_text(pilot, "discarded")
+        await pilot.press("escape")
+        for _ in range(10):
+            await pilot.pause()
+        assert not missing.exists()
+
+        await _enter_multiline(app, pilot, f"/write {existing}")
+        await pilot.press("escape")
+        for _ in range(10):
+            await pilot.pause()
+        assert existing.read_text() == "keep me"
+
+        assert app.query_one("#input", Input).display is True
+        assert not list(app.query("#multiline-input"))
+
+
+async def test_write_multiline_empty_submission_creates_an_empty_file(tmp_path):
+    """Enter on an empty editor is a choice the TUI must pass through."""
+    app = make_app(tmp_path)
+    async with app.run_test() as pilot:
+        target = tmp_path / "empty.txt"
+        ta = await _enter_multiline(app, pilot, f"/write {target}")
+        assert ta.text == ""
+
+        await pilot.press("enter")
+        for _ in range(10):
+            await pilot.pause()
+
+        assert target.read_text() == ""
+
+
+@pytest.mark.parametrize("source", ["terminal", "clipboard"])
+async def test_multiline_paste_promotes_the_whole_draft(tmp_path, source):
+    """A pasted line break expands the editor; nothing is lost and nothing sends."""
+    app = make_app(tmp_path)
+    async with app.run_test(size=(80, 24)) as pilot:
+        inp = app.query_one("#input", Input)
+        inp.value = "prefix DROP suffix"
+        inp.focus()
+        # Reverse selection with a live suffix: the hard case for the caret.
+        select_input_range(inp, len("prefix DROP"), len("prefix "))
+        await settle(pilot)
+
+        await deliver_paste(app, pilot, source, "one\ntwo")
+
+        assert inp.display is False
+        assert len(list(app.query("#multiline-input"))) == 1
+        ta = app.query_one("#multiline-input", TextArea)
+        assert ta.text == "prefix one\ntwo suffix"
+        assert ta.selection == AreaSelection.cursor((1, len("two")))
+        assert app.session.messages == []
+
+
+async def test_single_line_terminal_paste_stays_in_the_chat_input(tmp_path):
+    """Inherited Input paste still runs once — not skipped, not doubled."""
+    app = make_app(tmp_path)
+    async with app.run_test(size=(80, 24)) as pilot:
+        inp = app.query_one("#input", Input)
+        inp.focus()
+        clear_input_selection(inp)
+        await settle(pilot)
+
+        await deliver_paste(app, pilot, "terminal", "one line")
+
+        assert inp.value == "one line"
+        assert inp.display is True
+        assert not list(app.query("#multiline-input"))
+        assert app.session.messages == []
 
 
 async def test_multiline_cancel_restores_input(tmp_path):
@@ -580,26 +793,39 @@ async def test_multiline_cancel_restores_input(tmp_path):
         assert not list(app.query("#multiline-input"))
 
 
-async def test_shift_enter_opens_prefilled_multiline(tmp_path, monkeypatch):
+@pytest.mark.parametrize("reverse", [False, True])
+async def test_shift_enter_opens_prefilled_multiline(tmp_path, monkeypatch, reverse):
+    """One keypress must both expand the editor and make the newline."""
     app = make_app(tmp_path)
     monkeypatch.setattr("jtech_cli.tui.stream_reply", lambda profile, temperature, messages: iter(["ok"]))
     async with app.run_test() as pilot:
         inp = app.query_one("#input", Input)
-        inp.value = "first line"
-        await pilot.press("shift+enter")
-        for _ in range(5):
-            await pilot.pause()
-        ta = app.query_one("#multiline-input", TextArea)
-        assert ta.text == "first line"
-        assert inp.value == ""
+        inp.value = "prefix DROP suffix"
+        inp.focus()
+        start, end = len("prefix "), len("prefix DROP")
+        select_input_range(inp, *((end, start) if reverse else (start, end)))
+        await settle(pilot)
 
-        ta.text = "first line\nsecond line\n'''"
-        await pilot.press("ctrl+enter")
+        await pilot.press("shift+enter")
+        await settle(pilot)
+
+        assert len(list(app.query("#multiline-input"))) == 1
+        ta = app.query_one("#multiline-input", TextArea)
+        assert ta.text == "prefix \n suffix"
+        assert ta.selection == AreaSelection.cursor((1, 0))
+        assert inp.value == ""
+        assert app.session.messages == []
+
+        await type_text(pilot, "second")
+        await settle(pilot)
+        assert ta.text == "prefix \nsecond suffix"
+
+        await pilot.press("enter")
         for _ in range(10):
             await pilot.pause()
 
         assert app.session.messages == [
-            {"role": "user", "content": "first line\nsecond line"},
+            {"role": "user", "content": "prefix \nsecond suffix"},
             {"role": "assistant", "content": "ok"},
         ]
         assert app.query_one("#input", Input) is not None
@@ -847,6 +1073,11 @@ async def test_esc_stops_stream_and_discards_partial(tmp_path, monkeypatch):
 
 def suggestions_text(app: ChatApp) -> str:
     return str(app.query_one("#suggestions", Static).render())
+
+
+def hint_text(app: ChatApp) -> str:
+    """The settings screen hint line, as rendered."""
+    return str(app.screen.query_one("#settings-hint", Static).render())
 
 
 def suggestions_box(app: ChatApp) -> Static:

@@ -191,8 +191,9 @@ class ChatApp(App):
         # lock: a rule another agent just saved must decide this request too.
         self._approval_lock = asyncio.Lock()
         self._multiline_textarea: _MultilineInput | None = None
-        self._multiline_future: asyncio.Future[str] | None = None
-        self._multiline_terminator = "'''"
+        # ``None`` is the resolved value for a cancel, so it is distinct from a
+        # submitted empty editor: only the latter is content the user chose.
+        self._multiline_future: asyncio.Future[str | None] | None = None
         self._prompt_tokens = 0
         self._queue: list[str] = []
         self._queue_lines: list[PlainTail] = []
@@ -234,7 +235,7 @@ class ChatApp(App):
             yield Static(id="suggestions")
             yield _ChatInput(
                 id="input",
-                placeholder="Message… (Shift+Enter for newline · / for commands)",
+                placeholder="Message… (Enter send · Shift+Enter newline · / commands)",
             )
             readonly = Static(SUBAGENT_READONLY, id="subagent-readonly")
             readonly.display = False
@@ -572,7 +573,7 @@ class ChatApp(App):
             self._focus_input()
             return
         if value == "'''":
-            self.run_worker(self._heredoc())
+            self.run_worker(self._open_multiline_message())
             return
         if value.startswith("/"):
             self._dispatch_command(value)
@@ -589,19 +590,28 @@ class ChatApp(App):
         if result is not None:
             self.run_worker(result)
 
-    async def _heredoc(self) -> None:
-        content = (await self._enter_multiline("'''")).strip()
-        if content:
-            await self._send_message(content)
+    async def _open_multiline_message(self) -> None:
+        """Compose a chat message in the multi-line editor, then send it."""
+        content = await self._enter_multiline()
+        if content is None:
+            return
+        message = content.strip()
+        if message:
+            await self._send_message(message)
 
     def on_input_to_multiline(self, event: InputToMultiline) -> None:
         self.query_one("#input", _ChatInput).value = ""
-        self.run_worker(self._switch_to_multiline(event.value))
+        self.run_worker(self._switch_to_multiline(event.value, event.cursor_offset))
 
-    async def _switch_to_multiline(self, prefill: str) -> None:
-        content = (await self._enter_multiline("'''", prefill=prefill)).strip()
-        if content:
-            await self._send_message(content)
+    async def _switch_to_multiline(self, prefill: str, cursor_offset: int) -> None:
+        content = await self._enter_multiline(
+            prefill=prefill, cursor_offset=cursor_offset
+        )
+        if content is None:
+            return
+        message = content.strip()
+        if message:
+            await self._send_message(message)
 
     def _enqueue(self, text: str) -> None:
         """Queue a message while a reply or tool round is in flight.
@@ -620,8 +630,22 @@ class ChatApp(App):
         self.query_one("#chat", Transcript).remove(self._queue_lines.pop(index))
         self._render_status()
 
-    async def _enter_multiline(self, terminator: str = "'''", prefill: str = "") -> str:
-        self._multiline_terminator = terminator
+    async def _enter_multiline(
+        self, prefill: str = "", cursor_offset: int | None = None
+    ) -> str | None:
+        """Mount the multi-line editor and wait for a submit or a cancel.
+
+        Returns the submitted text — ``""`` included, which is a real choice a
+        caller such as ``/write`` must be able to honour — or ``None`` when the
+        user cancelled with ``Esc``.
+
+        ``cursor_offset`` is a codepoint index into ``prefill``. It crosses the
+        widget boundary as an index rather than a row/column pair because the
+        producer is a single-line ``Input`` that has no rows; converting it is
+        left to the document API so line-ending arithmetic is not reimplemented
+        here. ``None`` means the caret belongs at the end, which is what every
+        caller that does not come from a keyboard or paste edit wants.
+        """
         self._multiline_future = asyncio.get_running_loop().create_future()
         inp = self.query_one("#input", _ChatInput)
         textarea = _MultilineInput(classes="multiline", id="multiline-input")
@@ -630,6 +654,9 @@ class ChatApp(App):
         self._multiline_textarea = textarea
         if prefill:
             textarea.text = prefill
+        offset = len(prefill) if cursor_offset is None else cursor_offset
+        offset = max(0, min(offset, len(prefill)))
+        textarea.move_cursor(textarea.document.get_location_from_index(offset))
         textarea.focus()
         return await self._multiline_future
 
@@ -637,14 +664,12 @@ class ChatApp(App):
         textarea = self._multiline_textarea
         if textarea is None:
             return
-        lines = textarea.text.splitlines()
-        if lines and lines[-1].strip() == self._multiline_terminator:
-            self._resolve_multiline("\n".join(lines[:-1]))
+        self._resolve_multiline(textarea.text)
 
     def on_multiline_cancel(self, _event: MultilineCancel) -> None:
-        self._resolve_multiline("")
+        self._resolve_multiline(None)
 
-    def _resolve_multiline(self, content: str) -> None:
+    def _resolve_multiline(self, content: str | None) -> None:
         textarea = self._multiline_textarea
         if textarea is None:
             return

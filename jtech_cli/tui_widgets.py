@@ -15,6 +15,7 @@ from rich.padding import Padding
 from rich.segment import Segment
 from rich.style import Style
 from rich.text import Text
+from textual import events
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
@@ -62,11 +63,19 @@ def render_menu_rows(items: Sequence[tuple[str, str]], index: int) -> Text:
 
 
 class InputToMultiline(Message):
-    """Request that the app replace the single-line editor with a text area."""
+    """Request that the app replace the single-line editor with a text area.
 
-    def __init__(self, value: str) -> None:
+    The value is the draft *after* the edit that triggered the promotion, and
+    the offset is where the caret belongs inside it. Both are required: the
+    producer is the only party that still knows the original selection, and an
+    optional offset would silently mis-place the caret for edits made in the
+    middle of a draft.
+    """
+
+    def __init__(self, value: str, cursor_offset: int) -> None:
         super().__init__()
         self.value = value
+        self.cursor_offset = cursor_offset
 
 
 class MultilineSubmit(Message):
@@ -89,14 +98,10 @@ class _ChatInput(Input):
     """Single-line input with command completion and multi-line shortcuts."""
 
     BINDINGS: ClassVar[list[Binding]] = [
-        Binding("ctrl+enter", "submit_input", "Submit", show=False),
         Binding("shift+enter", "to_multiline", "Multi-line", show=False),
         Binding("enter", "submit_or_complete", "Submit", show=False),
         Binding("tab", "tab_complete", "Complete", show=False),
     ]
-
-    def action_submit_input(self) -> None:
-        self.post_message(Input.Submitted(self, self.value))
 
     def action_submit_or_complete(self) -> None:
         app = self.app
@@ -120,15 +125,83 @@ class _ChatInput(Input):
         self.screen.focus_next()
 
     def action_to_multiline(self) -> None:
-        self.post_message(InputToMultiline(self.value))
+        self._promote_with("\n")
+
+    @staticmethod
+    def _has_line_break(text: str) -> bool:
+        """Does this text need an editor that can show more than one line?"""
+        return "\n" in text or "\r" in text
+
+    def _promote_with(self, inserted: str) -> None:
+        """Apply an edit to the draft and hand the whole result to the app.
+
+        Every promotion — the first Shift+Enter and both paste routes — is a
+        real selection replacement, not merely a change of widget. Composing
+        the value and caret here, while this widget still owns the draft, keeps
+        that arithmetic in one place and leaves the text area with nothing to
+        reconstruct.
+        """
+        start, end = sorted(self.selection)
+        current = self.value
+        composed = current[:start] + inserted + current[end:]
+        self.post_message(InputToMultiline(composed, start + len(inserted)))
+
+    def _on_paste(self, event: events.Paste) -> None:
+        """Route a bracketed terminal paste before ``Input`` truncates it.
+
+        ``Input._on_paste()`` keeps only ``event.text.splitlines()[0]``, so a
+        multi-line paste has to be caught here or its remaining lines are gone
+        before the app can see them. Textual dispatches ``_on_paste`` once per
+        class in the MRO, so the inherited handler is suppressed in *both*
+        branches: after promotion it would truncate, and after the explicit
+        ``super()`` call it would insert the same text a second time.
+        """
+        if self._has_line_break(event.text):
+            event.stop()
+            event.prevent_default()
+            self._promote_with(event.text)
+            return
+        super()._on_paste(event)
+        event.prevent_default()
+
+    def action_paste(self) -> None:
+        """Paste Textual's local clipboard, promoting multi-line content.
+
+        Without this the extra lines are written into a widget that can only
+        render the first one, so the draft silently disagrees with the screen.
+        """
+        clipboard = self.app.clipboard
+        if self._has_line_break(clipboard):
+            self._promote_with(clipboard)
+            return
+        super().action_paste()
 
 
-class _MultilineInput(TextArea):
-    """Multi-line input; Ctrl+Enter submits and Esc cancels."""
+class _NewlineTextArea(TextArea):
+    """``TextArea`` base that makes Shift+Enter an explicit newline edit.
+
+    Both editors bind plain ``Enter`` to submit or save, which takes away the
+    newline gesture ``TextArea`` normally provides. Routing the replacement
+    through the public ``replace()`` boundary — rather than the document,
+    history, and cursor separately — keeps undo, ``Changed`` messages, and line
+    wrapping identical to ordinary typing.
+    """
+
+    def action_insert_newline(self) -> None:
+        """Replace the active selection with a newline and follow the caret."""
+        if self.read_only:
+            return
+        start, end = self.selection
+        self.replace("\n", start, end, maintain_selection_offset=False)
+
+
+class _MultilineInput(_NewlineTextArea):
+    """Multi-line input; Enter submits, Shift+Enter adds a line, Esc cancels."""
 
     BINDINGS: ClassVar[list[Binding]] = [
-        Binding("ctrl+enter", "multiline_submit", "Submit", show=False),
-        Binding("escape", "multiline_cancel", "Cancel", show=False),
+        Binding("enter", "multiline_submit", "Submit", show=False, priority=True),
+        Binding("shift+enter", "insert_newline", "Newline", show=False, priority=True),
+        Binding("escape", "multiline_cancel", "Cancel", show=False, priority=True),
     ]
 
     def action_multiline_submit(self) -> None:
@@ -153,11 +226,12 @@ class _FieldInput(Input):
         self.post_message(FieldCancel())
 
 
-class _PromptEditor(TextArea):
+class _PromptEditor(_NewlineTextArea):
     """Multi-line in-place editor for the system prompt row."""
 
     BINDINGS: ClassVar[list[Binding]] = [
         Binding("enter", "commit_field", "Commit", show=False, priority=True),
+        Binding("shift+enter", "insert_newline", "Newline", show=False, priority=True),
         Binding("escape", "cancel_field", "Cancel", show=False, priority=True),
     ]
 
