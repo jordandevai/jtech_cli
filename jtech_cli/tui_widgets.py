@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
-from typing import ClassVar, Literal, Protocol, runtime_checkable
+from typing import ClassVar, Literal, NamedTuple, Protocol, runtime_checkable
 
 from markdown_it import MarkdownIt
 from rich.cells import cell_len
@@ -62,20 +62,24 @@ def render_menu_rows(items: Sequence[tuple[str, str]], index: int) -> Text:
     return Text.assemble(*parts)
 
 
+class _PromotedDraft(NamedTuple):
+    """The draft handed from ``_ChatInput`` to the multi-line editor."""
+
+    value: str
+    cursor_offset: int
+    submit: bool
+    """The user pressed Enter before the editor existed; submit on arrival."""
+
+
 class InputToMultiline(Message):
-    """Request that the app replace the single-line editor with a text area.
+    """Ask the app to take over the promoted draft with a text area.
 
-    The value is the draft *after* the edit that triggered the promotion, and
-    the offset is where the caret belongs inside it. Both are required: the
-    producer is the only party that still knows the original selection, and an
-    optional offset would silently mis-place the caret for edits made in the
-    middle of a draft.
+    Deliberately carries no payload. A message is delivered a hop later than
+    it is posted, and in that gap the terminal can still deliver keys and
+    further pastes that ``_ChatInput`` applies to its own value; a snapshot
+    taken at post time would be stale on arrival and would overwrite them.
+    The app reads the live draft with ``_ChatInput.take_promotion()`` instead.
     """
-
-    def __init__(self, value: str, cursor_offset: int) -> None:
-        super().__init__()
-        self.value = value
-        self.cursor_offset = cursor_offset
 
 
 class MultilineSubmit(Message):
@@ -97,6 +101,12 @@ class FieldCancel(Message):
 class _ChatInput(Input):
     """Single-line input with command completion and multi-line shortcuts."""
 
+    # Set once a promotion is requested and cleared when the app collects the
+    # draft. Until then this widget stays the one owner of the draft, so input
+    # the terminal delivers in between is composed rather than lost.
+    _promoting: bool = False
+    _pending_submit: bool = False
+
     BINDINGS: ClassVar[list[Binding]] = [
         Binding("shift+enter", "to_multiline", "Multi-line", show=False),
         Binding("enter", "submit_or_complete", "Submit", show=False),
@@ -104,6 +114,12 @@ class _ChatInput(Input):
     ]
 
     def action_submit_or_complete(self) -> None:
+        if self._promoting:
+            # The draft is already on its way to the editor, where Enter means
+            # submit. Submitting here would send the half-composed value that
+            # is still sitting in this widget.
+            self._pending_submit = True
+            return
         app = self.app
         if isinstance(app, SuggestionHost):
             completed = app.accepted_suggestion()
@@ -133,18 +149,40 @@ class _ChatInput(Input):
         return "\n" in text or "\r" in text
 
     def _promote_with(self, inserted: str) -> None:
-        """Apply an edit to the draft and hand the whole result to the app.
+        """Apply an edit to the draft and ask the app to take it over.
 
         Every promotion — the first Shift+Enter and both paste routes — is a
-        real selection replacement, not merely a change of widget. Composing
-        the value and caret here, while this widget still owns the draft, keeps
-        that arithmetic in one place and leaves the text area with nothing to
-        reconstruct.
+        real selection replacement, not merely a change of widget, so the edit
+        is applied here and now. Keeping the draft in this widget until the app
+        collects it is what makes a burst of terminal events safe: a second
+        paste or a typed character arriving before the editor exists composes
+        into the same value, and only the first promotion is announced.
         """
         start, end = sorted(self.selection)
         current = self.value
-        composed = current[:start] + inserted + current[end:]
-        self.post_message(InputToMultiline(composed, start + len(inserted)))
+        self.value = current[:start] + inserted + current[end:]
+        self.cursor_position = start + len(inserted)
+        if self._promoting:
+            return
+        self._promoting = True
+        self.post_message(InputToMultiline())
+
+    def cancel_promotion(self) -> None:
+        """Withdraw a promotion request, leaving the draft where it is.
+
+        A promotion the app declines must still clear these flags, or Enter
+        stays dead in the composer for the rest of the session.
+        """
+        self._promoting = False
+        self._pending_submit = False
+
+    def take_promotion(self) -> _PromotedDraft:
+        """Hand the promoted draft to the app and reset to an empty composer."""
+        draft = _PromotedDraft(self.value, self.cursor_position, self._pending_submit)
+        self._promoting = False
+        self._pending_submit = False
+        self.value = ""
+        return draft
 
     def _on_paste(self, event: events.Paste) -> None:
         """Route a bracketed terminal paste before ``Input`` truncates it.

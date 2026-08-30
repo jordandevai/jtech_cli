@@ -599,14 +599,34 @@ class ChatApp(App):
         if message:
             await self._send_message(message)
 
-    def on_input_to_multiline(self, event: InputToMultiline) -> None:
-        self.query_one("#input", _ChatInput).value = ""
-        self.run_worker(self._switch_to_multiline(event.value, event.cursor_offset))
+    def on_input_to_multiline(self, _event: InputToMultiline) -> None:
+        """Take over the promoted draft, synchronously, before anything else can.
 
-    async def _switch_to_multiline(self, prefill: str, cursor_offset: int) -> None:
-        content = await self._enter_multiline(
-            prefill=prefill, cursor_offset=cursor_offset
-        )
+        The editor is mounted here rather than inside the worker: a worker only
+        starts on a later pass of the message pump, and a burst of terminal
+        events could reach this handler again first and mount a second editor
+        under the same id.
+        """
+        inp = self.query_one("#input", _ChatInput)
+        if self._multiline_textarea is not None:
+            # Reachable when an editor is open but hidden behind a selected
+            # subagent. Decline the promotion rather than mount a second
+            # editor, but release the flags so the composer still works.
+            inp.cancel_promotion()
+            return
+        draft = inp.take_promotion()
+        future = self._open_multiline_editor(draft.value, draft.cursor_offset)
+        self.run_worker(self._switch_to_multiline(future))
+        if draft.submit:
+            # Enter arrived while the draft was still in the single-line input.
+            # The user asked to send; the racing editor must not change that.
+            self._resolve_multiline(draft.value)
+
+    async def _switch_to_multiline(
+        self, future: asyncio.Future[str | None]
+    ) -> None:
+        """Send whatever the promoted editor produces, unless it was cancelled."""
+        content = await future
         if content is None:
             return
         message = content.strip()
@@ -646,7 +666,23 @@ class ChatApp(App):
         here. ``None`` means the caret belongs at the end, which is what every
         caller that does not come from a keyboard or paste edit wants.
         """
-        self._multiline_future = asyncio.get_running_loop().create_future()
+        return await self._open_multiline_editor(prefill, cursor_offset)
+
+    def _open_multiline_editor(
+        self, prefill: str, cursor_offset: int | None
+    ) -> asyncio.Future[str | None]:
+        """Mount the editor and claim ownership in one synchronous step.
+
+        Returning the future rather than reading ``self._multiline_future``
+        later matters: ``_resolve_multiline()`` clears that attribute, and a
+        submit can land before the awaiting worker has even started.
+        """
+        if self._multiline_textarea is not None:
+            raise RuntimeError("A multi-line editor is already open.")
+        future: asyncio.Future[str | None] = (
+            asyncio.get_running_loop().create_future()
+        )
+        self._multiline_future = future
         inp = self.query_one("#input", _ChatInput)
         textarea = _MultilineInput(classes="multiline", id="multiline-input")
         inp.display = False
@@ -658,7 +694,7 @@ class ChatApp(App):
         offset = max(0, min(offset, len(prefill)))
         textarea.move_cursor(textarea.document.get_location_from_index(offset))
         textarea.focus()
-        return await self._multiline_future
+        return future
 
     def on_multiline_submit(self, _event: MultilineSubmit) -> None:
         textarea = self._multiline_textarea

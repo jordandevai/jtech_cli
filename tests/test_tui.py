@@ -763,6 +763,73 @@ async def test_multiline_paste_promotes_the_whole_draft(tmp_path, source):
         assert app.session.messages == []
 
 
+async def burst(app, *events_in_order) -> None:
+    """Queue events with no chance to process between, as a terminal does."""
+    for event in events_in_order:
+        app.post_message(event)
+
+
+async def test_paste_then_character_keeps_the_typed_character(tmp_path):
+    """The gap before the editor mounts must compose input, not discard it."""
+    app = make_app(tmp_path)
+    async with app.run_test(size=(80, 24)) as pilot:
+        inp = app.query_one("#input", Input)
+        inp.focus()
+        clear_input_selection(inp)
+        await settle(pilot)
+
+        await burst(app, events.Paste("one\ntwo"), events.Key("x", "x"))
+        await settle(pilot, 12)
+
+        ta = app.query_one("#multiline-input", TextArea)
+        assert ta.text == "one\ntwox"
+        assert ta.selection == AreaSelection.cursor((1, len("twox")))
+        assert app.session.messages == []
+
+
+async def test_paste_then_enter_sends_the_pasted_draft_exactly_once(tmp_path, monkeypatch):
+    """A racing Enter must send the composed draft, never the pre-paste one."""
+    app = make_app(tmp_path)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", lambda profile, temperature, messages: iter(["ok"]))
+    async with app.run_test(size=(80, 24)) as pilot:
+        inp = app.query_one("#input", Input)
+        inp.value = "draft "
+        inp.focus()
+        clear_input_selection(inp)
+        await settle(pilot)
+
+        await burst(app, events.Paste("one\ntwo"), events.Key("enter", None))
+        await settle(pilot, 15)
+
+        assert app.session.messages == [
+            {"role": "user", "content": "draft one\ntwo"},
+            {"role": "assistant", "content": "ok"},
+        ]
+        assert not list(app.query("#multiline-input"))
+        assert app.query_one("#input", Input).display is True
+
+
+async def test_two_queued_pastes_compose_into_one_editor(tmp_path):
+    """Two promotions must not race into two editors sharing one id."""
+    app = make_app(tmp_path)
+    async with app.run_test(size=(80, 24)) as pilot:
+        inp = app.query_one("#input", Input)
+        inp.focus()
+        clear_input_selection(inp)
+        await settle(pilot)
+
+        await burst(
+            app, events.Paste("one\ntwo"), events.Paste("three\nfour")
+        )
+        await settle(pilot, 12)
+
+        assert len(list(app.query("#multiline-input"))) == 1
+        ta = app.query_one("#multiline-input", TextArea)
+        assert ta.text == "one\ntwothree\nfour"
+        assert ta.selection == AreaSelection.cursor((2, len("four")))
+        assert app.session.messages == []
+
+
 async def test_single_line_terminal_paste_stays_in_the_chat_input(tmp_path):
     """Inherited Input paste still runs once — not skipped, not doubled."""
     app = make_app(tmp_path)
