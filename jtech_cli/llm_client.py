@@ -18,6 +18,48 @@ UsageEvent = tuple[str, dict]
 TimingsEvent = tuple[str, dict]
 StreamItem = str | ReasoningEvent | UsageEvent | TimingsEvent
 
+#: The argument that asks a server to report token usage on a stream. Named
+#: once because the retry below has to recognise a refusal *of this argument*
+#: in an error, and matching on a literal spelled twice is how that drifts.
+USAGE_OPTION = "stream_options"
+
+
+def refuses_usage_option(error: APIStatusError | TypeError) -> bool:
+    """Whether ``error`` says specifically that `USAGE_OPTION` was refused.
+
+    Exactly two things count, because exactly two things can refuse it:
+
+    - a ``TypeError`` naming it, from an SDK too old to accept the argument at
+      all — the message CPython builds for an unexpected keyword carries the
+      keyword; and
+    - a rejected-request status (400/422) that identifies the argument, either
+      in the structured ``param`` field or by naming it in the message or body.
+
+    Everything else is somebody else's failure. An authentication error, a rate
+    limit, and a server fault say nothing about the request body: replaying the
+    request without usage would spend a second call, and — if that one happened
+    to succeed — hide the first failure completely. A rate limit answered by an
+    immediate retry is worse than that.
+
+    The cost of this precision is stated rather than hidden: a server that
+    rejects the argument with a 400 naming nothing is indistinguishable from one
+    rejecting malformed messages, so it gets no retry and the error propagates.
+
+    Args:
+        error: The exception raised by the usage-carrying request.
+
+    Returns:
+        True when the retry without `USAGE_OPTION` is worth making.
+    """
+    if isinstance(error, TypeError):
+        return USAGE_OPTION in str(error)
+    if error.status_code not in (400, 422):
+        return False
+    if error.param == USAGE_OPTION:
+        return True
+    return USAGE_OPTION in (error.message or "") or USAGE_OPTION in str(error.body or "")
+
+
 # Reuse one OpenAI client (connection pool) per transport identity instead of
 # building a new one per message. The credential is part of that identity: two
 # profiles may share a base URL with different keys, and sharing a client
@@ -66,28 +108,22 @@ def stream_reply(
     ``prompt_per_second``, ...).
     """
     client = make_client(profile)
-    kwargs = {
+    request = {
         "model": profile.model,
         "messages": messages,
         "stream": True,
         "temperature": temperature,
     }
     try:
-        kwargs["stream_options"] = {"include_usage": True}
-        stream = client.chat.completions.create(**kwargs)
-    except (APIStatusError, TypeError):
-        # The two ways asking for usage can be refused, and only those: the
-        # server answered with an error status because it does not implement
-        # ``stream_options``, or the installed SDK is old enough not to accept
-        # the argument at all. A connection failure, a timeout, or a bug in
-        # this module is not a reason to silently re-request — it now
-        # propagates to the caller that knows how to report it.
         stream = client.chat.completions.create(
-            model=profile.model,
-            messages=messages,
-            stream=True,
-            temperature=temperature,
+            **request, stream_options={"include_usage": True}
         )
+    except (APIStatusError, TypeError) as error:
+        if not refuses_usage_option(error):
+            raise
+        # The retry differs from the request above in exactly one argument, so
+        # it is only worth making when the failure was about that argument.
+        stream = client.chat.completions.create(**request)
     for chunk in stream:
         # Usage first. The chunk carrying it has an empty ``choices`` list —
         # that is the shape ``include_usage`` asks for — so reading it after

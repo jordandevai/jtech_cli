@@ -3,8 +3,16 @@
 import threading
 from types import SimpleNamespace
 
+import httpx2
 import pytest
-from openai import APIConnectionError, APIStatusError
+from openai import (
+    APIConnectionError,
+    AuthenticationError,
+    BadRequestError,
+    InternalServerError,
+    RateLimitError,
+    UnprocessableEntityError,
+)
 
 from jtech_cli import llm_client
 from jtech_cli.config import ResolvedProfile
@@ -42,23 +50,32 @@ def _usage_chunk(prompt_tokens):
     return SimpleNamespace(choices=[], usage=SimpleNamespace(prompt_tokens=prompt_tokens))
 
 
-class _Refused(APIStatusError):
-    """A server answering an error status because it has no ``stream_options``.
-
-    Built without a transport object: the production code branches on the type,
-    and constructing a real one would tie this test to whichever HTTP client the
-    SDK currently vendors.
-    """
-
-    def __init__(self) -> None:
-        Exception.__init__(self, "stream_options is not supported")
+#: The SDK parses ``status_code``, ``param``, and ``body`` out of a real
+#: response, so errors here are built through it rather than asserted into
+#: existence. That needs the HTTP types openai vendors — ``httpx2`` for 3.x. A
+#: future SDK changing transports breaks this import loudly, which is the point:
+#: a hand-built stand-in would keep passing while proving nothing.
+_REQUEST = httpx2.Request("POST", "http://host:9000/v1/chat/completions")
 
 
-class _Unreachable(APIConnectionError):
-    """The endpoint is down. Same reason for skipping the parent constructor."""
+def api_error(cls, status, *, message="refused", body=None):
+    """One genuine SDK error, with the fields the production predicate reads."""
+    return cls(message, response=httpx2.Response(status, request=_REQUEST), body=body)
 
-    def __init__(self) -> None:
-        Exception.__init__(self, "Connection error.")
+
+def unsupported_param_error():
+    """A 400 shaped the way a server naming the offending argument sends one."""
+    return api_error(
+        BadRequestError,
+        400,
+        message="Unrecognized request argument supplied: stream_options",
+        body={
+            "message": "Unrecognized request argument supplied: stream_options",
+            "type": "invalid_request_error",
+            "param": "stream_options",
+            "code": None,
+        },
+    )
 
 
 def fake_openai(monkeypatch, chunks=(), fail_on_stream_options=False, raises=None):
@@ -180,28 +197,95 @@ def test_stream_options_failure_retries_without_them(monkeypatch):
     assert client.calls[1]["temperature"] == 0.7
 
 
-def test_a_server_rejecting_the_usage_option_still_retries(monkeypatch):
-    """The other legitimate refusal: an error status rather than a `TypeError`."""
-    built = fake_openai(monkeypatch, [_chunk("hi")], fail_on_stream_options=_Refused())
-    assert "".join(stream_reply(LOCAL, 0.7, [])) == "hi"
+@pytest.mark.parametrize(
+    "name, refusal",
+    [
+        # The structured signal: the server names the argument in `param`.
+        ("param names it", unsupported_param_error()),
+        # Servers that answer prose instead of a parsed error body.
+        (
+            "message names it",
+            api_error(BadRequestError, 400, message="unknown field stream_options"),
+        ),
+        (
+            "body names it",
+            api_error(
+                BadRequestError,
+                400,
+                message="Invalid request",
+                body={"error": "stream_options is not supported by this server"},
+            ),
+        ),
+        # 422 is the other rejected-request status in the wild.
+        (
+            "unprocessable names it",
+            api_error(
+                UnprocessableEntityError, 422, message="stream_options not allowed"
+            ),
+        ),
+    ],
+)
+def test_a_server_refusing_the_usage_option_retries_without_it(monkeypatch, name, refusal):
+    """A rejected *request* that identifies the argument is the real trigger."""
+    built = fake_openai(monkeypatch, [_chunk("hi")], fail_on_stream_options=refusal)
+    assert "".join(stream_reply(LOCAL, 0.7, [])) == "hi", name
 
     client = built[0]
     assert "stream_options" in client.calls[0]
     assert "stream_options" not in client.calls[1]
+    # The retry changes that one argument and nothing else.
+    assert {k: v for k, v in client.calls[0].items() if k != "stream_options"} == (
+        client.calls[1]
+    )
+
+
+@pytest.mark.parametrize(
+    "name, failure",
+    [
+        ("authentication", api_error(AuthenticationError, 401, message="bad key")),
+        ("rate limit", api_error(RateLimitError, 429, message="slow down")),
+        ("server fault", api_error(InternalServerError, 500, message="boom")),
+        # A rejected request that names nothing: indistinguishable from
+        # malformed messages, so it is not retried either. Stated cost of
+        # precision, asserted so it cannot change silently.
+        ("unattributed 400", api_error(BadRequestError, 400, message="Invalid request body")),
+        # A `TypeError` from somewhere other than the missing keyword.
+        ("unrelated TypeError", TypeError("messages must be a list")),
+    ],
+)
+def test_an_unrelated_failure_is_never_retried(monkeypatch, name, failure):
+    """Only a refusal *of this argument* justifies a second request.
+
+    Retrying anything else spends a call the caller never asked for and, when
+    that call succeeds, hides the original failure completely — which is what
+    the broad `except` did for every 401, 429, and 500.
+    """
+    built = fake_openai(monkeypatch, [_chunk("hi")], fail_on_stream_options=failure)
+
+    with pytest.raises(type(failure)):
+        list(stream_reply(LOCAL, 0.7, []))
+
+    assert len(built[0].calls) == 1, (name, built[0].calls)
 
 
 def test_a_transport_failure_is_not_swallowed_by_the_usage_retry(monkeypatch):
-    """The retry exists for a refused option, not for an endpoint that is down.
-
-    Catching every exception turned one connection failure into two requests and
-    reported the second one's error, from a request the caller never asked for.
-    """
-    built = fake_openai(monkeypatch, raises=_Unreachable())
+    """The retry exists for a refused argument, not for an endpoint that is down."""
+    built = fake_openai(
+        monkeypatch, raises=APIConnectionError(request=_REQUEST)
+    )
 
     with pytest.raises(APIConnectionError):
         list(stream_reply(LOCAL, 0.7, []))
 
     assert len(built[0].calls) == 1, built[0].calls
+
+
+def test_an_old_sdk_naming_the_keyword_still_retries(monkeypatch):
+    """The `TypeError` branch is narrowed to the message that names the keyword."""
+    refusal = TypeError("create() got an unexpected keyword argument 'stream_options'")
+    built = fake_openai(monkeypatch, [_chunk("hi")], fail_on_stream_options=refusal)
+    assert "".join(stream_reply(LOCAL, 0.7, [])) == "hi"
+    assert len(built[0].calls) == 2
 
 
 def test_stream_reply_emits_usage_from_the_choiceless_final_chunk(monkeypatch):
