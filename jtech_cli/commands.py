@@ -38,7 +38,10 @@ SwitchProfile = Callable[[str], Awaitable[None]]
 EffectivePrompt = Callable[[], str]
 Handler = Callable[["CommandContext", str], None | Awaitable[None]]
 
-WRITE_USAGE = "Usage: /write PATH  then edit content — Shift+Enter newline, Enter write"
+WRITE_USAGE = (
+    "Usage: /write PATH  then edit content — Ctrl+J newline, "
+    "Shift+Enter when supported, Enter write"
+)
 NO_PROFILE = "No API profile is configured — run /profiles to add one."
 
 
@@ -156,7 +159,10 @@ def build_registry(ctx: CommandContext) -> CommandRegistry:
         if not arg:
             c.print(WRITE_USAGE)
             return
-        c.print("Enter content — Shift+Enter adds a newline, Enter writes the file.")
+        c.print(
+            "Enter content — Ctrl+J adds a newline (Shift+Enter too, when your "
+            "terminal reports it), Enter writes the file."
+        )
         content = await ctx.enter_multiline()
         if content is None:
             c.print("Write cancelled.")

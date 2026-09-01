@@ -43,7 +43,13 @@ from jtech_cli.tui_app import (
     SUBAGENT_CLEAR_BLOCKED,
     SUBAGENT_READONLY,
 )
-from jtech_cli.tui_runtime import AutonomousRuntime, _StreamEnd, _StreamInbox
+from jtech_cli.tui_runtime import (
+    INTERRUPTED_RESPONSE,
+    STOPPED_LABEL,
+    AutonomousRuntime,
+    _StreamEnd,
+    _StreamInbox,
+)
 from jtech_cli.tui_widgets import (
     AgentSummary,
     AgentTaskSummary,
@@ -165,6 +171,46 @@ def body_widgets(app: ChatApp) -> list[Static]:
 def at_bottom(chat) -> bool:
     """True when the scroll offset is at (or within 2 lines of) the bottom."""
     return chat.scroll_offset.y >= chat.max_scroll_y - 2
+
+
+class BlockingStream:
+    """A `ReplyStream` parked in its read until the app cancels it.
+
+    A test that stops a stream must not also be the thing that releases it:
+    opening a gate by hand proves the runtime waited, not that it cancelled.
+    Only ``cancel()`` — which is what pressing ``Esc`` reaches — ends this one.
+    """
+
+    def __init__(self, first: str = "partial "):
+        self.first = first
+        self.blocked = threading.Event()  # set once the reader is parked
+        self._released = threading.Event()  # set only by cancel()
+        self.cancels = 0
+        self.ended = False
+
+    def __iter__(self):
+        yield self.first
+        self.blocked.set()
+        self._released.wait(10)
+        self.ended = True
+
+    def cancel(self) -> None:
+        self.cancels += 1
+        self._released.set()
+
+
+class FiniteStream:
+    """A `ReplyStream` over a fixed list of items."""
+
+    def __init__(self, *items):
+        self.items = items
+        self.cancels = 0
+
+    def __iter__(self):
+        yield from self.items
+
+    def cancel(self) -> None:
+        self.cancels += 1
 
 
 async def test_submit_shows_user_and_ai_bubble(tmp_path, monkeypatch):
@@ -436,8 +482,9 @@ async def test_settings_esc_cancels_edit_then_closes(tmp_path):
         assert not isinstance(app.screen, SettingsScreen)
 
 
-async def test_settings_system_prompt_edits_multiline(tmp_path):
-    """The newline is typed, not assigned: Shift+Enter makes it, Enter saves."""
+@pytest.mark.parametrize("newline_key", ["ctrl+j", "shift+enter"])
+async def test_settings_system_prompt_edits_multiline(tmp_path, newline_key):
+    """The newline is typed, not assigned: a newline key makes it, Enter saves."""
     app = make_app(tmp_path)
     before = app.settings.system_prompt
     async with app.run_test(size=(80, 24)) as pilot:
@@ -446,11 +493,11 @@ async def test_settings_system_prompt_edits_multiline(tmp_path):
         ta.selection = AreaSelection.cursor((0, len("line one")))
         await settle(pilot)
 
-        await pilot.press("shift+enter")
+        await pilot.press(newline_key)
         await type_text(pilot, "line two")
         await settle(pilot)
 
-        # Shift+Enter edits; it must not save or close.
+        # The newline key edits; it must not save or close.
         assert ta.text == "line one\nline two"
         assert app.screen.query_one("#settings-field", TextArea) is ta
         assert app.settings.system_prompt == before
@@ -634,9 +681,12 @@ async def test_multiline_shift_enter_replaces_the_selection(tmp_path, reverse):
         assert ta.text == "alpha beta"
 
 
+@pytest.mark.parametrize("newline_key", ["ctrl+j", "shift+enter"])
 @pytest.mark.parametrize("reverse", [False, True])
-async def test_prompt_editor_shift_enter_replaces_the_selection(tmp_path, reverse):
-    """The settings editor shares the same newline action, undo included."""
+async def test_prompt_editor_newline_keys_replace_the_selection(
+    tmp_path, reverse, newline_key
+):
+    """Both newline keys share the settings editor's action, undo included."""
     app = make_app(tmp_path)
     before = app.settings.system_prompt
     async with app.run_test(size=(80, 24)) as pilot:
@@ -646,7 +696,7 @@ async def test_prompt_editor_shift_enter_replaces_the_selection(tmp_path, revers
         ta.selection = AreaSelection(tail, head) if reverse else AreaSelection(head, tail)
         await settle(pilot)
 
-        await pilot.press("shift+enter")
+        await pilot.press(newline_key)
         await settle(pilot)
 
         assert ta.text == "alpha \n"
@@ -872,6 +922,7 @@ async def test_shift_enter_opens_prefilled_multiline(tmp_path, monkeypatch, reve
         start, end = len("prefix "), len("prefix DROP")
         select_input_range(inp, *((end, start) if reverse else (start, end)))
         await settle(pilot)
+        single_outer_height = inp.outer_size.height
 
         await pilot.press("shift+enter")
         await settle(pilot)
@@ -882,6 +933,12 @@ async def test_shift_enter_opens_prefilled_multiline(tmp_path, monkeypatch, reve
         assert ta.selection == AreaSelection.cursor((1, 0))
         assert inp.value == ""
         assert app.session.messages == []
+        # The widget binding still reaches the same action, and the editor is
+        # laid out with two editable rows rather than a fixed block.
+        assert ta.document.line_count == 2
+        assert ta.size.height == 2
+        assert ta.outer_size.height == single_outer_height + 1
+        assert ta.has_focus
 
         await type_text(pilot, "second")
         await settle(pilot)
@@ -897,6 +954,123 @@ async def test_shift_enter_opens_prefilled_multiline(tmp_path, monkeypatch, reve
         ]
         assert app.query_one("#input", Input) is not None
         assert not list(app.query("#multiline-input"))
+
+
+@pytest.mark.parametrize("viewport_height", [10, 24])
+async def test_ctrl_j_promotes_and_grows_composer_to_two_editable_rows(
+    tmp_path,
+    viewport_height,
+) -> None:
+    """Terminal LF promotes the draft and paints a second editable row.
+
+    The key event is built by hand because a raw LF byte is what the reporting
+    terminal actually sends, and Textual reports it as ``ctrl+j``. Starting at
+    that public event boundary is what the suite was missing, and the height
+    assertions are what prove the second line is laid out, not merely stored.
+    """
+    app = make_app(tmp_path)
+    async with app.run_test(size=(80, viewport_height)) as pilot:
+        inp = app.query_one("#input", Input)
+        inp.value = "prefix suffix"
+        inp.focus()
+        inp.selection = InputSelection.cursor(len("prefix "))
+        await settle(pilot)
+        single_outer_height = inp.outer_size.height
+
+        app.post_message(events.Key("ctrl+j", "\n"))
+        await settle(pilot, 12)
+
+        assert len(list(app.query("#multiline-input"))) == 1
+        ta = app.query_one("#multiline-input", TextArea)
+        assert ta.text == "prefix \nsuffix"
+        assert ta.document.line_count == 2
+        assert ta.selection == AreaSelection.cursor((1, 0))
+        assert ta.has_focus
+        assert ta.size.height == 2
+        # The border gains one row. The single-line input's bottom margin goes
+        # away with it, so the reserved screen footprint is unchanged.
+        assert ta.outer_size.height == single_outer_height + 1
+        assert inp.display is False
+        assert app.session.messages == []
+        assert app._queue == []
+
+
+async def test_ctrl_j_edits_and_grows_open_multiline(tmp_path, monkeypatch) -> None:
+    """LF adds a line inside the open editor; CR still submits it exactly once."""
+    app = make_app(tmp_path)
+    monkeypatch.setattr(
+        "jtech_cli.tui.stream_reply",
+        lambda profile, temperature, messages: iter(["ok"]),
+    )
+    async with app.run_test(size=(80, 24)) as pilot:
+        opened = await _enter_multiline(app, pilot, "'''")
+        opened.text = "one\ntwothree"
+        opened.selection = AreaSelection.cursor((1, len("two")))
+        opened.focus()
+        await settle(pilot)
+        assert opened.size.height == 2
+
+        app.post_message(events.Key("ctrl+j", "\n"))
+        await settle(pilot, 12)
+
+        assert app.query_one("#multiline-input", TextArea) is opened
+        assert opened.text == "one\ntwo\nthree"
+        assert opened.selection == AreaSelection.cursor((2, 0))
+        assert opened.size.height == 3
+        assert opened.has_focus
+        assert app.session.messages == []
+        assert app._queue == []
+
+        await pilot.press("enter")
+        await settle(pilot, 12)
+
+        assert app.session.messages == [
+            {"role": "user", "content": "one\ntwo\nthree"},
+            {"role": "assistant", "content": "ok"},
+        ]
+        assert not list(app.query("#multiline-input"))
+
+        # `bubbles()` reports source record content, so only the rendered rows
+        # can show that the submitted newlines survived presentation.
+        user_record = chat_of(app).history.records[0]
+        assert user_record.content == "one\ntwo\nthree"
+        assert user_record.format == "plain"
+        rows = [row.strip() for row in history_lines(app).split("\n")]
+        assert rows.count("one") == 1
+        assert rows.count("two") == 1
+        assert rows.count("three") == 1
+        assert rows.index("one") < rows.index("two") < rows.index("three")
+        assert not [row for row in rows if "one two three" in row]
+
+
+async def test_multiline_editor_auto_grows_then_scrolls_at_existing_max(
+    tmp_path,
+) -> None:
+    """Growth tracks the document, then stops at the existing six-cell footprint."""
+    app = make_app(tmp_path)
+    async with app.run_test(size=(80, 24)) as pilot:
+        ta = await _enter_multiline(app, pilot, "'''")
+        await settle(pilot)
+
+        # Short lines in a full-width app, so this measures real document
+        # lines and never accidental soft wrapping.
+        heights = []
+        for line in range(1, 7):
+            if line > 1:
+                await pilot.press("ctrl+j")
+            await type_text(pilot, f"l{line}")
+            await settle(pilot)
+            assert ta.document.line_count == line
+            heights.append(ta.size.height)
+            assert ta.outer_size.height <= 6
+
+        assert heights == [1, 2, 3, 4, 4, 4]
+        assert ta.outer_size.height == 6
+        assert ta.virtual_size.height > ta.size.height
+        assert ta.max_scroll_y > 0
+        assert ta.cursor_at_last_line
+        cursor = ta.cursor_screen_offset
+        assert ta.content_region.contains(cursor.x, cursor.y)
 
 
 async def _send_and_drain(app: ChatApp, pilot, text: str) -> None:
@@ -1105,37 +1279,79 @@ async def test_esc_idle_does_nothing(tmp_path):
         assert app.focused is app.query_one("#input", Input)
 
 
-async def test_esc_stops_stream_and_discards_partial(tmp_path, monkeypatch):
-    app = make_app(tmp_path)
-    gate = threading.Event()
+async def test_esc_stops_stream_and_retains_marked_partial(tmp_path, monkeypatch):
+    """Esc closes the response and keeps what the user actually saw.
 
-    def fake(profile, temperature, messages):
-        yield "partial "
-        gate.wait(5)
-        yield "never"
+    The provider is released by nothing but the app's own cancellation, so a
+    stop that only set a flag would park this test in the blocked read.
+    """
+    app = make_app(tmp_path, settings=make_settings("always"))
+    stream = BlockingStream()
 
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    monkeypatch.setattr(
+        "jtech_cli.tui.stream_reply", lambda profile, temperature, messages: stream
+    )
     async with app.run_test() as pilot:
         inp = app.query_one("#input", Input)
         inp.value = "hello"
         await pilot.press("enter")
-        for _ in range(50):
-            await pilot.pause()
-            if any("partial" in b for b in bubbles(app)):
-                break
+        await _wait_until(app, pilot, stream.blocked.is_set)
 
         await pilot.press("escape")
-        gate.set()
-        for _ in range(50):
-            await pilot.pause()
-            if not any("partial" in b for b in bubbles(app)):
-                break
+        await _wait_until(app, pilot, lambda: not app._generating, tries=100)
+        await pilot.pause()
 
-        assert app.session.messages == [{"role": "user", "content": "hello"}]
-        assert not any("partial" in b for b in bubbles(app))
-        assert not any("never" in b for b in bubbles(app))
-        assert any("Generation stopped" in b for b in bubbles(app))
-        assert app.query_one("#input", Input) is not None
+        interrupted = f"partial \n\n{INTERRUPTED_RESPONSE}"
+        assert stream.cancels == 1
+        assert stream.ended is True  # cancelled, not waited out
+        assert app.session.messages == [
+            {"role": "user", "content": "hello"},
+            {
+                "role": "assistant",
+                "content": interrupted,
+                "_model_role": "assistant",
+                "_model_content": INTERRUPTED_RESPONSE,
+            },
+        ]
+        assert app.session.messages_with_system("") == [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": INTERRUPTED_RESPONSE},
+        ]
+        assert interrupted in bubbles(app)
+        assert STOPPED_LABEL in labels(app)
+        assert not any("Generation stopped" in b for b in bubbles(app))
+        assert reasoning_bodies(app) == []
+        assert app.query_one("#input", Input).disabled is False
+
+
+async def test_startup_restores_interrupted_partial_but_context_uses_marker(
+    tmp_path,
+):
+    """A reloaded session shows what was stopped and sends only the marker.
+
+    The durability half of the contract: the two representations have to
+    survive a restart, not just exist in memory for the rest of the turn.
+    """
+    session = Session(tmp_path / "s.jsonl", persist=False)
+    session.add("user", "hello")
+    session.add(
+        "assistant",
+        f"partial answer\n\n{INTERRUPTED_RESPONSE}",
+        model_role="assistant",
+        model_content=INTERRUPTED_RESPONSE,
+    )
+    app = make_app(
+        tmp_path, session=session, fetch_token_count_fn=lambda profile, text: 7
+    )
+    async with app.run_test() as pilot:
+        await pilot.pause()
+
+        assert f"partial answer\n\n{INTERRUPTED_RESPONSE}" in bubbles(app)
+
+    assert app.session.messages_with_system("") == [
+        {"role": "user", "content": "hello"},
+        {"role": "assistant", "content": INTERRUPTED_RESPONSE},
+    ]
 
 
 def suggestions_text(app: ChatApp) -> str:
@@ -2232,39 +2448,70 @@ async def test_a_running_command_is_shown_then_replaced_by_its_result(tmp_path, 
 
 
 async def test_queue_drains_after_esc_stop(tmp_path, monkeypatch):
-    """Esc-stopping the in-flight reply still unblocks the queue."""
+    """The queued turn starts after the stopped one closed, and sees the marker.
+
+    Two user turns in a row is what degenerated the next completion. The stop
+    now leaves a balanced assistant turn between them, carrying the marker
+    rather than the partial answer.
+    """
     app = make_app(tmp_path)
-    gate = threading.Event()
-    calls = {"n": 0}
+    first = BlockingStream()
+    second = FiniteStream("r2")
+    entered: list[str] = []
+    first_ended_at_second_entry: list[bool] = []
+    sent: list[list[dict]] = []
 
-    def fake(profile, temperature, messages):
-        calls["n"] += 1
-        if calls["n"] == 1:
-            yield "partial "
-            gate.wait(5)
-        else:
-            yield "r2"
+    def provider(profile, temperature, messages):
+        sent.append(messages)
+        if not entered:
+            entered.append("one")
+            return first
+        entered.append("two")
+        # Read here, in the second request itself: the first provider must
+        # already be finished, not merely asked to stop.
+        first_ended_at_second_entry.append(first.ended)
+        return second
 
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", provider)
     async with app.run_test() as pilot:
         inp = app.query_one("#input", Input)
         inp.value = "one"
         await pilot.press("enter")
-        await _wait_until(app, pilot, lambda: any("partial" in b for b in bubbles(app)))
+        await _wait_until(app, pilot, first.blocked.is_set)
+        system_prompt = app._primary_system_prompt()
 
         inp.value = "two"
         await pilot.press("enter")
         await _wait_until(app, pilot, lambda: bool(app._queue), tries=10, pause=0.05)
+        assert entered == ["one"]  # the queued turn has not started
 
         await pilot.press("escape")
-        gate.set()
-        await _wait_until(app, pilot, lambda: calls["n"] >= 2)
-        assert any("Generation stopped" in b for b in bubbles(app))
-        assert not any("Queued" in b for b in bubbles(app))
+        await _wait_until(app, pilot, lambda: any("r2" in b for b in bubbles(app)))
 
-    # partial reply discarded; queued "two" still sent afterwards
+        interrupted = f"partial \n\n{INTERRUPTED_RESPONSE}"
+        assert entered == ["one", "two"]  # the requests never overlapped
+        assert first_ended_at_second_entry == [True]
+        assert first.cancels == 1
+        assert not any("Queued" in b for b in bubbles(app))
+        assert not any("Generation stopped" in b for b in bubbles(app))
+        # the stopped partial is still on screen, above the queued turn's answer
+        shown = bubbles(app)
+        assert shown.index(interrupted) < shown.index("r2")
+
+    assert sent[1] == [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": "one"},
+        {"role": "assistant", "content": INTERRUPTED_RESPONSE},
+        {"role": "user", "content": "two"},
+    ]
     assert app.session.messages == [
         {"role": "user", "content": "one"},
+        {
+            "role": "assistant",
+            "content": interrupted,
+            "_model_role": "assistant",
+            "_model_content": INTERRUPTED_RESPONSE,
+        },
         {"role": "user", "content": "two"},
         {"role": "assistant", "content": "r2"},
     ]
@@ -2854,6 +3101,40 @@ async def test_startup_renders_every_stored_message_in_order(tmp_path):
         assert labels(app) == ["USER", "ASSISTANT", "USER"]
 
 
+async def test_startup_renders_multiline_user_message_as_literal_rows(tmp_path):
+    """A reloaded session needs no migration: the format is chosen at rebuild."""
+    stored = [
+        {"role": "user", "content": "first **literal**\n\nsecond"},
+        {"role": "assistant", "content": "**formatted answer**"},
+    ]
+    app = history_app(tmp_path, stored)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+
+        assert app.session.messages == [
+            {"role": "user", "content": "first **literal**\n\nsecond"},
+            {"role": "assistant", "content": "**formatted answer**"},
+        ]
+        chat = chat_of(app)
+        user, assistant = chat.history.records
+        assert (user.format, user.content) == ("plain", stored[0]["content"])
+        assert (assistant.format, assistant.content) == (
+            "markdown",
+            stored[1]["content"],
+        )
+
+        rows = [row.rstrip() for row in history_lines(app).split("\n")]
+        first = rows.index("  first **literal**")
+        assert rows[first + 1] == ""  # the source blank line keeps its row
+        assert rows[first + 2] == "  second"
+        rendered = "\n".join(rows)
+        assert "formatted answer" in rendered
+        assert "**formatted answer**" not in rendered
+
+        # Replay still costs no widget per stored message.
+        assert list(chat.children) == [chat.history]
+
+
 async def test_startup_filters_debug_only_history_unless_debugging(tmp_path):
     stored = [
         {"role": "user", "content": "kept"},
@@ -3399,28 +3680,41 @@ async def test_a_render_failure_stops_its_provider_before_the_next_turn(
 ):
     """The one exit that never drains _StreamEnd must still end its producer.
 
-    A gated multi-chunk provider keeps running past the render failure. If the
-    turn were released there, the queued message would open a second,
-    overlapping request while the first stream fed an inbox nobody reads.
+    The provider is parked in its read when the renderer fails, so nothing the
+    consumer sets can reach it: the abandoned response has to be closed. If the
+    turn were released before that producer exited, the next message would open
+    a second, overlapping request while the first stream fed an inbox nobody
+    reads.
     """
     app = make_app(tmp_path)
     real_write = MarkdownStream.write
-    released = threading.Event()  # frees the provider parked past the failure
+    blocked = BlockingStream("one")
     entries: list[str] = []
-    generating_while_producing: list[bool] = []
+    generating_at_cancel: list[bool] = []
+    first_ended_at_second_entry: list[bool] = []
 
     def provider(profile, temperature, messages):
         entries.append(f"turn-{len(entries) + 1}")
         if len(entries) > 1:
-            yield "ok"
-            return
-        yield "one"
-        released.wait(5)
-        # read from the provider thread: the turn must still be held here
-        generating_while_producing.append(app._generating)
-        yield "two"
+            # Read in the second request itself: the abandoned producer must
+            # already have left its read, not merely have been asked to.
+            first_ended_at_second_entry.append(blocked.ended)
+            return FiniteStream("ok")
+        original_cancel = blocked.cancel
+
+        def cancel_and_observe() -> None:
+            # The close happens while the turn is still held; releasing it
+            # first is what would let the next request overlap this one.
+            generating_at_cancel.append(app._generating)
+            original_cancel()
+
+        blocked.cancel = cancel_and_observe
+        return blocked
 
     async def failing_write(self, markdown_fragment: str) -> None:
+        # Fail only once the provider is parked in its read, so the abandoned
+        # producer is genuinely unreachable by the cooperative flag.
+        blocked.blocked.wait(10)
         raise RuntimeError("renderer failed")
 
     monkeypatch.setattr(MarkdownStream, "write", failing_write)
@@ -3431,26 +3725,18 @@ async def test_a_render_failure_stops_its_provider_before_the_next_turn(
         await _wait_until(
             app, pilot, lambda: any(RENDER_ERROR in b for b in bubbles(app)), tries=100
         )
+        # The turn ends by closing the response its producer is parked in, and
+        # only releases once that producer has been joined.
+        await _wait_until(app, pilot, lambda: not app._generating, tries=100)
 
-        # the failure is already reported, but the turn is still held because
-        # its provider is parked mid-stream
-        for _ in range(5):
-            await pilot.pause()
-        assert app._generating
-        assert entries == ["turn-1"]
-
-        # so the next message queues instead of racing the abandoned provider
-        app.query_one("#input", Input).value = "second"
-        await pilot.press("enter")
-        await pilot.pause()
-        assert app._queue == ["second"]
+        assert blocked.cancels == 1  # the renderer failure closed the response
+        assert blocked.ended is True  # and that released the parked read
+        assert generating_at_cancel == [True]
         assert entries == ["turn-1"]
 
         monkeypatch.setattr(MarkdownStream, "write", real_write)
-        released.set()
-        # The reply becomes visible when the turn finalizes, but the turn is
-        # only released once its abandoned provider has been joined — so the
-        # wait has to cover both, not just the text.
+        app.query_one("#input", Input).value = "second"
+        await pilot.press("enter")
         await _wait_until(
             app,
             pilot,
@@ -3458,8 +3744,8 @@ async def test_a_render_failure_stops_its_provider_before_the_next_turn(
             tries=100,
         )
 
-        assert generating_while_producing == [True]  # never released early
         assert entries == ["turn-1", "turn-2"]  # the requests never overlapped
+        assert first_ended_at_second_entry == [True]
         assert not app._generating
         assert app._queue == []
         assert app.session.messages == [
@@ -5131,6 +5417,14 @@ async def test_a_repeated_key_continues_one_conversation(tmp_path, monkeypatch):
             "second task",
         ]
         assert agent_activity(app, "coder").count("second task") == 1
+        # The seeded first task and the appended second one share one policy.
+        tasks = [
+            record
+            for record in app._agents["coder"].transcript.history.records
+            if record.role == "user"
+        ]
+        assert [record.content for record in tasks] == ["first task", "second task"]
+        assert [record.format for record in tasks] == ["plain", "plain"]
 
 
 async def test_a_label_or_profile_change_for_one_key_fails_without_mutating(

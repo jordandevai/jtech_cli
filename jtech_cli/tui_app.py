@@ -235,7 +235,7 @@ class ChatApp(App):
             yield Static(id="suggestions")
             yield _ChatInput(
                 id="input",
-                placeholder="Message… (Enter send · Shift+Enter newline · / commands)",
+                placeholder="Message… (Enter send · Ctrl+J newline · / commands)",
             )
             readonly = Static(SUBAGENT_READONLY, id="subagent-readonly")
             readonly.display = False
@@ -357,7 +357,10 @@ class ChatApp(App):
             if msg.get("_debug_only") and self.settings.debug_level != "system":
                 continue
             history.append(
-                TranscriptRecord(role=msg["role"], content=msg["content"])
+                TranscriptRecord.from_message(
+                    role=msg["role"],
+                    content=msg["content"],
+                )
             )
         chat = self.query_one("#chat", Transcript)
         chat.load(history)
@@ -405,7 +408,7 @@ class ChatApp(App):
     def push_message(self, role: str, text: str) -> None:
         """Add one already-complete message to the visible transcript."""
         self.query_one("#chat", Transcript).append(
-            TranscriptRecord(role=role, content=text)
+            TranscriptRecord.from_message(role=role, content=text)
         )
 
     def _focus_input(self) -> None:
@@ -1042,7 +1045,7 @@ class ChatApp(App):
             session = Session(persist=False)
             transcript = await self.add_agent_view(
                 AgentSummary(call.agent_key, call.agent_label, "running", (task,)),
-                (TranscriptRecord(role="user", content=call.task),),
+                (TranscriptRecord.from_message(role="user", content=call.task),),
             )
             # Same rule as a continuation: the assignment joins the worker's
             # conversation only once its presentation exists. The seeded
@@ -1091,7 +1094,9 @@ class ChatApp(App):
             )
         )
         managed.tasks.append(task)
-        managed.transcript.append(TranscriptRecord(role="user", content=call.task))
+        managed.transcript.append(
+            TranscriptRecord.from_message(role="user", content=call.task)
+        )
         managed.session.add("user", call.task)
         return managed
 

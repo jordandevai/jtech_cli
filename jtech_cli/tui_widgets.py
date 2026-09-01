@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
-from typing import ClassVar, Literal, NamedTuple, Protocol, runtime_checkable
+from typing import ClassVar, Final, Literal, NamedTuple, Protocol, runtime_checkable
 
 from markdown_it import MarkdownIt
 from rich.cells import cell_len
@@ -98,6 +98,15 @@ class FieldCancel(Message):
     """The in-place settings editor asks its screen to discard the value."""
 
 
+_NEWLINE_KEYS: Final[str] = "ctrl+j,shift+enter"
+"""One newline intent with two terminal encodings.
+
+Terminals that preserve the modifier report ``shift+enter``; the rest send a
+literal LF, which Textual reports as ``ctrl+j``. Both names bind to the same
+action so their content, caret, undo, and lifecycle semantics cannot diverge.
+"""
+
+
 class _ChatInput(Input):
     """Single-line input with command completion and multi-line shortcuts."""
 
@@ -108,7 +117,7 @@ class _ChatInput(Input):
     _pending_submit: bool = False
 
     BINDINGS: ClassVar[list[Binding]] = [
-        Binding("shift+enter", "to_multiline", "Multi-line", show=False),
+        Binding(_NEWLINE_KEYS, "to_multiline", "Multi-line", show=False),
         Binding("enter", "submit_or_complete", "Submit", show=False),
         Binding("tab", "tab_complete", "Complete", show=False),
     ]
@@ -151,7 +160,7 @@ class _ChatInput(Input):
     def _promote_with(self, inserted: str) -> None:
         """Apply an edit to the draft and ask the app to take it over.
 
-        Every promotion — the first Shift+Enter and both paste routes — is a
+        Every promotion — the first newline key and both paste routes — is a
         real selection replacement, not merely a change of widget, so the edit
         is applied here and now. Keeping the draft in this widget until the app
         collects it is what makes a burst of terminal events safe: a second
@@ -216,7 +225,7 @@ class _ChatInput(Input):
 
 
 class _NewlineTextArea(TextArea):
-    """``TextArea`` base that makes Shift+Enter an explicit newline edit.
+    """``TextArea`` base that makes a newline key an explicit newline edit.
 
     Both editors bind plain ``Enter`` to submit or save, which takes away the
     newline gesture ``TextArea`` normally provides. Routing the replacement
@@ -234,11 +243,17 @@ class _NewlineTextArea(TextArea):
 
 
 class _MultilineInput(_NewlineTextArea):
-    """Multi-line input; Enter submits, Shift+Enter adds a line, Esc cancels."""
+    """Multi-line input; Enter submits, a newline key adds a line, Esc cancels."""
 
     BINDINGS: ClassVar[list[Binding]] = [
         Binding("enter", "multiline_submit", "Submit", show=False, priority=True),
-        Binding("shift+enter", "insert_newline", "Newline", show=False, priority=True),
+        Binding(
+            _NEWLINE_KEYS,
+            "insert_newline",
+            "Newline",
+            show=False,
+            priority=True,
+        ),
         Binding("escape", "multiline_cancel", "Cancel", show=False, priority=True),
     ]
 
@@ -269,7 +284,13 @@ class _PromptEditor(_NewlineTextArea):
 
     BINDINGS: ClassVar[list[Binding]] = [
         Binding("enter", "commit_field", "Commit", show=False, priority=True),
-        Binding("shift+enter", "insert_newline", "Newline", show=False, priority=True),
+        Binding(
+            _NEWLINE_KEYS,
+            "insert_newline",
+            "Newline",
+            show=False,
+            priority=True,
+        ),
         Binding("escape", "cancel_field", "Cancel", show=False, priority=True),
     ]
 
@@ -345,6 +366,32 @@ class TranscriptRecord:
     label: str | None = None
     format: TranscriptFormat = "markdown"
     error: bool = False
+
+    @classmethod
+    def from_message(cls, role: str, content: str) -> TranscriptRecord:
+        """Build presentation data for one unlabelled conversation message.
+
+        This is the single place role-to-format policy lives: a user turn is
+        echoed literally, so its newlines, Markdown syntax, and Rich markup all
+        survive as typed, while every other role keeps Markdown. Renderers stay
+        driven by the record's explicit ``format`` and never re-check the role.
+
+        Records that need a live completion label, an error style, or a
+        deliberately different format use the constructor instead.
+
+        Args:
+            role: The conversation role, passed through unchanged.
+            content: The complete source string, passed through unchanged.
+
+        Returns:
+            A record with ``format="plain"`` for ``user`` and ``markdown``
+            for every other role.
+        """
+        return cls(
+            role=role,
+            content=content,
+            format="plain" if role == "user" else "markdown",
+        )
 
     @property
     def display_label(self) -> str:
@@ -893,7 +940,7 @@ class Transcript(VerticalScroll):
         elif record.format == "plain":
             entry = PlainTail(
                 label=label,
-                body=Static(record.content, classes=body_classes),
+                body=Static(record.content, classes=body_classes, markup=False),
                 _owner=self._owner_token,
             )
         else:

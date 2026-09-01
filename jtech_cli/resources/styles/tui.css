@@ -71,7 +71,8 @@ TranscriptHistory {
 }
 
 #multiline-input {
-    height: 6;
+    height: auto;
+    max-height: 6;
     dock: bottom;
 }
 

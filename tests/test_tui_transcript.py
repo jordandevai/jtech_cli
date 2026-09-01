@@ -195,6 +195,35 @@ def foregrounds(history: TranscriptHistory) -> set[str]:
     return {fg for fg, _ in styles_of(history) if fg}
 
 
+# --- TranscriptRecord presentation policy ----------------------------------
+
+
+def test_message_records_choose_literal_user_and_markdown_response_formats() -> None:
+    """Role picks the format once, and neither role nor content is rewritten.
+
+    The content deliberately carries Markdown and Rich-markup syntax plus a
+    blank line, so a factory that "helpfully" escaped or normalized source text
+    would fail here rather than in a rendering test.
+    """
+    content = "first **literal** [bold]tag[/bold]\n\nsecond"
+
+    records = {
+        role: TranscriptRecord.from_message(role, content)
+        for role in ("user", "assistant", "ai", "system")
+    }
+
+    assert records["user"].format == "plain"
+    assert records["assistant"].format == "markdown"
+    assert records["ai"].format == "markdown"
+    assert records["system"].format == "markdown"
+
+    for role, record in records.items():
+        assert record.role == role
+        assert record.content == content
+        assert record.label is None
+        assert record.error is False
+
+
 # --- TranscriptHistory rendering -------------------------------------------
 
 
@@ -796,6 +825,63 @@ async def test_the_two_notice_hard_case_preserves_order_at_every_transition():
         ]
         assert chat._tail == []
         assert list(chat.children) == [chat.history]
+
+
+async def test_multiline_user_message_is_literal_before_and_after_compaction():
+    """One plain user record reads literally as a tail widget and as history.
+
+    The two states use different renderers — a Textual `Static` while the
+    record waits behind a removable notice, Rich `Text` once it compacts — so
+    only driving the whole lifecycle can show that one explicit format has one
+    meaning.
+    """
+    source = "first **literal** [bold]tag[/bold]\nsecond"
+    app = TranscriptApp()
+    async with app.run_test(size=SIZE) as pilot:
+        await pilot.pause()
+        chat = transcript(app)
+        # A removable notice ahead of it keeps the finalized record in the tail.
+        blocker = chat.begin_plain("system", "Queued: earlier")
+        record = TranscriptRecord.from_message("user", source)
+        chat.append(record)
+        await pilot.pause()
+
+        entry = chat._tail[-1]
+        assert isinstance(entry, PlainTail)
+        assert chat.history.records == ()
+        assert tail_content(entry) == source
+
+        chat.remove(blocker)
+        await pilot.pause()
+
+        history = chat.history
+        assert len(history.records) == 1
+        # Identity, not equality: compaction moved the record, it did not
+        # rebuild one that merely compares equal.
+        assert history.records[0] is record
+        assert history.records[0].format == "plain"
+        assert history.records[0].content == source
+        rendered = lines(history)
+        first_rows = [n for n, line in enumerate(rendered) if "**literal**" in line]
+        second_rows = [n for n, line in enumerate(rendered) if "second" in line]
+        assert len(first_rows) == 1
+        assert len(second_rows) == 1
+        assert first_rows[0] != second_rows[0]
+        assert "[bold]tag[/bold]" in rendered[first_rows[0]]
+        # The collapsed soft-break form must not appear on any row.
+        assert not [line for line in rendered if "first" in line and "second" in line]
+
+        copied = await drag_select(
+            pilot,
+            history,
+            Offset(2, first_rows[0]),
+            Offset(2 + len("second") - 1, second_rows[0]),
+        )
+
+        assert copied.split("\n") == [
+            "first **literal** [bold]tag[/bold]",
+            "  second",  # the bubble's two-cell left pad on the continuation row
+        ]
 
 
 async def test_clear_empties_everything_and_late_closes_are_no_ops():

@@ -78,12 +78,34 @@ def unsupported_param_error():
     )
 
 
+class _SDKStream:
+    """One SDK completion stream: iterable once, with a counted ``close()``.
+
+    Shaped like ``openai.Stream``, which is what production now keeps a handle
+    on so it can be closed from another thread.
+    """
+
+    def __init__(self, chunks):
+        self._chunks = iter(list(chunks))
+        self.closed = 0
+
+    def __iter__(self):
+        return self._chunks
+
+    def close(self):
+        self.closed += 1
+
+
 def fake_openai(monkeypatch, chunks=(), fail_on_stream_options=False, raises=None):
     """Replace the SDK constructor; return the list of clients it builds.
 
     ``fail_on_stream_options`` refuses only the usage request, as a server or an
     old SDK does; pass an exception to choose which refusal. ``raises`` fails
     every call, standing in for a transport that is down.
+
+    Each client records the streams it opened in ``streams`` and counts its own
+    ``close()`` in ``closed``: cancelling one response must never take the
+    shared, cached client down with it.
     """
     built = []
 
@@ -92,6 +114,8 @@ def fake_openai(monkeypatch, chunks=(), fail_on_stream_options=False, raises=Non
             self.kwargs = kwargs
             self.sent = None
             self.calls = []
+            self.streams = []
+            self.closed = 0
             built.append(self)
 
         @property
@@ -101,6 +125,9 @@ def fake_openai(monkeypatch, chunks=(), fail_on_stream_options=False, raises=Non
         @property
         def completions(self):
             return self
+
+        def close(self):
+            self.closed += 1
 
         def create(self, **kwargs):
             self.calls.append(kwargs)
@@ -113,7 +140,9 @@ def fake_openai(monkeypatch, chunks=(), fail_on_stream_options=False, raises=Non
                     else fail_on_stream_options
                 )
             self.sent = kwargs
-            return iter(list(chunks))
+            stream = _SDKStream(chunks)
+            self.streams.append(stream)
+            return stream
 
     monkeypatch.setattr(llm_client, "OpenAI", _Client)
     return built
@@ -318,6 +347,52 @@ def test_reasoning_and_timings_events_are_preserved(monkeypatch):
     assert ("reasoning", "hmm") in items
     assert ("timings", {"prompt_n": 12}) in items
     assert "".join(i for i in items if isinstance(i, str)) == "4"
+
+
+# ------------------------------------------------------ cancellation
+
+
+def test_reply_stream_cancel_closes_only_its_sdk_stream(monkeypatch):
+    """Cancelling one response must not close the pool every agent shares."""
+    built = fake_openai(monkeypatch, [_chunk("hi")])
+    first = stream_reply(LOCAL, 0.7, [])
+    client = built[0]
+
+    first.cancel()
+
+    assert client.streams[0].closed == 1
+    assert client.closed == 0
+
+    second = stream_reply(LOCAL, 0.7, [])
+    assert built == [client]  # the same cached client answered both
+    assert "".join(second) == "hi"
+    assert client.streams[1].closed == 0
+
+
+def test_reply_stream_preserves_event_order_after_becoming_closeable(monkeypatch):
+    """One chunk carrying everything still yields in the documented order.
+
+    The chunk-to-``StreamItem`` loop moved from a generator function into an
+    adapter method; this is what would notice if the move reordered it.
+    """
+    everything = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                delta=SimpleNamespace(content="4", reasoning_content="hmm"),
+                finish_reason="stop",
+            )
+        ],
+        usage=SimpleNamespace(prompt_tokens=11),
+        timings={"prompt_n": 12},
+    )
+    fake_openai(monkeypatch, [everything])
+
+    assert list(stream_reply(LOCAL, 0.7, [])) == [
+        ("usage", {"prompt_tokens": 11}),
+        ("reasoning", "hmm"),
+        "4",
+        ("timings", {"prompt_n": 12}),
+    ]
 
 
 # ------------------------------------------------------ concurrent access

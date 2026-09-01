@@ -4,7 +4,8 @@ Available slash commands:
   /help              Show this help
   /clear             Clear conversation history
   /read PATH[:LINE]  Print a file with line numbers. Line range like main.py:10-40 or main.py:10
-  /write PATH        Write content to a file. Shift+Enter adds a newline, Enter writes it
+  /write PATH        Write content to a file. Ctrl+J adds a newline (Shift+Enter too,
+                     when your terminal reports it), Enter writes it
   /diff PATH         Show a diff between PATH and a temp copy (useful before applying changes)
   /set KEY VALUE     Change a global setting: temperature, theme, reasoning, cmd_mode,
                      debug_level. The endpoint and model belong to a profile, not here.
@@ -70,8 +71,13 @@ Available slash commands:
 Keys:
   /                  Command menu: type /, then ↑/↓ to pick, Enter runs it, Tab completes
   Enter              Submit the input, or the multi-line editor
-  Shift+Enter        Insert a newline; the first one opens the multi-line editor
-                     and carries the current text across unchanged
+  Ctrl+J             Insert a newline; the first one opens the multi-line editor
+                     and carries the current text across unchanged. The input
+                     grows a row per line and scrolls once it reaches its
+                     maximum height
+  Shift+Enter        The same action as Ctrl+J, but only when your terminal
+                     reports it distinctly; otherwise it arrives as Enter and
+                     submits, so use Ctrl+J
   Paste              Pasted text containing a line break opens the multi-line
                      editor with every line intact; it never submits by itself
    Esc                Cancel the multi-line editor; stop a reply while it streams

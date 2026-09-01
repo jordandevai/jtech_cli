@@ -12,7 +12,7 @@ from pathlib import Path
 from jtech_cli import server_info
 from jtech_cli.cmd_tools import CmdPolicy
 from jtech_cli.config import CONFIG_PATH, Profile, ResolvedProfile, Settings
-from jtech_cli.llm_client import stream_reply
+from jtech_cli.llm_client import ReplyStream, stream_reply
 from jtech_cli.server_info import ServerInfo, fetch_server_info
 from jtech_cli.session import Session
 from jtech_cli.tui_app import (
@@ -45,9 +45,15 @@ from jtech_cli.tui_widgets import (
 
 def _stream_reply_compat(
     profile: ResolvedProfile, temperature: float, messages: list[dict]
-):
-    """Late-bound stream seam retained for existing callers and tests."""
-    yield from stream_reply(profile, temperature, messages)
+) -> ReplyStream:
+    """Late-bound stream seam retained for existing callers and tests.
+
+    The name is looked up on this module at call time, which is the whole point
+    of the seam. The stream is returned rather than yielded from: wrapping it in
+    another generator would hide the cancellation handle the runtime needs to
+    close the response from the event-loop thread.
+    """
+    return stream_reply(profile, temperature, messages)
 
 
 def _fetch_server_info_compat(profile: Profile) -> ServerInfo:

@@ -129,7 +129,7 @@ class SettingsScreen(_ChatModal[None]):
     )
     _HINT_IDLE = "↑/↓ move · Enter edit · Esc close"
     _HINT_EDITING = "Enter save · Esc cancel"
-    _HINT_PROMPT_EDITING = "Enter save · Shift+Enter newline · Esc cancel"
+    _HINT_PROMPT_EDITING = "Enter save · Ctrl+J newline · Esc cancel"
 
     def __init__(
         self,

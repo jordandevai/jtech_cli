@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import threading
 from collections.abc import Iterator
+from typing import Protocol
 
-from openai import APIStatusError, OpenAI
+from openai import APIStatusError, OpenAI, Stream
+from openai.types.chat import ChatCompletionChunk
 
 from jtech_cli.config import ResolvedProfile
 
@@ -17,6 +19,24 @@ ReasoningEvent = tuple[str, str]
 UsageEvent = tuple[str, dict]
 TimingsEvent = tuple[str, dict]
 StreamItem = str | ReasoningEvent | UsageEvent | TimingsEvent
+
+
+class ReplyStream(Protocol):
+    """Synchronous reply items with an independent cancellation handle.
+
+    The caller consumes a reply on a provider thread that blocks inside the
+    read, so stopping one is not something the consumer can do between items:
+    it needs a handle it can act on from another thread while that read is
+    still parked. These two operations are all the runtime depends on, and the
+    adapter behind them owns whatever its SDK calls closing a response.
+    """
+
+    def __iter__(self) -> Iterator[StreamItem]: ...
+
+    def cancel(self) -> None:
+        """Close the provider response and unblock an active read."""
+        ...
+
 
 #: The argument that asks a server to report token usage on a stream. Named
 #: once because the retry below has to recognise a refusal *of this argument*
@@ -89,16 +109,67 @@ def make_client(profile: ResolvedProfile) -> OpenAI:
     return client
 
 
+class _OpenAIReplyStream:
+    """One OpenAI-compatible response, as `StreamItem`s plus a cancel handle.
+
+    The SDK stream stays reachable as an attribute rather than living inside a
+    generator frame. A generator's own ``close()`` is not a cross-thread
+    cancellation boundary — calling it while the generator is executing raises
+    ``ValueError: generator already executing`` — so the only handle that can
+    unblock a parked read has to outlive the iteration that is using it.
+    """
+
+    def __init__(self, source: Stream[ChatCompletionChunk]) -> None:
+        self._source = source
+
+    def __iter__(self) -> Iterator[StreamItem]:
+        """Yield every event one chunk carries, in the order it carries them."""
+        for chunk in self._source:
+            # Usage first. The chunk carrying it has an empty ``choices`` list —
+            # that is the shape ``include_usage`` asks for — so reading it after
+            # the guard below made the event unreachable on compliant servers.
+            usage = getattr(chunk, "usage", None)
+            if usage is not None and usage.prompt_tokens:
+                yield ("usage", {"prompt_tokens": usage.prompt_tokens})
+            if not chunk.choices:
+                continue
+            choice = chunk.choices[0]
+            delta = choice.delta
+            reasoning = getattr(delta, "reasoning_content", None)
+            if reasoning:
+                yield ("reasoning", reasoning)
+            if delta and delta.content:
+                yield delta.content
+            if getattr(choice, "finish_reason", None) is not None:
+                timings = getattr(chunk, "timings", None)
+                if isinstance(timings, dict):
+                    yield ("timings", timings)
+
+    def cancel(self) -> None:
+        """Close this response, and only this one.
+
+        Never the client: clients are cached and shared by transport identity,
+        so closing one would take every other agent's connection pool with it.
+        Closing the response is the strongest cancellation an OpenAI-compatible
+        streaming endpoint offers generically — a server may still keep
+        generating, but the client stops reading and its reader is released.
+        """
+        self._source.close()
+
+
 def stream_reply(
     profile: ResolvedProfile,
     temperature: float,
     messages: list[dict],
-) -> Iterator[StreamItem]:
-    """Yield content deltas from a streaming chat completion.
+) -> ReplyStream:
+    """Open a streaming chat completion and return it as a `ReplyStream`.
 
     ``profile`` is the immutable identity the caller pinned for the whole turn:
     endpoint, model, and credential all come from it, and there is no default
     model to fall back on.
+
+    The request is made here, not on first iteration, so the caller holds a
+    cancellable response as soon as this returns.
 
     Content deltas are plain ``str``. Thinking models additionally produce
     ``("reasoning", text)`` events for their reasoning tokens. Servers honouring
@@ -124,23 +195,4 @@ def stream_reply(
         # The retry differs from the request above in exactly one argument, so
         # it is only worth making when the failure was about that argument.
         stream = client.chat.completions.create(**request)
-    for chunk in stream:
-        # Usage first. The chunk carrying it has an empty ``choices`` list —
-        # that is the shape ``include_usage`` asks for — so reading it after
-        # the guard below made the event unreachable on compliant servers.
-        usage = getattr(chunk, "usage", None)
-        if usage is not None and usage.prompt_tokens:
-            yield ("usage", {"prompt_tokens": usage.prompt_tokens})
-        if not chunk.choices:
-            continue
-        choice = chunk.choices[0]
-        delta = choice.delta
-        reasoning = getattr(delta, "reasoning_content", None)
-        if reasoning:
-            yield ("reasoning", reasoning)
-        if delta and delta.content:
-            yield delta.content
-        if getattr(choice, "finish_reason", None) is not None:
-            timings = getattr(chunk, "timings", None)
-            if isinstance(timings, dict):
-                yield ("timings", timings)
+    return _OpenAIReplyStream(stream)

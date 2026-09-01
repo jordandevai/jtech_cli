@@ -191,21 +191,29 @@ error rather than resolved by guessing which endpoint was meant.
   - `tail` — show only the last 500 characters of the reasoning
   - `always` — keep the full reasoning visible after the reply
 - **Pinned input**: a single bordered input line at the bottom, above the
-  status line. `Enter` submits and `Shift+Enter` inserts a newline. The first
-  `Shift+Enter` opens the multi-line editor and creates the line in the same
+  status line. `Enter` submits and `Ctrl+J` inserts a newline; `Shift+Enter`
+  does the same only when your terminal reports it distinctly. The first
+  newline opens the multi-line editor and creates the line in the same
   keypress, carrying the current text across unchanged; in the editor `Enter`
-  submits, `Shift+Enter` adds another line, and `Esc` cancels.
+  submits, `Ctrl+J` adds another line, and `Esc` cancels. The editor border
+  grows with the draft and scrolls once it reaches its maximum height.
 - **Multi-line paste**: pasting text that contains a line break — from the
   terminal or from `Ctrl+V` — opens the multi-line editor with every line
   intact, replacing the selection if there is one. A paste never submits by
   itself; review or edit it, then press `Enter`.
-- **Esc to stop**: pressing `Esc` while a reply is streaming aborts the
-  generation and discards the partial bubble (with a dim "Generation stopped."
-  note). It applies to Primary's own work, and only while Primary is selected;
-  a selected agent's stream is read only and is never cancelled by it.
+- **Esc to stop**: pressing `Esc` while a reply is streaming closes the
+  provider response instead of waiting for another token. The partial answer
+  stays in the conversation under an `AI · stopped` label, followed by
+  `[Response interrupted by user.]`; reasoning is discarded. Future requests
+  send only that marker for the stopped turn, never the incomplete answer, so
+  half-finished prose or a truncated tool call cannot steer the next reply. It
+  applies to Primary's own work, and only while Primary is selected; a selected
+  agent's stream is read only and is never cancelled by it.
 - **Message queue**: pressing `Enter` while a reply is streaming queues the
   message — it shows as a dim "Queued" line and a count in the status bar — and
-  queued messages send in order once the reply finishes or is stopped. Press
+  queued messages send in order once the reply finishes or is stopped. A queued
+  message starts only after the stopped reply's provider stream has closed and
+  its worker has exited, so two requests are never in flight at once. Press
   `Up` (with an empty input) to pull the next queued message back into the
   input for editing, or clear it to cancel it.
 - **Status bar**: the bottom row of the app (below the input) shows the active
@@ -251,13 +259,38 @@ error rather than resolved by guessing which endpoint was meant.
 | Key | Action |
 | --- | --- |
 | `Enter` | Submit input · submit the multi-line editor |
-| `Shift+Enter` | Insert a newline (the first one opens the multi-line editor) |
+| `Ctrl+J` | Insert a newline (the first one opens and expands the multi-line editor) |
+| `Shift+Enter` | Same as `Ctrl+J` when the terminal reports it distinctly |
 | `Esc` | Cancel multi-line editor · stop a reply while it streams |
 | `Ctrl+S` | Open settings dialog |
 | `Ctrl+L` | Clear the chat (refused while a subagent is selected) |
 | `Ctrl+Q` | Quit immediately |
 | `Ctrl+C` | Copy selection · otherwise clear composer · when empty, confirm quit |
 | `Ctrl+V` | Paste the local clipboard into the focused editor |
+
+### Newline keys and your terminal
+
+`Ctrl+J` sends a literal LF, which terminals preserve, so it is the supported
+newline key. If your terminal reports `Shift+Enter` distinctly — or you map it
+to a single LF — it invokes exactly the same action. If your terminal sends a
+plain `Enter` for both keys, the application cannot tell them apart, because
+the modifier was discarded before it arrived: use `Ctrl+J`, or map
+`Shift+Enter` to one LF. Jtech-CLI has no terminal-specific code path and never
+edits your terminal, tmux, or editor configuration.
+
+- **Konsole** (optional): in *Settings → Edit Current Profile → Keyboard*, copy
+  the current keyboard scheme rather than editing
+  `/usr/share/konsole/default.keytab` in place, replace the `Return+Shift`
+  output with `key Return+Shift : "\n"`, then select the copied scheme. That
+  exact rule is untested on the measured Konsole + tmux stack — no shipped
+  keytab uses a bare `"\n"` output.
+- **VS Code**: a `sendSequence` keybinding must send one `"\u000a"`. The
+  common `"\\\r\n"` recipe is not a newline — it sends a backslash, then
+  Enter (which submits), then LF.
+- **tmux**: tmux decides how modified keys are reported. On the measured tmux
+  3.4 with `extended-keys off` — the default — `Shift+Enter` is unavailable but
+  `Ctrl+J` works. Turning `extended-keys` on is not the fix here: it reports
+  `shift+\r`, which is not `shift+enter`.
 
 ## Commands
 
@@ -267,7 +300,7 @@ error rather than resolved by guessing which endpoint was meant.
 | `/help` | Show help |
 | `/clear` | Clear history |
 | `/read PATH[:LINE]` | Print a file with line numbers (`main.py:10-40`) |
-| `/write PATH` | Write content to a file (`Shift+Enter` newline, `Enter` writes) |
+| `/write PATH` | Write content to a file (`Ctrl+J` newline, `Shift+Enter` when supported, `Enter` writes) |
 | `/diff PATH` | Create a temp copy of a file to diff against |
 | `/set KEY VALUE` | Change a global setting: temperature / theme / reasoning / cmd_mode / debug_level |
 | `/settings` | Open the settings dialog (also Ctrl+S) |
@@ -280,8 +313,10 @@ error rather than resolved by guessing which endpoint was meant.
 | `/stats` | Show history size, tokens, and context usage |
 | `/render` | Re-render the last reply as Markdown |
 
-Multi-line input: press `Shift+Enter` to add a line, then `Enter` to send. No
-closing line is needed.
+Multi-line input: press `Ctrl+J` to add a line, then `Enter` to send.
+`Shift+Enter` performs the same action only when the terminal reports it
+distinctly. The editor border grows with the draft and scrolls after reaching
+its existing maximum height. No closing line is needed.
 
 ## Project structure
 
