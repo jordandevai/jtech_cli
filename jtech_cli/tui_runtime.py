@@ -18,11 +18,13 @@ from __future__ import annotations
 import asyncio
 import functools
 import json
+import logging
 import os
 import signal
 import subprocess
 import threading
 import time
+from collections import deque
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -58,6 +60,8 @@ from jtech_cli.tui_widgets import (
     TranscriptRecord,
 )
 
+_LOG = logging.getLogger(__name__)
+
 CONNECTION_ERROR = "Connection failed — check the endpoint in /profiles"
 RENDER_ERROR = "Could not render the reply — it was not added to the conversation"
 PROMPT_ERROR = "The system prompt could not be composed — check /system and /prompt"
@@ -68,6 +72,7 @@ SPINNER_FRAMES = "-\\|/"
 #: never anchor the next completion.
 INTERRUPTED_RESPONSE = "[Response interrupted by user.]"
 STOPPED_LABEL = "AI · stopped"
+STREAM_CANCEL_ERROR = "Could not close the provider stream"
 
 MIXED_TOOLS_ERROR = (
     "Tool protocol error: one response cannot mix jtech_cmd and jtech_agent "
@@ -286,6 +291,97 @@ class RuntimeHost(Protocol):
         ...
 
 
+_STREAM_END = object()
+"""Terminal marker; the provider task is finished and nothing more will queue."""
+
+
+class _StreamEvents:
+    """Ordered handoff from the provider task to the rendering consumer.
+
+    Both run on the event loop, so this is not a thread handoff. It exists so a
+    burst of tokens that arrived while a Markdown write was awaited can be
+    drained and coalesced into one write, instead of costing one awaited write
+    per token — which on a fast local model is most of them.
+    """
+
+    def __init__(self) -> None:
+        self._items: deque = deque()
+        self._ready = asyncio.Event()
+        self._closed = False
+
+    def put(self, item) -> None:
+        """Queue one event and wake the consumer."""
+        self._items.append(item)
+        self._ready.set()
+
+    def close(self) -> None:
+        """Mark the producer finished; the consumer stops after it drains."""
+        self._closed = True
+        self._ready.set()
+
+    @property
+    def finished(self) -> bool:
+        """Whether the producer is done and every queued event was drained."""
+        return self._closed and not self._items
+
+    async def drain(self) -> list:
+        """Await and return every event queued since the last drain, in order."""
+        await self._ready.wait()
+        batch = list(self._items)
+        self._items.clear()
+        if not self._closed:
+            self._ready.clear()
+        return batch
+
+
+class StreamCloseAborted(RuntimeError):
+    """A provider response close did not run to completion.
+
+    Distinct from a close that raised: nothing is known about whether the
+    connection was released, which is a cleanup failure in its own right and
+    never something to report as a clean stop.
+    """
+
+
+async def _await_through_cancel(task: asyncio.Future) -> asyncio.CancelledError | None:
+    """Wait for ``task``, deferring a cancellation of this coroutine.
+
+    Releasing a provider response is not optional work, and the cancellations
+    that interrupt it are exactly the ones that make it necessary: a second
+    ``Esc``, or application teardown. They are held rather than obeyed, and
+    returned so the caller can restore them once the cleanup is finished —
+    absorbing one outright would strand the caller's own unwinding.
+    """
+    deferred: asyncio.CancelledError | None = None
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as cancelled:
+            if task.done():
+                # ``task`` cancelled itself. That is its outcome for the caller
+                # to inspect, not a cancellation of this coroutine to restore.
+                break
+            deferred = cancelled
+        except Exception:  # noqa: BLE001 - the caller inspects the task
+            break
+    return deferred
+
+
+async def _close_response(
+    stream: ReplyStream,
+) -> tuple[Exception | None, asyncio.CancelledError | None]:
+    """Close one provider response, reporting rather than raising a failure.
+
+    Returns the close failure, if any, and any cancellation that arrived while
+    the close was in flight for the caller to restore.
+    """
+    closing = asyncio.ensure_future(stream.aclose())
+    deferred = await _await_through_cancel(closing)
+    if closing.cancelled():
+        return StreamCloseAborted("the close was cancelled before it completed"), deferred
+    return closing.exception(), deferred
+
+
 def _interrupted_content(partial: str) -> str:
     """Return exact partial answer text followed by the durable stop marker.
 
@@ -446,6 +542,10 @@ class AutonomousRuntime:
         """
         state = self._state
         if state.generating:
+            if state.stop_event.is_set():
+                # Already stopping. Cancelling again would land on whatever is
+                # now cleaning up after the first stop.
+                return
             state.stop_event.set()
             task = self._provider_task
             if task is None:
@@ -585,6 +685,9 @@ class AutonomousRuntime:
         ai_entry: MarkdownTail | None = None
         timer: Timer | None = None
         provider_task: asyncio.Task[None] | None = None
+        stream: ReplyStream | None = None
+        close_error: Exception | None = None
+        released = False
         # Everything below is live state. Acquiring it is fallible — a widget
         # mount, a Markdown stream, a timer — so the release path starts here
         # rather than after the last thing that can fail.
@@ -676,30 +779,68 @@ class AutonomousRuntime:
                 tick_count += 1
                 update_label()
 
+            async def release_stream() -> None:
+                """End the reader and close its response, exactly once.
+
+                Idempotent because the normal path calls it as soon as the
+                stream is done with, and the ``finally`` calls it again for the
+                paths that never got there.
+                """
+                nonlocal released, close_error
+                if released:
+                    return
+                released = True
+                deferred: asyncio.CancelledError | None = None
+                if provider_task is not None:
+                    if not provider_task.done():
+                        provider_task.cancel()
+                    deferred = await _await_through_cancel(provider_task)
+                if stream is not None:
+                    close_error, close_deferred = await _close_response(stream)
+                    deferred = deferred or close_deferred
+                if deferred is not None:
+                    # The cleanup is done; the caller's cancellation is not this
+                    # coroutine's to discard, so it goes back the way it came.
+                    raise deferred
+
             # The timer belongs to the transcript it repaints, so it is scoped
             # to one run's own widget rather than to the whole app.
             timer = chat.set_interval(1.0, tick)
+            events = _StreamEvents()
 
             async def consume() -> None:
-                """Read and render one provider response until it ends.
+                """Read one provider response into the queue. Nothing else.
 
-                This is the cancellable unit. Every await in it — opening the
-                request, and each item — is a point the runtime can stop at,
-                and the response is closed on the way out however it ends.
+                This is the cancellable unit, so it is deliberately the part
+                that owns no cleanup: it does not render and does not close the
+                response. Cancelling it can therefore never interrupt the
+                release of what it opened.
                 """
-                nonlocal timings, got_item, got_content
-                nonlocal content_chars, reasoning_chars, render_error
+                nonlocal stream
                 stream = await self._stream_reply_fn(profile, temperature, messages)
-                try:
-                    async for item in stream:
+                async for item in stream:
+                    events.put(item)
+
+            provider_task = asyncio.create_task(consume())
+            self._provider_task = provider_task
+            # However the task ends — exhausted, failed, or cancelled before it
+            # ever ran — the consumer is released.
+            provider_task.add_done_callback(lambda _task: events.close())
+
+            try:
+                while True:
+                    batch = await events.drain()
+                    content_deltas: list[str] = []
+                    reason_deltas: list[str] = []
+                    for item in batch:
+                        if item is _STREAM_END:
+                            continue
                         got_item = True
-                        reason_delta = ""
-                        content_delta = ""
                         if isinstance(item, tuple):
                             kind, payload = item
                             if kind == "reasoning":
                                 reasoning_chars += len(payload)
-                                reason_delta = payload
+                                reason_deltas.append(payload)
                             elif kind == "usage":
                                 self._set_prompt_tokens(payload["prompt_tokens"])
                             elif kind == "timings":
@@ -712,40 +853,37 @@ class AutonomousRuntime:
                             content_chars += len(item)
                             if item:
                                 got_content = True
-                                content_delta = item
-                        # /clear can unmount the live bubbles mid-stream; the
-                        # answer keeps accumulating for the model, but there is
-                        # nothing left to paint.
-                        if not label.is_mounted:
-                            continue
-                        try:
-                            apply_reasoning(reason_delta)
-                            if content_delta:
-                                await ai_stream.write(content_delta)
-                            update_label()
-                        except Exception as exc:  # noqa: BLE001 - ends the turn
-                            # A broken renderer has no provider thread to
-                            # surface it and must not latch ``generating``, so
-                            # it is reported like any other stream failure and
-                            # the completion ends.
-                            render_error = exc
-                            return
-                finally:
-                    # Closed on every exit, cancellation included. This is what
-                    # disconnects a response the server would otherwise hold
-                    # open, and it happens before the turn is released.
-                    await stream.aclose()
+                                content_deltas.append(item)
+                    # /clear can unmount the live bubbles mid-stream; the answer
+                    # keeps accumulating for the model, but there is nothing
+                    # left to paint.
+                    if label.is_mounted:
+                        apply_reasoning("".join(reason_deltas))
+                        combined_delta = "".join(content_deltas)
+                        if combined_delta:
+                            # Awaited, not detached: everything the provider
+                            # queues while this is outstanding is drained into
+                            # the next write rather than costing its own.
+                            await ai_stream.write(combined_delta)
+                        update_label()
+                    if events.finished:
+                        break
+            except Exception as exc:  # noqa: BLE001 - a broken renderer ends the turn
+                # Rendering happens here rather than in the provider task, so a
+                # failure has nothing to surface it. Leaving it to propagate
+                # would latch ``generating`` and queue every later message
+                # behind a turn that can never finish.
+                render_error = exc
+            finally:
+                timer.stop()
 
-            provider_task = asyncio.create_task(consume())
-            self._provider_task = provider_task
-            # ``wait`` never re-raises the task's own outcome, so a provider
-            # failure, a stop, and a cancellation of *this* coroutine stay
-            # three distinguishable things instead of one CancelledError.
-            await asyncio.wait({provider_task})
+            # The reader is finished with, and its response is released, before
+            # anything below decides what this completion was.
+            await release_stream()
+            self._report_close_failure(close_error, visible=True)
             if not provider_task.cancelled():
                 stream_error = provider_task.exception()
 
-            timer.stop()
             await ai_stream.stop()
             async with ai_md.lock:
                 pass
@@ -806,21 +944,31 @@ class AutonomousRuntime:
         finally:
             if timer is not None:
                 timer.stop()
-            if provider_task is not None and not provider_task.done():
-                # Unwinding before the task finished: this coroutine was
-                # cancelled, or something after the stream failed. The turn is
-                # not released until the task has ended and — in its own
-                # ``finally`` — closed its response. Releasing it earlier would
-                # let the queued message open a second, overlapping request.
-                provider_task.cancel()
-                await asyncio.wait({provider_task})
-            self._provider_task = None
-            for entry in (ai_entry, reason_entry):
-                if entry is not None and entry.state == "live":
-                    # Nothing finalized it, so acquiring live state failed part
-                    # way. A live entry left behind is a bubble stuck on "live".
-                    chat.remove(entry)
-            self._set_generating(False)
+            try:
+                if provider_task is not None and not released:
+                    # Unwinding before the normal release ran: this coroutine
+                    # was cancelled, or something after the stream failed. The
+                    # turn is not released until the reader has ended and its
+                    # response has been closed — releasing earlier would let the
+                    # queued message open a second, overlapping request against
+                    # a live connection.
+                    await release_stream()
+                    # Log only. This path is teardown or an already-reported
+                    # failure, and run() is explicit that teardown has no reader
+                    # left for a status write.
+                    self._report_close_failure(close_error, visible=False)
+            finally:
+                # Runs even when the release restores a deferred cancellation:
+                # a latched ``generating`` would queue every later message
+                # behind a turn that can never finish.
+                self._provider_task = None
+                for entry in (ai_entry, reason_entry):
+                    if entry is not None and entry.state == "live":
+                        # Nothing finalized it, so acquiring live state failed
+                        # part way, and a live entry left behind is a bubble
+                        # stuck on "live" forever.
+                        chat.remove(entry)
+                self._set_generating(False)
 
     # -------------------------------------------------------------- commands
 
@@ -995,6 +1143,22 @@ class AutonomousRuntime:
         except OSError as error:
             self._show("system", f"Could not save history: {error}")
 
+    def _report_close_failure(self, error: Exception | None, *, visible: bool) -> None:
+        """Report a failure to close a provider response.
+
+        A response the CLI could not release is not a clean stop, and saying
+        nothing would imply it was, so it is always logged. It is additionally
+        shown only when there is a reader for it: an interactive stop still has
+        its transcript, while teardown has no remaining UI and the log is its
+        whole report. The warning is never persisted and never model-facing —
+        the conversation record is the interruption, not a socket.
+        """
+        if error is None:
+            return
+        _LOG.error("Could not close the provider stream", exc_info=error)
+        if visible:
+            self._show("system", f"{STREAM_CANCEL_ERROR}: {error}")
+
     def _show(self, role: str, content: str) -> None:
         """Add one already-complete message to this run's own transcript."""
         self._state.transcript.append(TranscriptRecord(role=role, content=content))
@@ -1075,6 +1239,7 @@ __all__ = [
     "RENDER_ERROR",
     "SPINNER_FRAMES",
     "STOPPED_LABEL",
+    "STREAM_CANCEL_ERROR",
     "SUBAGENT_DISPATCH_ERROR",
     "AgentOutcome",
     "AgentRunState",
@@ -1082,6 +1247,7 @@ __all__ = [
     "CommandAuthorization",
     "RunOutcome",
     "RuntimeHost",
+    "StreamCloseAborted",
     "StreamReply",
     "duplicate_keys_message",
     "parse_errors_message",

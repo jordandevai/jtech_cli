@@ -7,6 +7,7 @@ app is deliberately absent: what is proved here is the loop, not the TUI.
 
 import asyncio
 import json
+import logging
 import os
 import pathlib
 import socket
@@ -28,12 +29,14 @@ from jtech_cli.tui_runtime import (
     MIXED_TOOLS_ERROR,
     PROMPT_ERROR,
     STOPPED_LABEL,
+    STREAM_CANCEL_ERROR,
     SUBAGENT_DISPATCH_ERROR,
     AgentOutcome,
     AgentRunState,
     AutonomousRuntime,
     CommandAuthorization,
     RunOutcome,
+    StreamCloseAborted,
     _CompletionOutcome,
 )
 from jtech_cli.tui_widgets import MarkdownTail, Transcript
@@ -678,6 +681,176 @@ async def test_reasoning_only_stop_never_records_reasoning():
     assert not any("secret thoughts" in m["content"] for m in session.messages)
     assert not any("secret thoughts" in record.content for record in records)
     assert not any(record.role == "reasoning" for record in records)
+
+
+class _SlowClosingStream(_BlockingReplyStream):
+    """A stream whose response takes a while to close, and may refuse to."""
+
+    def __init__(self, first="partial", *, close_delay=0.2, close_error=None):
+        super().__init__(first)
+        self._close_delay = close_delay
+        self._close_error = close_error
+        self.close_started = asyncio.Event()
+
+    async def aclose(self):
+        self.close_started.set()
+        await asyncio.sleep(self._close_delay)
+        if self._close_error is not None:
+            raise self._close_error
+        self.closed += 1
+
+
+async def test_a_second_stop_cannot_interrupt_the_response_close():
+    """Esc pressed again mid-cleanup must not abandon an unclosed response.
+
+    The second stop used to land on whatever was cleaning up after the first,
+    cancelling the close and releasing the turn with the connection still open.
+    """
+    stream = _SlowClosingStream()
+    session = Session(persist=False)
+    async with _Harness().run_test() as pilot:
+        runtime, _ = make_runtime(
+            pilot.app, reply_stream_factory(stream), session=session
+        )
+        task = asyncio.create_task(runtime.run())
+        await wait_for(pilot, stream.blocked.is_set)
+
+        runtime.request_stop()
+        await wait_for(pilot, stream.close_started.is_set)
+        assert not task.done()  # still closing
+
+        runtime.request_stop()  # the second Esc, mid-close
+        runtime.request_stop()  # and a third, for good measure
+        outcome = await asyncio.wait_for(task, 10)
+
+    assert stream.closed == 1  # the close completed rather than being cancelled
+    assert outcome == RunOutcome("stopped")
+    assert runtime.state.generating is False
+
+
+async def test_a_close_failure_is_logged_and_reported_not_passed_off_as_clean(
+    caplog,
+):
+    """A response the CLI could not release is never reported as a clean stop."""
+    caplog.set_level(logging.ERROR, logger="jtech_cli.tui_runtime")
+    stream = _SlowClosingStream(close_delay=0, close_error=RuntimeError("close failed"))
+    session = Session(persist=False)
+    async with _Harness().run_test() as pilot:
+        runtime, _ = make_runtime(
+            pilot.app, reply_stream_factory(stream), session=session
+        )
+        task = asyncio.create_task(runtime.run())
+        await wait_for(pilot, stream.blocked.is_set)
+
+        runtime.request_stop()
+        outcome = await asyncio.wait_for(task, 10)
+        records = list(pilot.app.query_one("#chat", Transcript).history.records)
+
+    assert outcome == RunOutcome("stopped")
+    logged = [r for r in caplog.records if r.levelno == logging.ERROR and r.exc_info]
+    assert logged, caplog.records
+    assert "close failed" in str(logged[0].exc_info[1])
+
+    warnings = [r for r in records if STREAM_CANCEL_ERROR in r.content]
+    assert len(warnings) == 1
+    assert "close failed" in warnings[0].content
+    # visible only: the model sees the interruption, not the socket trouble
+    assert not any(STREAM_CANCEL_ERROR in m["content"] for m in session.messages)
+
+
+async def test_teardown_cancellation_survives_a_blocked_close():
+    """Cleanup is protected, but the caller's cancellation is not discarded.
+
+    Cancelling the run while the response is closing must still finish the
+    close and still cancel the run. Swallowing it returned a completed outcome
+    for a turn the app was shutting down.
+    """
+    stream = _SlowClosingStream(close_delay=0.3)
+    session = Session(persist=False)
+    async with _Harness().run_test() as pilot:
+        runtime, _ = make_runtime(
+            pilot.app, reply_stream_factory(stream), session=session
+        )
+        task = asyncio.create_task(runtime.run())
+        await wait_for(pilot, stream.blocked.is_set)
+
+        runtime.request_stop()
+        await wait_for(pilot, stream.close_started.is_set)
+
+        task.cancel()  # application teardown, landing mid-close
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 10)
+
+    assert stream.closed == 1  # the close still completed
+    assert runtime.state.generating is False
+
+
+async def test_a_cancelled_close_is_a_cleanup_failure_not_a_clean_stop(caplog):
+    """A close that never completed says so; it is not silently a success."""
+    caplog.set_level(logging.ERROR, logger="jtech_cli.tui_runtime")
+
+    class _SelfCancellingClose(_BlockingReplyStream):
+        async def aclose(self):
+            raise asyncio.CancelledError
+
+    stream = _SelfCancellingClose()
+    session = Session(persist=False)
+    async with _Harness().run_test() as pilot:
+        runtime, _ = make_runtime(
+            pilot.app, reply_stream_factory(stream), session=session
+        )
+        task = asyncio.create_task(runtime.run())
+        await wait_for(pilot, stream.blocked.is_set)
+
+        runtime.request_stop()
+        outcome = await asyncio.wait_for(task, 10)
+        records = list(pilot.app.query_one("#chat", Transcript).history.records)
+
+    assert outcome == RunOutcome("stopped")
+    logged = [r for r in caplog.records if r.levelno == logging.ERROR and r.exc_info]
+    assert logged, caplog.records
+    assert isinstance(logged[0].exc_info[1], StreamCloseAborted)
+    assert any(STREAM_CANCEL_ERROR in r.content for r in records)
+
+
+async def test_teardown_close_failure_is_logged_but_not_drawn(caplog):
+    """Teardown has no reader left, so its report is the log and nothing else."""
+    caplog.set_level(logging.ERROR, logger="jtech_cli.tui_runtime")
+    stream = _SlowClosingStream(close_delay=0, close_error=RuntimeError("close failed"))
+    session = Session(persist=False)
+    async with _Harness().run_test() as pilot:
+        runtime, _ = make_runtime(
+            pilot.app, reply_stream_factory(stream), session=session
+        )
+        task = asyncio.create_task(runtime.run())
+        await wait_for(pilot, stream.blocked.is_set)
+
+        task.cancel()  # teardown, with no stop requested first
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 10)
+        records = list(pilot.app.query_one("#chat", Transcript).history.records)
+
+    logged = [r for r in caplog.records if r.levelno == logging.ERROR and r.exc_info]
+    assert logged, caplog.records
+    assert "close failed" in str(logged[0].exc_info[1])
+    assert not any(STREAM_CANCEL_ERROR in r.content for r in records)
+    assert not any(STREAM_CANCEL_ERROR in m["content"] for m in session.messages)
+    assert runtime.state.generating is False
+
+
+async def test_stream_events_coalesce_a_burst_behind_one_drain():
+    """A burst queued while the consumer was busy comes back as one batch."""
+    events = tui_runtime._StreamEvents()
+    for item in ["a", ("reasoning", "r"), "b"]:
+        events.put(item)
+
+    assert await events.drain() == ["a", ("reasoning", "r"), "b"]
+    assert not events.finished
+
+    events.put("c")
+    events.close()
+    assert await events.drain() == ["c"]
+    assert events.finished
 
 
 # ------------------------------------------------------- transport boundary

@@ -2787,6 +2787,75 @@ def ai_label_updates(calls: list[tuple[Static, object]]) -> list[str]:
     ]
 
 
+class GatedBurstStream:
+    """Emits one item, waits to be told to continue, then bursts the rest."""
+
+    def __init__(self, first, *rest):
+        self.first = first
+        self.rest = rest
+        self.produced = asyncio.Event()  # set by the test to release the burst
+        self.finished = asyncio.Event()
+        self.closed = 0
+
+    def __aiter__(self):
+        return self._items()
+
+    async def _items(self):
+        yield self.first
+        await self.produced.wait()
+        for item in self.rest:
+            yield item
+        self.finished.set()
+
+    async def aclose(self) -> None:
+        self.closed += 1
+
+
+async def test_chunks_produced_during_a_blocked_write_are_combined(tmp_path, monkeypatch):
+    """Backlog is coalesced into the next awaited write, not one write per token.
+
+    The provider task only queues; the consumer drains. Everything that arrives
+    while a write is outstanding therefore rides in the next one.
+    """
+    app = make_app(tmp_path)
+    release = asyncio.Event()
+    writes = record_markdown_writes(monkeypatch, gate=release)
+    stream = GatedBurstStream("A", "B", "C", "D")
+
+    async def provider(profile, temperature, messages):
+        return stream
+
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", provider)
+    async with app.run_test() as pilot:
+        app.query_one("#input", Input).value = "go"
+        await pilot.press("enter")
+        await _wait_until(app, pilot, lambda: writes == ["A"], tries=100)
+
+        # B, C and D are produced while the first write is still outstanding
+        stream.produced.set()
+        await _wait_until(app, pilot, stream.finished.is_set, tries=100)
+        release.set()
+        await _wait_until(app, pilot, lambda: not app._generating, tries=100)
+
+        assert writes == ["A", "BCD"]
+        assert app.session.messages[-1] == {"role": "assistant", "content": "ABCD"}
+
+
+async def test_a_long_stream_costs_far_fewer_writes_than_deltas(tmp_path, monkeypatch):
+    """Coalescing is load-bearing: 300 deltas must not cost 300 awaited writes."""
+    app = make_app(tmp_path)
+    chunks = [f"c{index} " for index in range(300)]
+    writes = record_markdown_writes(monkeypatch)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", stream_of(*chunks))
+    async with app.run_test() as pilot:
+        app.query_one("#input", Input).value = "go"
+        await pilot.press("enter")
+        await _wait_until(app, pilot, lambda: not app._generating, tries=100)
+
+        assert "".join(writes) == "".join(chunks)
+        assert len(writes) < len(chunks)
+
+
 async def test_markdown_writes_reproduce_the_provider_content(tmp_path, monkeypatch):
     """Whatever the batching, the writes concatenate back to the source text."""
     app = make_app(tmp_path)
@@ -2869,8 +2938,8 @@ async def test_reasoning_hide_counts_without_mounting_a_bubble(tmp_path, monkeyp
         assert any("4" in b for b in bubbles(app))
 
 
-async def test_reasoning_always_grows_one_text_by_append(tmp_path, monkeypatch):
-    """Each delta extends one retained ``Text``; it is never re-joined."""
+async def test_reasoning_always_renders_a_batch_once(tmp_path, monkeypatch):
+    """Deltas drained together cost one repaint, not one per delta."""
     app = make_app(tmp_path, settings=make_settings("always"))
     updates = record_static_updates(monkeypatch)
     monkeypatch.setattr(
@@ -2881,11 +2950,7 @@ async def test_reasoning_always_grows_one_text_by_append(tmp_path, monkeypatch):
         await _send_and_drain(app, pilot, "what is 2+2")
 
         assert reasoning_bodies(app) == ["hmm ok"]
-        # One repaint per delta, and every repaint handed over the *same*
-        # growing ``Text`` — which is why both read as the final value here.
-        # A mode that re-joined its fragments would hand over new strings.
-        assert len(reasoning_updates(updates)) == 2
-        assert set(reasoning_updates(updates)) == {"hmm ok"}
+        assert reasoning_updates(updates) == ["hmm ok"]  # two deltas, one repaint
         assert any("4" in b for b in bubbles(app))
 
 
@@ -2901,7 +2966,7 @@ async def test_reasoning_tail_keeps_only_the_bounded_tail(tmp_path, monkeypatch)
         await _send_and_drain(app, pilot, "what is 2+2")
 
         assert reasoning_bodies(app) == ["…" + full[-500:]]
-        assert reasoning_updates(updates)[-1] == "…" + full[-500:]
+        assert reasoning_updates(updates) == ["…" + full[-500:]]
         assert any("4" in b for b in bubbles(app))
 
 
