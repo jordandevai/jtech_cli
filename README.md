@@ -201,8 +201,9 @@ error rather than resolved by guessing which endpoint was meant.
   terminal or from `Ctrl+V` — opens the multi-line editor with every line
   intact, replacing the selection if there is one. A paste never submits by
   itself; review or edit it, then press `Enter`.
-- **Esc to stop**: pressing `Esc` while a reply is streaming closes the
-  provider response instead of waiting for another token. The partial answer
+- **Esc to stop**: pressing `Esc` while a reply is streaming cancels the read
+  and disconnects the provider response, rather than waiting for another token
+  that may never come. The partial answer
   stays in the conversation under an `AI · stopped` label, followed by
   `[Response interrupted by user.]`; reasoning is discarded. Future requests
   send only that marker for the stopped turn, never the incomplete answer, so
@@ -212,8 +213,8 @@ error rather than resolved by guessing which endpoint was meant.
 - **Message queue**: pressing `Enter` while a reply is streaming queues the
   message — it shows as a dim "Queued" line and a count in the status bar — and
   queued messages send in order once the reply finishes or is stopped. A queued
-  message starts only after the stopped reply's provider stream has closed and
-  its worker has exited, so two requests are never in flight at once. Press
+  message starts only after the stopped reply's response has been closed and
+  its reader has ended, so two requests are never in flight at once. Press
   `Up` (with an empty input) to pull the next queued message back into the
   input for editing, or clear it to cancel it.
 - **Status bar**: the bottom row of the app (below the input) shows the active

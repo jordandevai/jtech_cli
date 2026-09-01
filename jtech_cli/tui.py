@@ -43,17 +43,16 @@ from jtech_cli.tui_widgets import (
 )
 
 
-def _stream_reply_compat(
+async def _stream_reply_compat(
     profile: ResolvedProfile, temperature: float, messages: list[dict]
 ) -> ReplyStream:
     """Late-bound stream seam retained for existing callers and tests.
 
     The name is looked up on this module at call time, which is the whole point
-    of the seam. The stream is returned rather than yielded from: wrapping it in
-    another generator would hide the cancellation handle the runtime needs to
-    close the response from the event-loop thread.
+    of the seam. Awaiting and returning the stream keeps that lookup late while
+    handing the runtime the object it cancels and closes.
     """
-    return stream_reply(profile, temperature, messages)
+    return await stream_reply(profile, temperature, messages)
 
 
 def _fetch_server_info_compat(profile: Profile) -> ServerInfo:

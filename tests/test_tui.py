@@ -47,8 +47,6 @@ from jtech_cli.tui_runtime import (
     INTERRUPTED_RESPONSE,
     STOPPED_LABEL,
     AutonomousRuntime,
-    _StreamEnd,
-    _StreamInbox,
 )
 from jtech_cli.tui_widgets import (
     AgentSummary,
@@ -174,29 +172,32 @@ def at_bottom(chat) -> bool:
 
 
 class BlockingStream:
-    """A `ReplyStream` parked in its read until the app cancels it.
+    """A `ReplyStream` that emits one item and then never produces another.
 
-    A test that stops a stream must not also be the thing that releases it:
-    opening a gate by hand proves the runtime waited, not that it cancelled.
-    Only ``cancel()`` — which is what pressing ``Esc`` reaches — ends this one.
+    Only cancellation ends it. A test that opens a gate by hand proves the
+    runtime waited, not that it stopped the read.
     """
 
     def __init__(self, first: str = "partial "):
         self.first = first
-        self.blocked = threading.Event()  # set once the reader is parked
-        self._released = threading.Event()  # set only by cancel()
-        self.cancels = 0
-        self.ended = False
+        self.blocked = asyncio.Event()  # set once the reader is parked
+        self.cancelled = False
+        self.closed = 0
 
-    def __iter__(self):
+    def __aiter__(self):
+        return self._items()
+
+    async def _items(self):
         yield self.first
         self.blocked.set()
-        self._released.wait(10)
-        self.ended = True
+        try:
+            await asyncio.Event().wait()  # never set by anyone
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
 
-    def cancel(self) -> None:
-        self.cancels += 1
-        self._released.set()
+    async def aclose(self) -> None:
+        self.closed += 1
 
 
 class FiniteStream:
@@ -204,19 +205,69 @@ class FiniteStream:
 
     def __init__(self, *items):
         self.items = items
-        self.cancels = 0
+        self.closed = 0
 
-    def __iter__(self):
-        yield from self.items
+    def __aiter__(self):
+        return self._items()
 
-    def cancel(self) -> None:
-        self.cancels += 1
+    async def _items(self):
+        for item in self.items:
+            yield item
+
+    async def aclose(self) -> None:
+        self.closed += 1
+
+
+class SyncStream:
+    """A `ReplyStream` over a synchronous generator of stream items.
+
+    Each item is pulled off the event loop. Several fakes here block between
+    yields to hold a stream open while the test does something else; doing that
+    on a worker thread is exactly what the provider thread used to do for them,
+    so their bodies keep working unchanged while production is fully async.
+    """
+
+    def __init__(self, items):
+        self._items = items
+        self.closed = 0
+
+    def __aiter__(self):
+        return self._iterate()
+
+    async def _iterate(self):
+        done = object()
+        while True:
+            item = await asyncio.to_thread(next, self._items, done)
+            if item is done:
+                return
+            yield item
+
+    async def aclose(self) -> None:
+        self.closed += 1
+
+
+def sync_stream(fn):
+    """Adapt a synchronous generator fake to the async `stream_reply` seam."""
+
+    async def factory(profile, temperature, messages):
+        return SyncStream(fn(profile, temperature, messages))
+
+    return factory
+
+
+def stream_of(*items):
+    """A `stream_reply` stand-in producing ``items`` for every request."""
+
+    async def factory(profile, temperature, messages):
+        return FiniteStream(*items)
+
+    return factory
 
 
 async def test_submit_shows_user_and_ai_bubble(tmp_path, monkeypatch):
     app = make_app(tmp_path)
     monkeypatch.setattr(
-        "jtech_cli.tui.stream_reply", lambda profile, temperature, messages: iter(["hi ", "there"])
+        "jtech_cli.tui.stream_reply", stream_of("hi ", "there")
     )
     async with app.run_test() as pilot:
         inp = app.query_one("#input", Input)
@@ -247,7 +298,7 @@ async def test_long_code_line_wraps_in_fence(tmp_path, monkeypatch):
     long_word = "z" * 300
     reply = f"```\n{long_word}\nafter-line\n```\n"
     monkeypatch.setattr(
-        "jtech_cli.tui.stream_reply", lambda profile, temperature, messages: iter([reply])
+        "jtech_cli.tui.stream_reply", stream_of(reply)
     )
     app = make_app(tmp_path)
     async with app.run_test() as pilot:
@@ -327,7 +378,7 @@ async def test_input_responsive_after_connection_error(tmp_path, monkeypatch):
             raise RuntimeError("boom")
         return iter(["ok"])
 
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(fake))
     async with app.run_test() as pilot:
         inp = app.query_one("#input", Input)
         inp.value = "first"
@@ -543,7 +594,7 @@ async def test_settings_prompt_editor_keeps_every_pasted_line(tmp_path):
 
 async def test_input_works_after_opening_and_closing_settings(tmp_path, monkeypatch):
     app = make_app(tmp_path)
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", lambda profile, temperature, messages: iter(["ok"]))
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", stream_of("ok"))
     async with app.run_test() as pilot:
         app.action_settings()
         await pilot.pause()
@@ -591,7 +642,7 @@ async def test_status_is_last_row_of_root(tmp_path):
 
 async def test_clear_empties_chat(tmp_path, monkeypatch):
     app = make_app(tmp_path)
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", lambda profile, temperature, messages: iter(["ok"]))
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", stream_of("ok"))
     async with app.run_test() as pilot:
         inp = app.query_one("#input", Input)
         inp.value = "hello"
@@ -710,7 +761,7 @@ async def test_prompt_editor_newline_keys_replace_the_selection(
 
 async def test_heredoc_multiline_sends_message(tmp_path, monkeypatch):
     app = make_app(tmp_path)
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", lambda profile, temperature, messages: iter(["ok"]))
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", stream_of("ok"))
     async with app.run_test() as pilot:
         ta = await _enter_multiline(app, pilot, "'''")
         await type_text(pilot, "line one")
@@ -840,7 +891,7 @@ async def test_paste_then_character_keeps_the_typed_character(tmp_path):
 async def test_paste_then_enter_sends_the_pasted_draft_exactly_once(tmp_path, monkeypatch):
     """A racing Enter must send the composed draft, never the pre-paste one."""
     app = make_app(tmp_path)
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", lambda profile, temperature, messages: iter(["ok"]))
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", stream_of("ok"))
     async with app.run_test(size=(80, 24)) as pilot:
         inp = app.query_one("#input", Input)
         inp.value = "draft "
@@ -914,7 +965,7 @@ async def test_multiline_cancel_restores_input(tmp_path):
 async def test_shift_enter_opens_prefilled_multiline(tmp_path, monkeypatch, reverse):
     """One keypress must both expand the editor and make the newline."""
     app = make_app(tmp_path)
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", lambda profile, temperature, messages: iter(["ok"]))
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", stream_of("ok"))
     async with app.run_test() as pilot:
         inp = app.query_one("#input", Input)
         inp.value = "prefix DROP suffix"
@@ -1000,7 +1051,7 @@ async def test_ctrl_j_edits_and_grows_open_multiline(tmp_path, monkeypatch) -> N
     app = make_app(tmp_path)
     monkeypatch.setattr(
         "jtech_cli.tui.stream_reply",
-        lambda profile, temperature, messages: iter(["ok"]),
+        stream_of("ok"),
     )
     async with app.run_test(size=(80, 24)) as pilot:
         opened = await _enter_multiline(app, pilot, "'''")
@@ -1088,7 +1139,7 @@ def reason_stream(profile, temperature, messages):
 async def test_reasoning_default_transient_shown_then_hidden(tmp_path, monkeypatch):
     """Default mode: reasoning streams in its own bubble, removed once the answer starts."""
     app = make_app(tmp_path)
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", reason_stream)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(reason_stream))
     async with app.run_test() as pilot:
         await _send_and_drain(app, pilot, "what is 2+2")
 
@@ -1104,7 +1155,7 @@ async def test_reasoning_default_transient_shown_then_hidden(tmp_path, monkeypat
 
 async def test_reasoning_hidden_mode_never_shown(tmp_path, monkeypatch):
     app = make_app(tmp_path, settings=make_settings("hide"))
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", reason_stream)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(reason_stream))
     async with app.run_test() as pilot:
         await _send_and_drain(app, pilot, "what is 2+2")
 
@@ -1125,7 +1176,7 @@ async def test_reasoning_hidden_mode_never_shown(tmp_path, monkeypatch):
 
 async def test_reasoning_always_kept_in_separate_bubble(tmp_path, monkeypatch):
     app = make_app(tmp_path, settings=make_settings("always"))
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", reason_stream)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(reason_stream))
     async with app.run_test() as pilot:
         await _send_and_drain(app, pilot, "what is 2+2")
 
@@ -1139,7 +1190,7 @@ async def test_reasoning_tail_caps_at_500_chars(tmp_path, monkeypatch):
     full = "x" * 300 + "tail-marker" + "y" * 900  # 1213 chars
     app = make_app(tmp_path, settings=make_settings("tail"))
     monkeypatch.setattr(
-        "jtech_cli.tui.stream_reply", lambda profile, temperature, messages: iter([("reasoning", full), "4"])
+        "jtech_cli.tui.stream_reply", stream_of(("reasoning", full), "4")
     )
     async with app.run_test() as pilot:
         await _send_and_drain(app, pilot, "what is 2+2")
@@ -1156,7 +1207,7 @@ async def test_waiting_label_ticks_without_tokens(tmp_path, monkeypatch):
         time.sleep(1.5)
         yield "ok"
 
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(fake))
     async with app.run_test() as pilot:
         await _send_and_drain(app, pilot, "hi")
         seen = set()
@@ -1205,7 +1256,7 @@ async def test_chat_follows_streaming_reasoning(tmp_path, monkeypatch):
         yield ("reasoning", "more thoughts ")
         yield "4"
 
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", slow_reason)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(slow_reason))
     async with app.run_test(size=(80, 10)) as pilot:
         await _send_and_drain(app, pilot, "what is 2+2")
 
@@ -1250,9 +1301,7 @@ async def test_prompt_timings_shown_in_ai_label(tmp_path, monkeypatch):
     app = make_app(tmp_path)
     monkeypatch.setattr(
         "jtech_cli.tui.stream_reply",
-        lambda profile, temperature, messages: iter(
-            ["ok", ("timings", {"prompt_n": 170, "prompt_ms": 594.8, "prompt_per_second": 285.8})]
-        ),
+        stream_of("ok", ("timings", {"prompt_n": 170, "prompt_ms": 594.8, "prompt_per_second": 285.8})),
     )
     async with app.run_test() as pilot:
         inp = app.query_one("#input", Input)
@@ -1288,9 +1337,10 @@ async def test_esc_stops_stream_and_retains_marked_partial(tmp_path, monkeypatch
     app = make_app(tmp_path, settings=make_settings("always"))
     stream = BlockingStream()
 
-    monkeypatch.setattr(
-        "jtech_cli.tui.stream_reply", lambda profile, temperature, messages: stream
-    )
+    async def provider(profile, temperature, messages):
+        return stream
+
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", provider)
     async with app.run_test() as pilot:
         inp = app.query_one("#input", Input)
         inp.value = "hello"
@@ -1302,8 +1352,8 @@ async def test_esc_stops_stream_and_retains_marked_partial(tmp_path, monkeypatch
         await pilot.pause()
 
         interrupted = f"partial \n\n{INTERRUPTED_RESPONSE}"
-        assert stream.cancels == 1
-        assert stream.ended is True  # cancelled, not waited out
+        assert stream.cancelled is True  # the parked read was cancelled
+        assert stream.closed == 1  # and its response closed on the way out
         assert app.session.messages == [
             {"role": "user", "content": "hello"},
             {
@@ -1332,22 +1382,32 @@ async def test_startup_restores_interrupted_partial_but_context_uses_marker(
     The durability half of the contract: the two representations have to
     survive a restart, not just exist in memory for the rest of the turn.
     """
-    session = Session(tmp_path / "s.jsonl", persist=False)
-    session.add("user", "hello")
-    session.add(
+    path = tmp_path / "s.jsonl"
+    written = Session(path)
+    written.add("user", "hello")
+    written.add(
         "assistant",
         f"partial answer\n\n{INTERRUPTED_RESPONSE}",
         model_role="assistant",
         model_content=INTERRUPTED_RESPONSE,
     )
+
+    # A genuinely separate process would do exactly this and nothing else.
+    reloaded = Session(path)
+    reloaded.load()
+    assert reloaded.messages == written.messages
+    assert reloaded.messages is not written.messages
+
     app = make_app(
-        tmp_path, session=session, fetch_token_count_fn=lambda profile, text: 7
+        tmp_path, session=reloaded, fetch_token_count_fn=lambda profile, text: 7
     )
     async with app.run_test() as pilot:
         await pilot.pause()
 
         assert f"partial answer\n\n{INTERRUPTED_RESPONSE}" in bubbles(app)
 
+    # the model-facing override survived the JSONL round trip, not just memory
+    assert reloaded.messages[1]["_model_content"] == INTERRUPTED_RESPONSE
     assert app.session.messages_with_system("") == [
         {"role": "user", "content": "hello"},
         {"role": "assistant", "content": INTERRUPTED_RESPONSE},
@@ -1566,7 +1626,7 @@ async def test_enter_while_streaming_queues_then_drains(tmp_path, monkeypatch):
         else:
             yield "r2"
 
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(fake))
     async with app.run_test() as pilot:
         inp = app.query_one("#input", Input)
         inp.value = "one"
@@ -1620,7 +1680,7 @@ async def test_up_recalls_queued_message_for_editing(tmp_path, monkeypatch):
         else:
             yield "r2"
 
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(fake))
     async with app.run_test() as pilot:
         inp = app.query_one("#input", Input)
         inp.value = "one"
@@ -1684,7 +1744,7 @@ async def test_up_with_suggestions_open_prefers_suggestions(tmp_path, monkeypatc
         gate.wait(5)
         yield "r1b"
 
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(fake))
     async with app.run_test() as pilot:
         inp = app.query_one("#input", Input)
         inp.value = "one"
@@ -1733,7 +1793,7 @@ async def test_queue_drains_in_order(tmp_path, monkeypatch):
         else:
             yield f"r{calls['n']}"
 
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(fake))
     async with app.run_test() as pilot:
         inp = app.query_one("#input", Input)
         inp.value = "one"
@@ -1792,7 +1852,7 @@ async def test_cmd_auto_allowlist_runs_silently(tmp_path, monkeypatch):
         requests.append(messages)
         yield command_call("echo hello-out") if calls["n"] == 1 else "done"
 
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(fake))
     async with app.run_test() as pilot:
         inp = app.query_one("#input", Input)
         inp.value = "go"
@@ -1816,7 +1876,7 @@ async def test_cmd_ask_prompts_then_allow_runs(tmp_path, monkeypatch):
     """ask mode: a non-allowlisted command prompts; 'y' allows and runs it."""
     app = make_app_with_cmd(tmp_path, CmdPolicy(mode="ask", allow=[]))
     fake, calls = cmd_stream(command_call("echo prompt-out"), "done")
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(fake))
     async with app.run_test() as pilot:
         inp = app.query_one("#input", Input)
         inp.value = "go"
@@ -1834,7 +1894,7 @@ async def test_cmd_ask_decline_feeds_back(tmp_path, monkeypatch):
     """ask mode: 'n' declines; the command does not run but the model still reacts."""
     app = make_app_with_cmd(tmp_path, CmdPolicy(mode="ask", allow=[]))
     fake, calls = cmd_stream(command_call("echo never-runs"), "done")
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(fake))
     async with app.run_test() as pilot:
         inp = app.query_one("#input", Input)
         inp.value = "go"
@@ -1855,7 +1915,7 @@ async def test_cmd_blacklist_blocked_even_in_yolo(tmp_path, monkeypatch):
     """The blacklist is absolute: even yolo blocks sudo, and no prompt is shown."""
     app = make_app_with_cmd(tmp_path, CmdPolicy(mode="yolo"))
     fake, calls = cmd_stream(command_call("sudo ls"), "done")
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(fake))
     async with app.run_test() as pilot:
         inp = app.query_one("#input", Input)
         inp.value = "go"
@@ -1872,7 +1932,7 @@ async def test_cmd_off_mode_disables_execution(tmp_path, monkeypatch):
     """off mode: requested commands are not run; a disabled note is fed back."""
     app = make_app_with_cmd(tmp_path, CmdPolicy(mode="off"))
     fake, calls = cmd_stream(command_call("echo should-not-run"), "done")
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(fake))
     async with app.run_test() as pilot:
         inp = app.query_one("#input", Input)
         inp.value = "go"
@@ -1888,7 +1948,7 @@ async def test_cmd_always_allow_saves_rule(tmp_path, monkeypatch):
     """'a' in the prompt persists a prefix rule to config and runs the command."""
     app = make_app_with_cmd(tmp_path, CmdPolicy(mode="ask", allow=[]))
     fake, calls = cmd_stream(command_call("git status"), "done")
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(fake))
     async with app.run_test() as pilot:
         inp = app.query_one("#input", Input)
         inp.value = "go"
@@ -1919,7 +1979,7 @@ async def test_every_command_in_one_reply_runs_in_source_order(tmp_path, monkeyp
         else:
             yield "stopped"
 
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(fake))
     async with app.run_test() as pilot:
         inp = app.query_one("#input", Input)
         inp.value = "go"
@@ -1950,7 +2010,7 @@ async def test_different_command_rounds_are_not_limited(tmp_path, monkeypatch):
         else:
             yield "finished"
 
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(fake))
     async with app.run_test() as pilot:
         inp = app.query_one("#input", Input)
         inp.value = "go"
@@ -1988,7 +2048,7 @@ async def test_repeated_commands_and_results_do_not_stop_the_loop(
         else:
             yield "done"
 
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(fake))
     async with app.run_test() as pilot:
         inp = app.query_one("#input", Input)
         inp.value = "go"
@@ -2027,7 +2087,7 @@ async def test_consecutive_empty_replies_are_each_nudged(tmp_path, monkeypatch):
         else:
             yield "recovered"
 
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(fake))
     async with app.run_test() as pilot:
         inp = app.query_one("#input", Input)
         inp.value = "go"
@@ -2073,7 +2133,7 @@ async def test_nudge_is_shown_in_system_debug_mode(tmp_path, monkeypatch):
         else:
             yield "done"
 
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(fake))
     async with app.run_test() as pilot:
         inp = app.query_one("#input", Input)
         inp.value = "go"
@@ -2106,7 +2166,7 @@ async def test_nudge_can_continue_with_an_explicit_command(tmp_path, monkeypatch
         }
         yield replies[calls["n"]]
 
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(fake))
     async with app.run_test() as pilot:
         inp = app.query_one("#input", Input)
         inp.value = "go"
@@ -2134,7 +2194,7 @@ async def test_final_answer_after_tool_ends_turn_without_repeat(tmp_path, monkey
         else:
             yield "The cwd is /the/project.\n\n```cmd\npwd\n```"
 
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(fake))
     async with app.run_test() as pilot:
         inp = app.query_one("#input", Input)
         inp.value = "whats the cwd?"
@@ -2165,7 +2225,7 @@ async def test_command_prefix_commentary_is_preserved_and_tool_round_continues(
         else:
             yield "The cwd is /the/project."
 
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(fake))
     async with app.run_test() as pilot:
         inp = app.query_one("#input", Input)
         inp.value = "audit this project"
@@ -2201,7 +2261,7 @@ async def test_interleaved_commentary_commands_start_one_tool_round(
         else:
             yield "The audit is complete."
 
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(fake))
     async with app.run_test() as pilot:
         inp = app.query_one("#input", Input)
         inp.value = "audit this project"
@@ -2230,7 +2290,7 @@ async def test_html_wrapped_command_executes_once(tmp_path, monkeypatch):
         else:
             yield "done"
 
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(fake))
     async with app.run_test() as pilot:
         inp = app.query_one("#input", Input)
         inp.value = "whats the cwd?"
@@ -2260,7 +2320,7 @@ async def test_clear_during_tool_followup_does_not_crash(tmp_path, monkeypatch):
         else:
             yield "unexpected extra request"
 
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(fake))
     async with app.run_test() as pilot:
         inp = app.query_one("#input", Input)
         inp.value = "go"
@@ -2290,7 +2350,7 @@ async def test_plain_final_answer_ends_turn(tmp_path, monkeypatch):
         calls["n"] += 1
         yield "all done"
 
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(fake))
     async with app.run_test() as pilot:
         inp = app.query_one("#input", Input)
         inp.value = "hello"
@@ -2319,7 +2379,7 @@ async def test_declined_command_ends_tool_turn(tmp_path, monkeypatch):
         else:
             yield "stopped"
 
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(fake))
     async with app.run_test() as pilot:
         inp = app.query_one("#input", Input)
         inp.value = "go"
@@ -2351,7 +2411,7 @@ async def test_blocked_command_ends_tool_turn(tmp_path, monkeypatch):
         else:
             yield "stopped"
 
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(fake))
     async with app.run_test() as pilot:
         inp = app.query_one("#input", Input)
         inp.value = "go"
@@ -2379,7 +2439,7 @@ async def test_failed_command_result_continues_the_loop(tmp_path, monkeypatch):
         else:
             yield "handled"
 
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(fake))
     async with app.run_test() as pilot:
         inp = app.query_one("#input", Input)
         inp.value = "go"
@@ -2414,7 +2474,7 @@ async def test_a_running_command_is_shown_then_replaced_by_its_result(tmp_path, 
         else:
             yield "final"
 
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(fake))
     async with app.run_test() as pilot:
         inp = app.query_one("#input", Input)
         inp.value = "go"
@@ -2458,18 +2518,18 @@ async def test_queue_drains_after_esc_stop(tmp_path, monkeypatch):
     first = BlockingStream()
     second = FiniteStream("r2")
     entered: list[str] = []
-    first_ended_at_second_entry: list[bool] = []
+    first_closed_at_second_entry: list[bool] = []
     sent: list[list[dict]] = []
 
-    def provider(profile, temperature, messages):
+    async def provider(profile, temperature, messages):
         sent.append(messages)
         if not entered:
             entered.append("one")
             return first
         entered.append("two")
-        # Read here, in the second request itself: the first provider must
-        # already be finished, not merely asked to stop.
-        first_ended_at_second_entry.append(first.ended)
+        # Read here, in the second request itself: the first response must
+        # already be closed, not merely asked to stop.
+        first_closed_at_second_entry.append(first.closed == 1)
         return second
 
     monkeypatch.setattr("jtech_cli.tui.stream_reply", provider)
@@ -2490,8 +2550,8 @@ async def test_queue_drains_after_esc_stop(tmp_path, monkeypatch):
 
         interrupted = f"partial \n\n{INTERRUPTED_RESPONSE}"
         assert entered == ["one", "two"]  # the requests never overlapped
-        assert first_ended_at_second_entry == [True]
-        assert first.cancels == 1
+        assert first_closed_at_second_entry == [True]
+        assert first.cancelled is True
         assert not any("Queued" in b for b in bubbles(app))
         assert not any("Generation stopped" in b for b in bubbles(app))
         # the stopped partial is still on screen, above the queued turn's answer
@@ -2577,7 +2637,7 @@ async def test_timings_without_prompt_n_keeps_the_usage_count(tmp_path, monkeypa
         ("usage", {"prompt_tokens": 8192}),
         ("timings", {"prompt_ms": 431.0}),  # no prompt_n
     )
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(fake))
     async with app.run_test() as pilot:
         app.query_one("#input", Input).value = "go"
         await pilot.press("enter")
@@ -2595,7 +2655,7 @@ async def test_unknown_stream_event_is_not_treated_as_timings(tmp_path, monkeypa
         ("usage", {"prompt_tokens": 512}),
         ("some_future_event", {"whatever": True}),
     )
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(fake))
     async with app.run_test() as pilot:
         app.query_one("#input", Input).value = "go"
         await pilot.press("enter")
@@ -2609,7 +2669,7 @@ async def test_timings_with_prompt_n_still_sets_the_count(tmp_path, monkeypatch)
     """The llama.cpp path is unchanged: a real prompt_n still drives the footer."""
     app = make_app(tmp_path)
     fake, calls = _event_stream("hi", ("timings", {"prompt_n": 2048, "prompt_ms": 12.0}))
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(fake))
     async with app.run_test() as pilot:
         app.query_one("#input", Input).value = "go"
         await pilot.press("enter")
@@ -2727,121 +2787,12 @@ def ai_label_updates(calls: list[tuple[Static, object]]) -> list[str]:
     ]
 
 
-def burst_stream(*items):
-    """A provider parked until released, then emitting ``items`` in one burst.
-
-    Returned alongside the gates a test needs to land the whole burst in a
-    single inbox batch: wait for ``entered`` (producer thread parked, consumer
-    parked on an empty inbox), set ``release``, then block the event loop on
-    ``emitted`` so nothing can be drained until every item is queued.
-    """
-    entered = threading.Event()
-    release = threading.Event()
-    emitted = threading.Event()
-
-    def fake(profile, temperature, messages):
-        entered.set()
-        release.wait(5)
-        yield from items
-        emitted.set()
-
-    return fake, entered, release, emitted
-
-
-async def _run_one_batch(app, pilot, gates, text: str = "go") -> None:
-    """Submit ``text`` and let the parked provider deliver one whole batch."""
-    entered, release, emitted = gates
-    app.query_one("#input", Input).value = text
-    await pilot.press("enter")
-    await _wait_until(app, pilot, entered.is_set, tries=100)
-    release.set()
-    # Blocking on purpose: while the test holds the loop the consumer cannot
-    # drain, so every queued item is still there when it finally wakes.
-    assert emitted.wait(5)
-    await _wait_until(app, pilot, lambda: not app._generating, tries=100)
-
-
-class _RecordingLoop:
-    """Stand-in event loop that records cross-thread wake-up callbacks."""
-
-    def __init__(self) -> None:
-        self.callbacks: list = []
-
-    def call_soon_threadsafe(self, callback, *args) -> None:
-        self.callbacks.append((callback, args))
-
-    def run_pending(self) -> None:
-        pending, self.callbacks = self.callbacks, []
-        for callback, args in pending:
-            callback(*args)
-
-
-async def test_stream_inbox_batches_a_burst_behind_one_wakeup():
-    """A producer burst costs one notification and arrives in source order."""
-    loop = _RecordingLoop()
-    inbox = _StreamInbox(loop)
-
-    for item in ["a", ("reasoning", "r"), "b", _StreamEnd()]:
-        inbox.put(item)
-
-    assert len(loop.callbacks) == 1  # only the idle -> pending transition woke it
-    loop.run_pending()
-    assert await inbox.get_batch() == ["a", ("reasoning", "r"), "b", _StreamEnd()]
-
-
-async def test_stream_inbox_reschedules_a_wakeup_after_a_drain():
-    """An item queued after a drain gets its own notification and batch."""
-    loop = _RecordingLoop()
-    inbox = _StreamInbox(loop)
-
-    inbox.put("first")
-    loop.run_pending()
-    assert await inbox.get_batch() == ["first"]
-    assert loop.callbacks == []
-
-    inbox.put("second")
-    assert len(loop.callbacks) == 1
-    loop.run_pending()
-    assert await inbox.get_batch() == ["second"]
-
-
-async def test_chunks_produced_during_a_blocked_write_are_combined(tmp_path, monkeypatch):
-    """Backlog is coalesced into the next awaited write, not one task per chunk."""
-    app = make_app(tmp_path)
-    release = asyncio.Event()
-    writes = record_markdown_writes(monkeypatch, gate=release)
-    produced = threading.Event()
-    finished = threading.Event()
-
-    def fake(profile, temperature, messages):
-        yield "A"
-        produced.wait(5)  # hold until the first write is in flight
-        yield "B"
-        yield "C"
-        yield "D"
-        finished.set()
-
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
-    async with app.run_test() as pilot:
-        app.query_one("#input", Input).value = "go"
-        await pilot.press("enter")
-        await _wait_until(app, pilot, lambda: writes == ["A"], tries=100)
-
-        produced.set()
-        assert finished.wait(5)  # B, C and D are queued while the write blocks
-        release.set()
-        await _wait_until(app, pilot, lambda: not app._generating, tries=100)
-
-        assert writes == ["A", "BCD"]
-        assert app.session.messages[-1] == {"role": "assistant", "content": "ABCD"}
-
-
 async def test_markdown_writes_reproduce_the_provider_content(tmp_path, monkeypatch):
     """Whatever the batching, the writes concatenate back to the source text."""
     app = make_app(tmp_path)
     chunks = [f"chunk-{index} " for index in range(60)]
     writes = record_markdown_writes(monkeypatch)
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", lambda profile, temperature, messages: iter(chunks))
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", stream_of(*chunks))
     async with app.run_test() as pilot:
         app.query_one("#input", Input).value = "go"
         await pilot.press("enter")
@@ -2856,7 +2807,7 @@ async def test_finalization_waits_for_a_blocked_markdown_write(tmp_path, monkeyp
     app = make_app(tmp_path)
     release = asyncio.Event()
     writes = record_markdown_writes(monkeypatch, gate=release)
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", lambda profile, temperature, messages: iter(["held"]))
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", stream_of("held"))
     async with app.run_test() as pilot:
         app.query_one("#input", Input).value = "go"
         await pilot.press("enter")
@@ -2883,7 +2834,7 @@ async def test_waiting_timer_repaints_only_the_label(tmp_path, monkeypatch):
         gate.wait(5)
         yield "spoke at last"
 
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", silent)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(silent))
     async with app.run_test() as pilot:
         app.query_one("#input", Input).value = "go"
         await pilot.press("enter")
@@ -2903,54 +2854,67 @@ async def test_waiting_timer_repaints_only_the_label(tmp_path, monkeypatch):
         assert writes == ["spoke at last"]
 
 
-async def test_batched_reasoning_hide_counts_without_mounting_a_bubble(
-    tmp_path, monkeypatch
-):
+async def test_reasoning_hide_counts_without_mounting_a_bubble(tmp_path, monkeypatch):
     app = make_app(tmp_path, settings=make_settings("hide"))
-    fake, *gates = burst_stream(("reasoning", "hmm "), ("reasoning", "ok"), "4")
     updates = record_static_updates(monkeypatch)
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    monkeypatch.setattr(
+        "jtech_cli.tui.stream_reply",
+        stream_of(("reasoning", "hmm "), ("reasoning", "ok"), "4"),
+    )
     async with app.run_test() as pilot:
-        await _run_one_batch(app, pilot, gates, "what is 2+2")
+        await _send_and_drain(app, pilot, "what is 2+2")
 
         assert reasoning_updates(updates) == []
         assert not reasoning_bodies(app)
         assert any("4" in b for b in bubbles(app))
 
 
-async def test_batched_reasoning_always_renders_the_batch_once(tmp_path, monkeypatch):
+async def test_reasoning_always_grows_one_text_by_append(tmp_path, monkeypatch):
+    """Each delta extends one retained ``Text``; it is never re-joined."""
     app = make_app(tmp_path, settings=make_settings("always"))
-    fake, *gates = burst_stream(("reasoning", "hmm "), ("reasoning", "ok"), "4")
     updates = record_static_updates(monkeypatch)
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    monkeypatch.setattr(
+        "jtech_cli.tui.stream_reply",
+        stream_of(("reasoning", "hmm "), ("reasoning", "ok"), "4"),
+    )
     async with app.run_test() as pilot:
-        await _run_one_batch(app, pilot, gates, "what is 2+2")
+        await _send_and_drain(app, pilot, "what is 2+2")
 
         assert reasoning_bodies(app) == ["hmm ok"]
-        assert reasoning_updates(updates) == ["hmm ok"]  # two deltas, one repaint
+        # One repaint per delta, and every repaint handed over the *same*
+        # growing ``Text`` — which is why both read as the final value here.
+        # A mode that re-joined its fragments would hand over new strings.
+        assert len(reasoning_updates(updates)) == 2
+        assert set(reasoning_updates(updates)) == {"hmm ok"}
         assert any("4" in b for b in bubbles(app))
 
 
-async def test_batched_reasoning_tail_renders_the_batch_once(tmp_path, monkeypatch):
+async def test_reasoning_tail_keeps_only_the_bounded_tail(tmp_path, monkeypatch):
     full = "x" * 300 + "tail-marker" + "y" * 900
     app = make_app(tmp_path, settings=make_settings("tail"))
-    fake, *gates = burst_stream(("reasoning", full[:600]), ("reasoning", full[600:]), "4")
     updates = record_static_updates(monkeypatch)
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    monkeypatch.setattr(
+        "jtech_cli.tui.stream_reply",
+        stream_of(("reasoning", full[:600]), ("reasoning", full[600:]), "4"),
+    )
     async with app.run_test() as pilot:
-        await _run_one_batch(app, pilot, gates, "what is 2+2")
+        await _send_and_drain(app, pilot, "what is 2+2")
 
         assert reasoning_bodies(app) == ["…" + full[-500:]]
-        assert reasoning_updates(updates) == ["…" + full[-500:]]
+        assert reasoning_updates(updates)[-1] == "…" + full[-500:]
         assert any("4" in b for b in bubbles(app))
 
 
-async def test_batched_reasoning_transient_drops_the_bubble_once(tmp_path, monkeypatch):
+async def test_reasoning_transient_drops_the_bubble_when_content_starts(
+    tmp_path, monkeypatch
+):
     app = make_app(tmp_path)  # transient is the default
-    fake, *gates = burst_stream(("reasoning", "hmm "), ("reasoning", "ok"), "4")
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    monkeypatch.setattr(
+        "jtech_cli.tui.stream_reply",
+        stream_of(("reasoning", "hmm "), ("reasoning", "ok"), "4"),
+    )
     async with app.run_test() as pilot:
-        await _run_one_batch(app, pilot, gates, "what is 2+2")
+        await _send_and_drain(app, pilot, "what is 2+2")
 
         assert reasoning_bodies(app) == []
         assert "REASONING" not in labels(app)
@@ -2958,33 +2922,35 @@ async def test_batched_reasoning_transient_drops_the_bubble_once(tmp_path, monke
         assert "4" in text and "hmm" not in text
 
 
-async def test_batched_usage_and_unknown_events_keep_the_usage_count(
-    tmp_path, monkeypatch
-):
-    """One batch carrying usage plus a future event kind still reads as usage."""
+async def test_usage_and_unknown_events_keep_the_usage_count(tmp_path, monkeypatch):
+    """A stream carrying usage plus a future event kind still reads as usage."""
     app = make_app(tmp_path)
-    fake, *gates = burst_stream(
-        ("usage", {"prompt_tokens": 512}),
-        "hi",
-        ("some_future_event", {"whatever": True}),
+    monkeypatch.setattr(
+        "jtech_cli.tui.stream_reply",
+        stream_of(
+            ("usage", {"prompt_tokens": 512}),
+            "hi",
+            ("some_future_event", {"whatever": True}),
+        ),
     )
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
     async with app.run_test() as pilot:
-        await _run_one_batch(app, pilot, gates)
+        await _send_and_drain(app, pilot, "go")
 
         assert app._prompt_tokens == 512
         assert "AI" in labels(app)  # no timings -> the plain done label
 
 
-async def test_batched_timings_still_reach_the_done_label(tmp_path, monkeypatch):
+async def test_timings_still_reach_the_done_label(tmp_path, monkeypatch):
     app = make_app(tmp_path)
-    fake, *gates = burst_stream(
-        "hi",
-        ("timings", {"prompt_n": 2048, "prompt_ms": 594.8, "prompt_per_second": 285.8}),
+    monkeypatch.setattr(
+        "jtech_cli.tui.stream_reply",
+        stream_of(
+            "hi",
+            ("timings", {"prompt_n": 2048, "prompt_ms": 594.8, "prompt_per_second": 285.8}),
+        ),
     )
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
     async with app.run_test() as pilot:
-        await _run_one_batch(app, pilot, gates)
+        await _send_and_drain(app, pilot, "go")
 
         assert app._prompt_tokens == 2048
         assert any("2,048" in l and "286 t/s" in l for l in labels(app))
@@ -2999,7 +2965,7 @@ async def test_batched_provider_error_is_reported_after_its_content(tmp_path, mo
         yield "partial "
         raise RuntimeError("boom")
 
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", failing)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(failing))
     async with app.run_test() as pilot:
         app.query_one("#input", Input).value = "go"
         await pilot.press("enter")
@@ -3020,7 +2986,7 @@ async def test_manual_scroll_during_a_stream_is_not_overridden(tmp_path, monkeyp
         gate.wait(5)
         yield "second paragraph\n\n" * 30
 
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(fake))
     async with app.run_test(size=(80, 10)) as pilot:
         app.query_one("#input", Input).value = "go"
         await pilot.press("enter")
@@ -3055,7 +3021,7 @@ async def test_history_save_failure_is_reported_and_generation_continues(
     """A failed append warns in the transcript without losing the exchange."""
     session = _UnwritableSession(tmp_path / "s.jsonl", persist=False)
     app = make_app(tmp_path, session=session)
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", lambda profile, temperature, messages: iter(["ok"]))
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", stream_of("ok"))
     async with app.run_test() as pilot:
         app.query_one("#input", Input).value = "hi"
         await pilot.press("enter")
@@ -3304,7 +3270,7 @@ async def test_one_live_answer_leaves_no_body_widget_behind(tmp_path, monkeypatc
         gate.wait(5)
         yield "done"
 
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(fake))
     app = make_app(tmp_path)
     async with app.run_test() as pilot:
         app.query_one("#input", Input).value = "go"
@@ -3337,7 +3303,7 @@ async def test_repeated_tool_rounds_do_not_accumulate_body_widgets(
         else:
             yield "finished"
 
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(fake))
     async with app.run_test() as pilot:
         app.query_one("#input", Input).value = "go"
         await pilot.press("enter")
@@ -3375,7 +3341,7 @@ async def test_a_queue_notice_holds_finished_messages_in_order(tmp_path, monkeyp
         else:
             yield f"r{calls['n']}"
 
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(fake))
     app = make_app(tmp_path)
     async with app.run_test() as pilot:
         inp = app.query_one("#input", Input)
@@ -3442,7 +3408,7 @@ async def test_a_visible_error_compacts_without_entering_session_context(
         yield "partial "
         raise RuntimeError("boom")
 
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", failing)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(failing))
     app = make_app(tmp_path)
     async with app.run_test() as pilot:
         app.query_one("#input", Input).value = "go"
@@ -3471,7 +3437,7 @@ async def test_clear_during_a_gated_stream_stays_empty_after_it_finishes(
         gate.wait(5)
         yield "late"
 
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(fake))
     app = make_app(tmp_path)
     async with app.run_test() as pilot:
         inp = app.query_one("#input", Input)
@@ -3534,7 +3500,7 @@ async def test_a_theme_switch_reflows_completed_history_once(tmp_path, monkeypat
         gate.wait(5)
         yield "done"
 
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(fake))
     # Pinned dark rather than auto: the switch below has to be a real change,
     # whatever background the terminal running the suite reports.
     app = history_app(
@@ -3597,7 +3563,7 @@ async def test_scrolling_to_the_top_survives_later_chunks_and_compaction(
         gate.wait(5)
         yield "second paragraph\n\n" * 30
 
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(fake))
     app = make_app(tmp_path)
     async with app.run_test(size=(80, 10)) as pilot:
         app.query_one("#input", Input).value = "go"
@@ -3638,7 +3604,7 @@ async def test_a_failing_markdown_write_ends_the_turn_instead_of_wedging_it(
         raise RuntimeError("renderer failed")
 
     monkeypatch.setattr(MarkdownStream, "write", failing_write)
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", lambda profile, temperature, messages: iter(["unrenderable"]))
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", stream_of("unrenderable"))
     async with app.run_test() as pilot:
         app.query_one("#input", Input).value = "go"
         await pilot.press("enter")
@@ -3661,7 +3627,7 @@ async def test_a_failing_markdown_write_ends_the_turn_instead_of_wedging_it(
 
         # and the app is still usable: the next message goes all the way through
         monkeypatch.setattr(MarkdownStream, "write", real_write)
-        monkeypatch.setattr("jtech_cli.tui.stream_reply", lambda profile, temperature, messages: iter(["ok"]))
+        monkeypatch.setattr("jtech_cli.tui.stream_reply", stream_of("ok"))
         app.query_one("#input", Input).value = "second"
         await pilot.press("enter")
         await _wait_until(
@@ -3675,46 +3641,32 @@ async def test_a_failing_markdown_write_ends_the_turn_instead_of_wedging_it(
         ]
 
 
-async def test_a_render_failure_stops_its_provider_before_the_next_turn(
+async def test_a_render_failure_closes_its_response_before_the_next_turn(
     tmp_path, monkeypatch
 ):
-    """The one exit that never drains _StreamEnd must still end its producer.
+    """The one exit that never sees the stream end must still close it.
 
-    The provider is parked in its read when the renderer fails, so nothing the
-    consumer sets can reach it: the abandoned response has to be closed. If the
-    turn were released before that producer exited, the next message would open
-    a second, overlapping request while the first stream fed an inbox nobody
-    reads.
+    The provider would hold this response open indefinitely, so a render
+    failure that merely stopped reading would leak the connection and let the
+    next turn open a second, overlapping request. The task ends and its
+    ``finally`` closes the response instead.
     """
     app = make_app(tmp_path)
     real_write = MarkdownStream.write
     blocked = BlockingStream("one")
     entries: list[str] = []
-    generating_at_cancel: list[bool] = []
-    first_ended_at_second_entry: list[bool] = []
+    closed_at_second_entry: list[bool] = []
 
-    def provider(profile, temperature, messages):
+    async def provider(profile, temperature, messages):
         entries.append(f"turn-{len(entries) + 1}")
         if len(entries) > 1:
-            # Read in the second request itself: the abandoned producer must
-            # already have left its read, not merely have been asked to.
-            first_ended_at_second_entry.append(blocked.ended)
+            # Read in the second request itself: the abandoned response must
+            # already be closed, not merely abandoned.
+            closed_at_second_entry.append(blocked.closed == 1)
             return FiniteStream("ok")
-        original_cancel = blocked.cancel
-
-        def cancel_and_observe() -> None:
-            # The close happens while the turn is still held; releasing it
-            # first is what would let the next request overlap this one.
-            generating_at_cancel.append(app._generating)
-            original_cancel()
-
-        blocked.cancel = cancel_and_observe
         return blocked
 
     async def failing_write(self, markdown_fragment: str) -> None:
-        # Fail only once the provider is parked in its read, so the abandoned
-        # producer is genuinely unreachable by the cooperative flag.
-        blocked.blocked.wait(10)
         raise RuntimeError("renderer failed")
 
     monkeypatch.setattr(MarkdownStream, "write", failing_write)
@@ -3725,13 +3677,9 @@ async def test_a_render_failure_stops_its_provider_before_the_next_turn(
         await _wait_until(
             app, pilot, lambda: any(RENDER_ERROR in b for b in bubbles(app)), tries=100
         )
-        # The turn ends by closing the response its producer is parked in, and
-        # only releases once that producer has been joined.
         await _wait_until(app, pilot, lambda: not app._generating, tries=100)
 
-        assert blocked.cancels == 1  # the renderer failure closed the response
-        assert blocked.ended is True  # and that released the parked read
-        assert generating_at_cancel == [True]
+        assert blocked.closed == 1  # the response was closed, not just dropped
         assert entries == ["turn-1"]
 
         monkeypatch.setattr(MarkdownStream, "write", real_write)
@@ -3745,7 +3693,7 @@ async def test_a_render_failure_stops_its_provider_before_the_next_turn(
         )
 
         assert entries == ["turn-1", "turn-2"]  # the requests never overlapped
-        assert first_ended_at_second_entry == [True]
+        assert closed_at_second_entry == [True]
         assert not app._generating
         assert app._queue == []
         assert app.session.messages == [
@@ -4099,7 +4047,7 @@ async def test_a_profile_switch_is_refused_while_streaming(tmp_path, monkeypatch
         gate.wait(5)
         yield "done"
 
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(fake))
     async with app.run_test() as pilot:
         await _send_and_drain(app, pilot, "go")
         await _wait_until(app, pilot, lambda: any("partial" in b for b in bubbles(app)))
@@ -4180,7 +4128,7 @@ async def test_one_autonomous_turn_uses_one_resolved_profile(tmp_path, monkeypat
         else:
             yield "done"
 
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(fake))
     async with app.run_test() as pilot:
         await _send_and_drain(app, pilot, "go")
         await _wait_until(app, pilot, lambda: calls["n"] >= 3, tries=150)
@@ -4205,7 +4153,7 @@ async def test_the_next_idle_turn_uses_the_newly_activated_profile(tmp_path, mon
         seen.append(profile)
         yield "ok"
 
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(fake))
     async with app.run_test() as pilot:
         await _send_and_drain(app, pilot, "first")
         await _wait_until(app, pilot, lambda: len(seen) == 1)
@@ -4240,7 +4188,7 @@ async def test_a_missing_credential_stops_before_the_provider_thread(tmp_path, m
         started.append(profile)
         yield "never"
 
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(fake))
     async with app.run_test() as pilot:
         await _send_and_drain(app, pilot, "go")
 
@@ -4264,7 +4212,7 @@ async def test_a_missing_model_stops_before_the_provider_thread(tmp_path, monkey
         started.append(profile)
         yield "never"
 
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(fake))
     async with app.run_test() as pilot:
         await _send_and_drain(app, pilot, "go")
 
@@ -4281,7 +4229,7 @@ async def test_a_turn_without_a_profile_reports_instead_of_streaming(tmp_path, m
         started.append(profile)
         yield "never"
 
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(fake))
     async with app.run_test() as pilot:
         await _send_and_drain(app, pilot, "go")
 
@@ -4899,7 +4847,7 @@ async def test_primary_is_selected_and_existing_composer_is_writable_on_startup(
 ):
     app = make_app(tmp_path)
     monkeypatch.setattr(
-        "jtech_cli.tui.stream_reply", lambda profile, temperature, messages: iter(["ok"])
+        "jtech_cli.tui.stream_reply", stream_of("ok")
     )
     async with app.run_test() as pilot:
         workspace = workspace_of(app)
@@ -5100,7 +5048,7 @@ async def test_ctrl_l_in_subagent_view_changes_no_transcript_or_session(
 ):
     app = make_app(tmp_path)
     monkeypatch.setattr(
-        "jtech_cli.tui.stream_reply", lambda profile, temperature, messages: iter(["ok"])
+        "jtech_cli.tui.stream_reply", stream_of("ok")
     )
     async with app.run_test() as pilot:
         inp = app.query_one("#input", Input)
@@ -5136,7 +5084,7 @@ async def test_escape_in_subagent_view_does_not_stop_hidden_primary_work(
         gate.wait(5)
         yield "rest"
 
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(fake))
     async with app.run_test() as pilot:
         inp = app.query_one("#input", Input)
         inp.value = "hello"
@@ -5200,7 +5148,7 @@ async def test_primary_status_transitions_preserve_primary_tasks(tmp_path, monke
         gate.wait(5)
         yield "r1b"
 
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(fake))
     async with app.run_test() as pilot:
         tasks = (
             AgentTaskSummary("t1", "Implement parser", "running"),
@@ -5246,7 +5194,7 @@ async def test_primary_status_stays_running_across_queued_turn_drain(
         else:
             yield f"r{calls['n']}"
 
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(fake))
     async with app.run_test() as pilot:
         statuses = record_primary_status(app, monkeypatch)
         inp = app.query_one("#input", Input)
@@ -5346,7 +5294,7 @@ async def test_a_first_dispatch_creates_one_agent_view_session_and_task(
     tmp_path, monkeypatch
 ):
     stream = Conversation([dispatch_call(), "all done"], ["worker answer"])
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", stream)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(stream))
     app = make_app(tmp_path)
     async with app.run_test() as pilot:
         await run_primary(app, pilot)
@@ -5372,7 +5320,7 @@ async def test_the_coordinator_prompt_reaches_the_real_primary_request(
     tmp_path, monkeypatch
 ):
     stream = Conversation(["done"])
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", stream)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(stream))
     app = make_app(tmp_path, settings=two_profile_settings())
     async with app.run_test() as pilot:
         await run_primary(app, pilot)
@@ -5391,7 +5339,7 @@ async def test_a_repeated_key_continues_one_conversation(tmp_path, monkeypatch):
         ],
         ["first answer", "second answer"],
     )
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", stream)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(stream))
     app = make_app(tmp_path)
     async with app.run_test() as pilot:
         await run_primary(app, pilot)
@@ -5439,7 +5387,7 @@ async def test_a_label_or_profile_change_for_one_key_fails_without_mutating(
         ],
         ["worker answer"],
     )
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", stream)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(stream))
     app = make_app(tmp_path, settings=two_profile_settings())
     async with app.run_test() as pilot:
         await run_primary(app, pilot)
@@ -5469,7 +5417,7 @@ async def test_two_agents_never_share_a_session_or_a_transcript(
          "all done"],
         ["answer one", "answer two"],
     )
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", stream)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(stream))
     app = make_app(tmp_path)
     async with app.run_test() as pilot:
         await run_primary(app, pilot)
@@ -5488,7 +5436,7 @@ async def test_two_agents_never_share_a_session_or_a_transcript(
 
 async def test_subagent_sessions_never_touch_the_filesystem(tmp_path, monkeypatch):
     stream = Conversation([dispatch_call(), "all done"], ["worker answer"])
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", stream)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(stream))
     worker_history = tmp_path / "never" / "session.jsonl"
     monkeypatch.setattr(
         "jtech_cli.session.default_history_path", lambda: worker_history
@@ -5523,7 +5471,7 @@ async def test_a_failed_agent_stays_selectable_and_can_take_another_task(
         else:
             yield "all done"
 
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(fake))
     app = make_app(tmp_path)
     async with app.run_test() as pilot:
         await run_primary(app, pilot)
@@ -5546,7 +5494,7 @@ async def test_a_failed_agent_stays_selectable_and_can_take_another_task(
 
 async def test_a_relaunch_restores_primary_history_only(tmp_path, monkeypatch):
     stream = Conversation([dispatch_call(), "all done"], ["worker answer"])
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", stream)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(stream))
     session = Session(tmp_path / "s.jsonl")
     app = make_app(tmp_path, session=session)
     async with app.run_test() as pilot:
@@ -5579,7 +5527,7 @@ async def test_dispatch_never_disturbs_the_composer_selection_or_queue(
         calls["n"] += 1
         yield dispatch_call() if calls["n"] == 1 else "all done"
 
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(fake))
     app = make_app(tmp_path)
     async with app.run_test() as pilot:
         inp = app.query_one("#input", Input)
@@ -5615,7 +5563,7 @@ async def test_each_agent_uses_its_own_resolved_profile(tmp_path, monkeypatch):
         ],
         ["one", "two"],
     )
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", stream)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(stream))
     monkeypatch.setenv("CLOUD_API_KEY", "sk-secret")
     app = make_app(tmp_path, settings=two_profile_settings())
     async with app.run_test() as pilot:
@@ -5643,7 +5591,7 @@ async def test_each_agent_uses_its_own_resolved_profile(tmp_path, monkeypatch):
 
 async def test_an_explicit_model_skips_discovery(tmp_path, monkeypatch):
     stream = Conversation([dispatch_call(), "all done"], ["ok"])
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", stream)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(stream))
     probed: list[Profile] = []
 
     def discover(profile):
@@ -5662,7 +5610,7 @@ async def test_an_empty_model_on_the_active_profile_uses_the_discovered_one(
     tmp_path, monkeypatch
 ):
     stream = Conversation([dispatch_call(), "all done"], ["ok"])
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", stream)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(stream))
     settings = local_settings()
     settings.profiles = Profiles(
         items=(Profile(name="local", base_url="http://host:9000/v1"),),
@@ -5684,7 +5632,7 @@ async def test_an_empty_model_elsewhere_is_discovered_without_touching_primary(
     tmp_path, monkeypatch
 ):
     stream = Conversation([dispatch_call(profile="cloud"), "all done"], ["ok"])
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", stream)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(stream))
     monkeypatch.setenv("CLOUD_API_KEY", "sk-secret")
     cloud = Profile(
         name="cloud",
@@ -5738,7 +5686,7 @@ async def test_a_profile_failure_fails_only_its_own_task(
         ],
         ["good answer"],
     )
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", stream)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(stream))
     app = make_app(tmp_path, settings=two_profile_settings())
     async with app.run_test() as pilot:
         await run_primary(app, pilot)
@@ -5761,7 +5709,7 @@ async def test_an_unreachable_discovery_endpoint_fails_only_its_task(
     tmp_path, monkeypatch
 ):
     stream = Conversation([dispatch_call(profile="cloud"), "all done"])
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", stream)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(stream))
     monkeypatch.setenv("CLOUD_API_KEY", "sk-secret")
     cloud = Profile(
         name="cloud",
@@ -5785,7 +5733,7 @@ async def test_a_cli_override_is_advertised_once_and_dispatchable(
     tmp_path, monkeypatch
 ):
     stream = Conversation([dispatch_call(profile="local"), "all done"], ["ok"])
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", stream)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(stream))
     settings = two_profile_settings()
     settings.profile_override = Profile(
         name="local", base_url="http://override:1/v1", model="override-model"
@@ -5832,7 +5780,7 @@ async def test_each_continuation_re_resolves_the_named_profile(tmp_path, monkeyp
         else:
             yield "all done"
 
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(fake))
     settings = local_settings()
     settings.profiles = Profiles(
         items=(Profile(name="local", base_url="http://host:9000/v1"),),
@@ -5879,7 +5827,7 @@ async def test_distinct_calls_all_start_before_any_of_them_finishes(
         else:
             yield "all done"
 
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(fake))
     app = make_app(tmp_path)
     async with app.run_test() as pilot:
         inp = app.query_one("#input", Input)
@@ -5929,7 +5877,7 @@ async def test_results_are_ordered_by_call_not_by_completion(tmp_path, monkeypat
         else:
             yield "all done"
 
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(fake))
     app = make_app(tmp_path)
     async with app.run_test() as pilot:
         inp = app.query_one("#input", Input)
@@ -5964,7 +5912,7 @@ async def test_one_failing_agent_does_not_cancel_its_siblings(tmp_path, monkeypa
         else:
             yield "all done"
 
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(fake))
     app = make_app(tmp_path)
     async with app.run_test() as pilot:
         await run_primary(app, pilot)
@@ -5999,7 +5947,7 @@ async def test_one_agent_runs_its_own_tasks_sequentially(tmp_path, monkeypatch):
         else:
             yield "all done"
 
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(fake))
     app = make_app(tmp_path)
     async with app.run_test() as pilot:
         inp = app.query_one("#input", Input)
@@ -6044,7 +5992,7 @@ async def test_one_modal_at_a_time_names_each_requesting_agent(
         else:
             yield "all done"
 
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(fake))
     app = make_app_with_cmd(tmp_path, CmdPolicy(mode="ask", allow=[]))
     titles: list[str] = []
     async with app.run_test() as pilot:
@@ -6108,7 +6056,7 @@ async def test_an_agent_waiting_for_the_lock_re_reads_the_saved_rule(
         else:
             yield "all done"
 
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(fake))
     app = make_app_with_cmd(tmp_path, CmdPolicy(mode="ask", allow=[]))
     prompts = {"n": 0}
     async with app.run_test() as pilot:
@@ -6145,7 +6093,7 @@ async def test_escape_never_stops_a_subagent(tmp_path, monkeypatch):
         calls["n"] += 1
         yield dispatch_call() if calls["n"] == 1 else "all done"
 
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(fake))
     app = make_app(tmp_path)
     async with app.run_test() as pilot:
         inp = app.query_one("#input", Input)
@@ -6178,7 +6126,7 @@ async def test_exiting_signals_every_live_runtime(tmp_path, monkeypatch):
         calls["n"] += 1
         yield dispatch_call() if calls["n"] == 1 else "all done"
 
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(fake))
     app = make_app(tmp_path)
     try:
         async with app.run_test() as pilot:
@@ -6217,7 +6165,7 @@ async def test_exiting_kills_a_subagent_command_and_everything_it_started(
         calls["n"] += 1
         yield dispatch_call() if calls["n"] == 1 else "all done"
 
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(fake))
     app = make_app_with_cmd(tmp_path, CmdPolicy(mode="yolo"))
     async with app.run_test() as pilot:
         inp = app.query_one("#input", Input)
@@ -6281,7 +6229,7 @@ async def test_an_unexpected_setup_failure_fails_only_its_own_call(
         else:
             yield "all done"
 
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(fake))
     app = make_app(tmp_path)
     original = app._begin_agent_task
 
@@ -6331,7 +6279,7 @@ async def test_a_setup_failure_never_leaves_a_task_row_running_forever(
         else:
             yield "all done"
 
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(fake))
     app = make_app(tmp_path)
     async with app.run_test() as pilot:
         inp = app.query_one("#input", Input)
@@ -6373,7 +6321,7 @@ async def test_a_result_is_recorded_once_with_its_exact_identity(
     tmp_path, monkeypatch
 ):
     stream = Conversation([dispatch_call(), "all done"], ["the worker answer"])
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", stream)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(stream))
     app = make_app(tmp_path)
     async with app.run_test() as pilot:
         await run_primary(app, pilot)
@@ -6400,7 +6348,7 @@ async def test_a_primary_history_failure_is_visible_but_keeps_the_result(
     tmp_path, monkeypatch
 ):
     stream = Conversation([dispatch_call(), "all done"], ["worker answer"])
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", stream)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(stream))
     app = make_app(tmp_path)
     original = app.session.add
     failures = {"n": 0}
@@ -6431,7 +6379,7 @@ async def test_primary_reports_waiting_while_its_own_command_awaits_approval(
 ):
     """The requester is Primary here, so the same waiting rule applies to it."""
     fake, _ = cmd_stream(command_call("echo needs-approval"), "done")
-    monkeypatch.setattr("jtech_cli.tui.stream_reply", fake)
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(fake))
     app = make_app_with_cmd(tmp_path, CmdPolicy(mode="ask", allow=[]))
     async with app.run_test() as pilot:
         inp = app.query_one("#input", Input)

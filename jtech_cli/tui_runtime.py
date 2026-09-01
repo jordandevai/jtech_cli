@@ -18,19 +18,18 @@ from __future__ import annotations
 import asyncio
 import functools
 import json
-import logging
 import os
 import signal
 import subprocess
 import threading
 import time
-from collections import deque
-from collections.abc import Callable, Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal, Protocol
 
 from rich.text import Text
+from textual.timer import Timer
 from textual.widgets import Markdown
 
 from jtech_cli.cmd_tools import (
@@ -44,7 +43,7 @@ from jtech_cli.cmd_tools import (
     parse_jtech_reply,
 )
 from jtech_cli.config import ResolvedProfile
-from jtech_cli.llm_client import ReplyStream, StreamItem
+from jtech_cli.llm_client import ReplyStream
 from jtech_cli.prompts import (
     COMMAND_DECLINED_PROMPT,
     NUDGE_PROMPT,
@@ -59,8 +58,6 @@ from jtech_cli.tui_widgets import (
     TranscriptRecord,
 )
 
-_LOG = logging.getLogger(__name__)
-
 CONNECTION_ERROR = "Connection failed — check the endpoint in /profiles"
 RENDER_ERROR = "Could not render the reply — it was not added to the conversation"
 PROMPT_ERROR = "The system prompt could not be composed — check /system and /prompt"
@@ -71,7 +68,6 @@ SPINNER_FRAMES = "-\\|/"
 #: never anchor the next completion.
 INTERRUPTED_RESPONSE = "[Response interrupted by user.]"
 STOPPED_LABEL = "AI · stopped"
-STREAM_CANCEL_ERROR = "Could not close the provider stream immediately"
 
 MIXED_TOOLS_ERROR = (
     "Tool protocol error: one response cannot mix jtech_cmd and jtech_agent "
@@ -84,7 +80,7 @@ SUBAGENT_DISPATCH_ERROR = (
     "commands and report the result."
 )
 
-StreamReply = Callable[[ResolvedProfile, float, list[dict]], ReplyStream]
+StreamReply = Callable[[ResolvedProfile, float, list[dict]], Awaitable[ReplyStream]]
 
 RunKind = Literal["primary", "subagent"]
 RunPhase = Literal[
@@ -290,133 +286,6 @@ class RuntimeHost(Protocol):
         ...
 
 
-@dataclass(frozen=True)
-class _StreamEnd:
-    """Terminal marker the provider thread enqueues exactly once."""
-
-    error: Exception | None = None
-
-
-_QueuedStreamItem = StreamItem | _StreamEnd
-
-
-class _StreamInbox:
-    """Ordered handoff from the provider thread to the Textual event loop.
-
-    The provider iterator is synchronous and runs off the event loop, so it may
-    not touch widgets or stream state. It only appends here. Every event is
-    enqueued once, drained once in source order, and at most one wake-up is
-    outstanding for a non-empty queue: the idle-to-pending transition and the
-    drain that clears it share one lock, so an item can neither slip into the
-    gap between draining and clearing nor schedule a redundant callback.
-    """
-
-    def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
-        self._loop = loop
-        self._items: deque[_QueuedStreamItem] = deque()
-        self._lock = threading.Lock()
-        self._ready = asyncio.Event()
-        self._notified = False
-
-    def put(self, item: _QueuedStreamItem) -> None:
-        """Enqueue one event from any thread, waking the consumer if idle."""
-        with self._lock:
-            self._items.append(item)
-            notify = not self._notified
-            self._notified = True
-        if notify:
-            self._loop.call_soon_threadsafe(self._ready.set)
-
-    async def get_batch(self) -> list[_QueuedStreamItem]:
-        """Await and return every event queued since the last drain, in order."""
-        await self._ready.wait()
-        with self._lock:
-            self._ready.clear()
-            batch = list(self._items)
-            self._items.clear()
-            self._notified = False
-        return batch
-
-
-class _ProviderStreamControl:
-    """One completion's cross-thread provider-cancellation handoff.
-
-    Two threads reach for the same response. The event loop asks for the stop
-    (``Esc``, an abandoned turn, application teardown); the provider thread is
-    the one that has the response object, and it may not have it yet — the
-    request is still being created. So a request that arrives early is
-    remembered, and whichever side observes both an attached stream and a
-    pending request first is the one that closes it, exactly once.
-
-    The claim is made under the lock and the close is made outside it: a
-    provider callback that runs during ``cancel()`` must not be able to
-    deadlock against this object's own state.
-    """
-
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._stream: ReplyStream | None = None
-        self._cancel_requested = False
-        self._cancel_started = False
-        self._cancel_error: Exception | None = None
-
-    def attach(self, stream: ReplyStream) -> None:
-        """Hand this completion's response over, closing it if a stop is waiting.
-
-        Raises:
-            RuntimeError: if a stream was already attached. One controller
-                belongs to one completion, so a second attachment means two
-                producers are sharing it — an invariant violation, not a case
-                to recover from.
-        """
-        with self._lock:
-            if self._stream is not None:
-                raise RuntimeError("a provider stream is already attached")
-            self._stream = stream
-            claimed = self._claim_cancel_locked()
-        self._cancel_claimed(claimed)
-
-    def cancel(self) -> None:
-        """Request closure of this completion's response, now or on attachment."""
-        with self._lock:
-            self._cancel_requested = True
-            claimed = self._claim_cancel_locked()
-        self._cancel_claimed(claimed)
-
-    @property
-    def cancel_error(self) -> Exception | None:
-        """The exception the cancellation call itself raised, if any."""
-        with self._lock:
-            return self._cancel_error
-
-    def _claim_cancel_locked(self) -> ReplyStream | None:
-        """The stream this caller may close, or ``None``. Call under the lock."""
-        if self._cancel_started or not self._cancel_requested:
-            return None
-        if self._stream is None:
-            return None
-        self._cancel_started = True
-        return self._stream
-
-    def _cancel_claimed(self, stream: ReplyStream | None) -> None:
-        """Close a claimed stream, recording a failure instead of raising it.
-
-        The caller is a Textual key handler or a provider thread; neither can
-        do anything useful with the exception, and neither may be allowed to
-        die of it. It is logged with its traceback and kept for the completion
-        to report, because a cancellation that failed is not a cancellation
-        that succeeded.
-        """
-        if stream is None:
-            return
-        try:
-            stream.cancel()
-        except Exception as error:  # noqa: BLE001 - recorded and logged, never hidden
-            _LOG.exception("Provider stream cancellation failed")
-            with self._lock:
-                self._cancel_error = error
-
-
 def _interrupted_content(partial: str) -> str:
     """Return exact partial answer text followed by the durable stop marker.
 
@@ -522,11 +391,11 @@ class AutonomousRuntime:
         self._stream_reply_fn = stream_reply_fn
         self._cmd = cmd_policy
         self._project_root = project_root
-        # One completion at a time, so one field: the controller for the stream
-        # currently being consumed, and ``None`` whenever there is not one. SDK
-        # objects stay out of ``AgentRunState`` and ``Session``, which are
-        # presentation and history, not transport.
-        self._stream_control: _ProviderStreamControl | None = None
+        # One completion at a time, so one field: the task consuming the
+        # provider stream right now, and ``None`` whenever there is not one.
+        # Transport objects stay out of ``AgentRunState`` and ``Session``,
+        # which are presentation and history.
+        self._provider_task: asyncio.Task[None] | None = None
 
     @property
     def state(self) -> AgentRunState:
@@ -560,28 +429,28 @@ class AutonomousRuntime:
     def request_stop(self) -> None:
         """Stop this run's live external work: its stream, or its command.
 
-        Those are the only resources a run holds outside the event loop, so
+        Those are the only resources a run holds outside its own coroutine, so
         this is the whole of stopping one — for ``Esc`` on Primary and for
         application exit alike.
 
-        Stopping a stream closes its provider response rather than waiting for
-        one more item: the read the provider thread is parked in cannot be
-        woken by a flag it only checks between items.
+        Stopping a stream cancels the task awaiting it. Waiting for one more
+        item would not do: the response may stay open indefinitely, and this
+        transport gives a reader parked in it no other way out.
 
         Raises:
-            RuntimeError: if the run is generating without a stream controller.
-                The controller exists for the whole of ``generating``, so its
-                absence means the two have drifted apart — and a silent
-                fallback to the flag alone would leave the stop cooperative
-                again, which is the bug.
+            RuntimeError: if the run is generating without a provider task. The
+                task exists for the whole of ``generating``, so its absence
+                means the two have drifted apart — and falling back to the flag
+                alone would silently make the stop cooperative again, which is
+                the bug this exists to prevent.
         """
         state = self._state
         if state.generating:
             state.stop_event.set()
-            control = self._stream_control
-            if control is None:
-                raise RuntimeError("a generating run has no provider stream control")
-            control.cancel()
+            task = self._provider_task
+            if task is None:
+                raise RuntimeError("a generating run has no provider task")
+            task.cancel()
         elif state.running_proc is not None:
             state.command_interrupted = True
             _kill_command_group(state.running_proc)
@@ -671,13 +540,17 @@ class AutonomousRuntime:
         exists. Composing the prompt is fallible, and a failure after the
         generating flag, the AI entry, and the label timer were opened would
         latch all three: a bubble stuck on "live" forever and a run that never
-        releases its turn. Nothing that can fail is done after that point
-        without a ``finally`` that closes it.
+        releases its turn. Everything opened after that point is closed by the
+        one ``finally`` that also releases the turn.
+
+        The provider stream is consumed by its own task. That task is the unit
+        of cancellation — the whole point of the split — and this coroutine
+        does not return until it has ended and its response has been closed.
         """
         state = self._state
         try:
-            # Snapshotted on the event loop: a provider thread must never read
-            # a live Session.messages list the loop can mutate underneath it.
+            # Snapshotted before the task starts: the provider must never read
+            # a live Session.messages list this coroutine can mutate under it.
             messages = state.session.messages_with_system(state.system_prompt())
         except (PromptResourceError, PromptSourceError) as error:
             failure = f"{PROMPT_ERROR}\n\n{error}"
@@ -688,7 +561,8 @@ class AutonomousRuntime:
 
         parts: list[str] = []
         timings: dict | None = None
-        error: Exception | None = None
+        stream_error: Exception | None = None
+        render_error: Exception | None = None
         started = time.monotonic()
         mode = state.reasoning_mode()
         content_chars = 0
@@ -700,161 +574,132 @@ class AutonomousRuntime:
         reason_dropped = False
         reason_tail = ""
         reason_text = Text()
+        profile = state.profile
+        temperature = state.temperature
         state.stop_event.clear()
-        control = _ProviderStreamControl()
-        # Reachable before the flag that makes ``request_stop()`` look here, so
-        # an Esc pressed on the first frame of the turn still finds it.
-        self._stream_control = control
         self._set_phase("streaming")
         self._set_generating(True)
 
         chat = state.transcript
         reason_entry: PlainTail | None = None
-        if mode != "hide":
-            reason_entry = chat.begin_plain("reasoning", hidden=True)
-        ai_entry: MarkdownTail = chat.begin_markdown("ai")
-        label, ai_md = ai_entry.label, ai_entry.body
-        ai_stream = Markdown.get_stream(ai_md)
-        # Anchoring lets Textual keep the newest output in view by itself and
-        # release that hold the moment the user scrolls, so the stream never
-        # has to issue a scroll request of its own per chunk.
-        chat.anchor()
-
-        def drop_reason_bubble() -> None:
-            """Withdraw the reasoning entry; the transcript owns its widgets."""
-            if reason_entry is not None:
-                chat.remove(reason_entry)
-
-        def close_reason_bubble() -> None:
-            """End the reasoning entry the way its mode asks for.
-
-            ``transient`` never keeps anything, and neither retaining mode has
-            anything worth keeping if no reasoning ever became visible; both
-            withdraw the entry instead of compacting an empty one.
-            """
-            if reason_entry is None:
-                return
-            if mode == "transient" or not reason_visible:
-                chat.remove(reason_entry)
-                return
-            displayed = "…" + reason_tail if mode == "tail" else reason_text.plain
-            chat.finalize(
-                reason_entry,
-                TranscriptRecord("reasoning", displayed, format="plain"),
-            )
-
-        def render_reasoning() -> None:
-            """Push the accumulated reasoning body into its bubble.
-
-            ``tail`` renders a bounded string; the retaining modes hand over one
-            mutable ``Text`` that grows by append, so no mode re-joins every
-            fragment received so far.
-            """
-            assert reason_entry is not None
-            if mode == "tail":
-                reason_entry.body.update("…" + reason_tail)
-            else:
-                reason_entry.body.update(reason_text)
-
-        def apply_reasoning(delta: str) -> None:
-            """Fold one batch of reasoning deltas into the reasoning bubble."""
-            nonlocal reason_visible, reason_dropped, reason_tail
-            if reason_entry is None:
-                return
-            if delta:
-                if mode == "tail":
-                    reason_tail = (reason_tail + delta)[-500:]
-                else:
-                    reason_text.append(delta)
-            if reasoning_chars and not reason_visible and not reason_dropped:
-                reason_entry.label.display = True
-                reason_entry.body.display = True
-                reason_visible = True
-            if not reason_visible:
-                return
-            if got_content and mode == "transient":
-                drop_reason_bubble()
-                reason_visible = False
-                reason_dropped = True
-            elif delta:
-                render_reasoning()
-
-        def update_label() -> None:
-            """Repaint the AI status line from the running counters only."""
-            if not label.is_mounted:
-                return
-            elapsed = int(time.monotonic() - started)
-            frame = SPINNER_FRAMES[tick_count % len(SPINNER_FRAMES)]
-            if not got_item:
-                label.update(f"AI  ·  waiting {elapsed}s")
-            elif not got_content:
-                label.update(f"AI  ·  {frame}  thinking… {reasoning_chars}")
-            else:
-                label.update(f"AI  ·  {frame}  {content_chars}")
-
-        def tick() -> None:
-            nonlocal tick_count
-            tick_count += 1
-            update_label()
-
-        # The timer belongs to the transcript it repaints, so it is scoped to
-        # one run's own widget rather than to the whole app.
-        timer = chat.set_interval(1.0, tick)
-        inbox = _StreamInbox(asyncio.get_running_loop())
-        # This stream's own stop signal, separate from the run's stop flag: it
-        # says "nobody is reading the inbox any more", which is true on every
-        # exit, not only the ones the user asked for.
-        abandoned = threading.Event()
-        profile = state.profile
-        temperature = state.temperature
-
-        def consume() -> None:
-            """Provider thread: enqueue every event, then one end marker."""
-            producer_error: Exception | None = None
-            try:
-                stream = self._stream_reply_fn(profile, temperature, messages)
-                # Before the first read, so a stop that landed while the request
-                # was being created closes the response the request produced
-                # instead of being lost. Closing cannot interrupt the creating
-                # call itself; the SDK request timeout still owns that window.
-                control.attach(stream)
-                if not (abandoned.is_set() or state.stop_event.is_set()):
-                    for item in stream:
-                        inbox.put(item)
-                        if abandoned.is_set() or state.stop_event.is_set():
-                            break
-            except Exception as exc:  # noqa: BLE001 - report connection failures cleanly
-                producer_error = exc
-            finally:
-                inbox.put(_StreamEnd(producer_error))
-
-        producer = threading.Thread(target=consume, daemon=True)
-        producer.start()
-
-        render_error: Exception | None = None
-        # Whether the consumer saw the producer's terminal marker. False means
-        # the producer is still inside the provider read with nobody left to
-        # hand items to, and only closing the response ends that.
-        provider_ended = False
+        ai_entry: MarkdownTail | None = None
+        timer: Timer | None = None
+        provider_task: asyncio.Task[None] | None = None
+        # Everything below is live state. Acquiring it is fallible — a widget
+        # mount, a Markdown stream, a timer — so the release path starts here
+        # rather than after the last thing that can fail.
         try:
-            try:
-                ended = False
-                while not ended:
-                    batch = await inbox.get_batch()
-                    content_deltas: list[str] = []
-                    reason_deltas: list[str] = []
-                    for item in batch:
-                        if isinstance(item, _StreamEnd):
-                            error = item.error
-                            ended = True
-                            provider_ended = True
-                            break
+            if mode != "hide":
+                reason_entry = chat.begin_plain("reasoning", hidden=True)
+            ai_entry = chat.begin_markdown("ai")
+            label, ai_md = ai_entry.label, ai_entry.body
+            ai_stream = Markdown.get_stream(ai_md)
+            # Anchoring lets Textual keep the newest output in view by itself
+            # and release that hold the moment the user scrolls, so the stream
+            # never has to issue a scroll request of its own per chunk.
+            chat.anchor()
+
+            def drop_reason_bubble() -> None:
+                """Withdraw the reasoning entry; the transcript owns its widgets."""
+                if reason_entry is not None:
+                    chat.remove(reason_entry)
+
+            def close_reason_bubble() -> None:
+                """End the reasoning entry the way its mode asks for.
+
+                ``transient`` never keeps anything, and neither retaining mode
+                has anything worth keeping if no reasoning ever became visible;
+                both withdraw the entry instead of compacting an empty one.
+                """
+                if reason_entry is None:
+                    return
+                if mode == "transient" or not reason_visible:
+                    chat.remove(reason_entry)
+                    return
+                displayed = "…" + reason_tail if mode == "tail" else reason_text.plain
+                chat.finalize(
+                    reason_entry,
+                    TranscriptRecord("reasoning", displayed, format="plain"),
+                )
+
+            def render_reasoning() -> None:
+                """Push the accumulated reasoning body into its bubble.
+
+                ``tail`` renders a bounded string; the retaining modes hand over
+                one mutable ``Text`` that grows by append, so no mode re-joins
+                every fragment received so far.
+                """
+                assert reason_entry is not None
+                if mode == "tail":
+                    reason_entry.body.update("…" + reason_tail)
+                else:
+                    reason_entry.body.update(reason_text)
+
+            def apply_reasoning(delta: str) -> None:
+                """Fold one reasoning delta into the reasoning bubble."""
+                nonlocal reason_visible, reason_dropped, reason_tail
+                if reason_entry is None:
+                    return
+                if delta:
+                    if mode == "tail":
+                        reason_tail = (reason_tail + delta)[-500:]
+                    else:
+                        reason_text.append(delta)
+                if reasoning_chars and not reason_visible and not reason_dropped:
+                    reason_entry.label.display = True
+                    reason_entry.body.display = True
+                    reason_visible = True
+                if not reason_visible:
+                    return
+                if got_content and mode == "transient":
+                    drop_reason_bubble()
+                    reason_visible = False
+                    reason_dropped = True
+                elif delta:
+                    render_reasoning()
+
+            def update_label() -> None:
+                """Repaint the AI status line from the running counters only."""
+                if not label.is_mounted:
+                    return
+                elapsed = int(time.monotonic() - started)
+                frame = SPINNER_FRAMES[tick_count % len(SPINNER_FRAMES)]
+                if not got_item:
+                    label.update(f"AI  ·  waiting {elapsed}s")
+                elif not got_content:
+                    label.update(f"AI  ·  {frame}  thinking… {reasoning_chars}")
+                else:
+                    label.update(f"AI  ·  {frame}  {content_chars}")
+
+            def tick() -> None:
+                nonlocal tick_count
+                tick_count += 1
+                update_label()
+
+            # The timer belongs to the transcript it repaints, so it is scoped
+            # to one run's own widget rather than to the whole app.
+            timer = chat.set_interval(1.0, tick)
+
+            async def consume() -> None:
+                """Read and render one provider response until it ends.
+
+                This is the cancellable unit. Every await in it — opening the
+                request, and each item — is a point the runtime can stop at,
+                and the response is closed on the way out however it ends.
+                """
+                nonlocal timings, got_item, got_content
+                nonlocal content_chars, reasoning_chars, render_error
+                stream = await self._stream_reply_fn(profile, temperature, messages)
+                try:
+                    async for item in stream:
                         got_item = True
+                        reason_delta = ""
+                        content_delta = ""
                         if isinstance(item, tuple):
                             kind, payload = item
                             if kind == "reasoning":
                                 reasoning_chars += len(payload)
-                                reason_deltas.append(payload)
+                                reason_delta = payload
                             elif kind == "usage":
                                 self._set_prompt_tokens(payload["prompt_tokens"])
                             elif kind == "timings":
@@ -867,37 +712,48 @@ class AutonomousRuntime:
                             content_chars += len(item)
                             if item:
                                 got_content = True
-                                content_deltas.append(item)
-                    # /clear can unmount the live bubbles mid-stream; the answer
-                    # keeps accumulating for the model, but there is nothing
-                    # left to paint.
-                    if label.is_mounted:
-                        apply_reasoning("".join(reason_deltas))
-                        combined_delta = "".join(content_deltas)
-                        if combined_delta:
-                            # Awaited, not detached: the next batch cannot be
-                            # drained — and the stream cannot be finalized —
-                            # until this lands.
-                            await ai_stream.write(combined_delta)
-                    update_label()
-            except Exception as exc:  # noqa: BLE001 - a broken renderer ends the turn
-                # Rendering happens on the event loop now, so a failure here has
-                # no provider thread to surface it. Leaving it to propagate
-                # would latch ``generating`` and queue every later message
-                # behind a turn that can never finish, so it is reported like
-                # any other stream failure and the completion ends.
-                render_error = exc
-            finally:
-                timer.stop()
+                                content_delta = item
+                        # /clear can unmount the live bubbles mid-stream; the
+                        # answer keeps accumulating for the model, but there is
+                        # nothing left to paint.
+                        if not label.is_mounted:
+                            continue
+                        try:
+                            apply_reasoning(reason_delta)
+                            if content_delta:
+                                await ai_stream.write(content_delta)
+                            update_label()
+                        except Exception as exc:  # noqa: BLE001 - ends the turn
+                            # A broken renderer has no provider thread to
+                            # surface it and must not latch ``generating``, so
+                            # it is reported like any other stream failure and
+                            # the completion ends.
+                            render_error = exc
+                            return
+                finally:
+                    # Closed on every exit, cancellation included. This is what
+                    # disconnects a response the server would otherwise hold
+                    # open, and it happens before the turn is released.
+                    await stream.aclose()
 
+            provider_task = asyncio.create_task(consume())
+            self._provider_task = provider_task
+            # ``wait`` never re-raises the task's own outcome, so a provider
+            # failure, a stop, and a cancellation of *this* coroutine stay
+            # three distinguishable things instead of one CancelledError.
+            await asyncio.wait({provider_task})
+            if not provider_task.cancelled():
+                stream_error = provider_task.exception()
+
+            timer.stop()
             await ai_stream.stop()
             async with ai_md.lock:
                 pass
             reply = "".join(parts)
             if state.stop_event.is_set():
-                # A stop wins over whatever closing the response did to the
-                # blocked read. The transport error it raised is the mechanism
-                # of the stop, not a connection failure to report.
+                # A stop wins over whatever the disconnect did to the read in
+                # flight. The error it raised is the mechanism of the stop, not
+                # a connection failure to report.
                 drop_reason_bubble()
                 interrupted = _interrupted_content(reply)
                 # One record, two faces: the reader keeps the answer they
@@ -918,14 +774,8 @@ class AutonomousRuntime:
                     TranscriptRecord("ai", interrupted, label=STOPPED_LABEL),
                 )
                 chat.scroll_end(animate=False)
-                cancel_error = control.cancel_error
-                if cancel_error is not None:
-                    # Visible, but never persisted and never model-facing: the
-                    # conversation record is the interruption, not the CLI's
-                    # trouble closing a socket.
-                    self._show("system", f"{STREAM_CANCEL_ERROR}: {cancel_error}")
                 return _CompletionOutcome("stopped")
-            failure = error if render_error is None else render_error
+            failure = stream_error if render_error is None else render_error
             if failure is not None:
                 headline = CONNECTION_ERROR if render_error is None else RENDER_ERROR
                 error_text = f"{headline}\n\n{failure}"
@@ -954,26 +804,23 @@ class AutonomousRuntime:
             self._set_last_reply(reply)
             return _CompletionOutcome("reply", text=reply)
         finally:
-            abandoned.set()
-            try:
-                if not provider_ended:
-                    # A render failure or a cancelled task leaves the producer
-                    # parked in the provider read, where ``abandoned`` cannot
-                    # reach it. Closing the response is what ends it. A stream
-                    # that ran to completion is not closed here: the SDK closes
-                    # an exhausted stream itself, and cancelling is an early
-                    # exit, not a teardown step.
-                    control.cancel()
-                # Every path but a render failure has already seen _StreamEnd,
-                # so the producer is done. That one has not: releasing the run
-                # with it still running would let the next request overlap it
-                # and grow an inbox nobody drains. Join off the event loop —
-                # Escape already makes a run wait for its provider this way.
-                if producer.is_alive():
-                    await asyncio.to_thread(producer.join)
-            finally:
-                self._stream_control = None
-                self._set_generating(False)
+            if timer is not None:
+                timer.stop()
+            if provider_task is not None and not provider_task.done():
+                # Unwinding before the task finished: this coroutine was
+                # cancelled, or something after the stream failed. The turn is
+                # not released until the task has ended and — in its own
+                # ``finally`` — closed its response. Releasing it earlier would
+                # let the queued message open a second, overlapping request.
+                provider_task.cancel()
+                await asyncio.wait({provider_task})
+            self._provider_task = None
+            for entry in (ai_entry, reason_entry):
+                if entry is not None and entry.state == "live":
+                    # Nothing finalized it, so acquiring live state failed part
+                    # way. A live entry left behind is a bubble stuck on "live".
+                    chat.remove(entry)
+            self._set_generating(False)
 
     # -------------------------------------------------------------- commands
 
@@ -1228,7 +1075,6 @@ __all__ = [
     "RENDER_ERROR",
     "SPINNER_FRAMES",
     "STOPPED_LABEL",
-    "STREAM_CANCEL_ERROR",
     "SUBAGENT_DISPATCH_ERROR",
     "AgentOutcome",
     "AgentRunState",

@@ -7,9 +7,9 @@ app is deliberately absent: what is proved here is the loop, not the TUI.
 
 import asyncio
 import json
-import logging
 import os
 import pathlib
+import socket
 import subprocess
 import threading
 import time
@@ -18,7 +18,7 @@ from unittest import mock
 import pytest
 from textual.app import App, ComposeResult
 
-from jtech_cli import tui_runtime
+from jtech_cli import llm_client, tui_runtime
 from jtech_cli.cmd_tools import AgentDispatch, CmdPolicy, truncate_output
 from jtech_cli.config import ResolvedProfile
 from jtech_cli.prompts import NUDGE_PROMPT, PromptResourceError, PromptSourceError
@@ -28,7 +28,6 @@ from jtech_cli.tui_runtime import (
     MIXED_TOOLS_ERROR,
     PROMPT_ERROR,
     STOPPED_LABEL,
-    STREAM_CANCEL_ERROR,
     SUBAGENT_DISPATCH_ERROR,
     AgentOutcome,
     AgentRunState,
@@ -82,47 +81,42 @@ class FakeHost:
 
 
 class _BlockingReplyStream:
-    """A `ReplyStream` that parks in its read until something cancels it.
+    """A `ReplyStream` that emits one item and then never produces another.
 
-    This is the shape the hotfix exists for: a provider thread blocked inside
-    the SDK read, where a cooperative flag checked between items can never
-    reach it. Nothing but ``cancel()`` releases it, so a test that stops this
-    stream is exercising the real cancellation path rather than a gate it
+    This is the shape the fix exists for: a reader parked in a response that
+    will not end on its own. Nothing releases it but cancellation, so a test
+    that stops this stream is exercising the real path rather than a gate it
     opened itself.
     """
 
-    def __init__(self, first="partial", *, cancel_error=None):
+    def __init__(self, first="partial"):
         self.first = first
-        self.cancel_error = cancel_error
-        self.blocked = threading.Event()  # set once the reader is parked
-        self._released = threading.Event()  # set only by cancel()
-        self.cancels = 0
+        self.blocked = asyncio.Event()  # set once the reader is parked
+        self.cancelled = False
+        self.closed = 0
         self.iterated = False
-        self.ended = False
 
-    def __iter__(self):
+    def __aiter__(self):
+        return self._items()
+
+    async def _items(self):
         self.iterated = True
         yield self.first
         self.blocked.set()
-        self._released.wait(10)
-        self.ended = True
+        try:
+            await asyncio.Event().wait()  # never set by anyone
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
 
-    def cancel(self):
-        """Release the parked reader, then fail if the test asked it to.
-
-        The order matters: a real ``close()`` unblocks the read before it can
-        raise, so a failure here must not also leave the producer stuck.
-        """
-        self.cancels += 1
-        self._released.set()
-        if self.cancel_error is not None:
-            raise self.cancel_error
+    async def aclose(self):
+        self.closed += 1
 
 
 def reply_stream_factory(stream):
     """A `StreamReply` handing out one prepared stream."""
 
-    def factory(profile, temperature, messages):
+    async def factory(profile, temperature, messages):
         return stream
 
     return factory
@@ -138,24 +132,28 @@ async def wait_for(pilot, predicate, *, tries=100, pause=0.05):
 
 
 class _ScriptedReplyStream:
-    """A finite `ReplyStream` over one already-known reply."""
+    """A finite `ReplyStream` over already-known items."""
 
-    def __init__(self, reply):
-        self.reply = reply
-        self.cancels = 0
+    def __init__(self, *items):
+        self.items = items
+        self.closed = 0
 
-    def __iter__(self):
-        yield self.reply
+    def __aiter__(self):
+        return self._items()
 
-    def cancel(self):
-        self.cancels += 1
+    async def _items(self):
+        for item in self.items:
+            yield item
+
+    async def aclose(self):
+        self.closed += 1
 
 
 def scripted_stream(*replies):
     """A stream fake yielding one scripted reply per completion, in order."""
     calls = {"n": 0}
 
-    def fake(profile, temperature, messages):
+    async def fake(profile, temperature, messages):
         index = calls["n"]
         calls["n"] += 1
         reply = replies[index] if index < len(replies) else ""
@@ -181,6 +179,7 @@ def make_state(
     session=None,
     debug_level="none",
     reasoning="hide",
+    profile=None,
 ) -> AgentRunState:
     return AgentRunState(
         agent_key="primary" if kind == "primary" else "coder",
@@ -188,7 +187,7 @@ def make_state(
         kind=kind,
         session=session or Session(persist=False),
         transcript=app.query_one("#chat", Transcript),
-        profile=PROFILE,
+        profile=profile or PROFILE,
         temperature=0.7,
         system_prompt=lambda: "SYSTEM",
         reasoning_mode=lambda: reasoning,
@@ -582,8 +581,8 @@ async def test_a_stopped_run_closes_provider_and_records_balanced_context():
         records = list(chat.history.records)
         tail = list(chat._tail)
 
-    assert stream.cancels == 1
-    assert stream.ended is True  # the blocked read was released, not waited out
+    assert stream.cancelled is True  # the parked read was cancelled, not waited out
+    assert stream.closed == 1  # and its response was closed on the way out
     assert outcome == RunOutcome("stopped")
     assert runtime.state.generating is False
     assert runtime.state.tool_rounds_active is False
@@ -613,20 +612,20 @@ async def test_a_stopped_run_closes_provider_and_records_balanced_context():
     assert host.dispatched == []
 
 
-async def test_stop_before_stream_attachment_cancels_before_first_iteration():
-    """A stop that lands while the request is still being created is remembered.
+async def test_stop_during_request_creation_cancels_before_any_iteration():
+    """A stop landing while the request is still being opened cancels it.
 
-    This is the controller's hard race: the event loop asks to cancel a stream
-    the provider thread does not have yet. The returned response must still be
-    closed, and must never be read.
+    The request itself is an await inside the cancellable task, so there is no
+    window where a stop can be dropped for arriving too early, and no stream to
+    read once it is cancelled.
     """
     stream = _BlockingReplyStream()
-    creating = threading.Event()
-    release = threading.Event()
+    creating = asyncio.Event()
+    release = asyncio.Event()
 
-    def factory(profile, temperature, messages):
+    async def factory(profile, temperature, messages):
         creating.set()
-        release.wait(10)
+        await release.wait()
         return stream
 
     session = Session(persist=False)
@@ -639,8 +638,7 @@ async def test_stop_before_stream_attachment_cancels_before_first_iteration():
         release.set()
         outcome = await asyncio.wait_for(task, 10)
 
-    assert stream.cancels == 1
-    assert stream.iterated is False
+    assert stream.iterated is False  # the stream was never read
     assert outcome == RunOutcome("stopped")
     assert runtime.state.generating is False
     assert [m["content"] for m in session.messages] == [INTERRUPTED_RESPONSE]
@@ -682,43 +680,112 @@ async def test_reasoning_only_stop_never_records_reasoning():
     assert not any(record.role == "reasoning" for record in records)
 
 
-async def test_stream_cancel_failure_is_logged_and_visible_after_stream_ends(caplog):
-    """A cancellation call that raises is reported, never quietly downgraded."""
-    caplog.set_level(logging.ERROR, logger="jtech_cli.tui_runtime")
-    stream = _BlockingReplyStream(cancel_error=RuntimeError("close failed"))
-    session = Session(persist=False)
-    async with _Harness().run_test() as pilot:
-        runtime, _ = make_runtime(
-            pilot.app, reply_stream_factory(stream), session=session
+# ------------------------------------------------------- transport boundary
+
+
+class _OpenSSEServer:
+    """A real HTTP endpoint that streams one token and then never finishes.
+
+    The point of this fixture is what it refuses to do: after the first chunk
+    it holds the response open and sends nothing further, so the only thing
+    that can end a read of it is the client disconnecting. A server that
+    politely closed would let a broken cancellation look like a working one.
+    """
+
+    def __init__(self) -> None:
+        self._socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._socket.bind(("127.0.0.1", 0))
+        self._socket.listen(1)
+        self.port = self._socket.getsockname()[1]
+        self.disconnected = threading.Event()
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+
+    def __enter__(self):
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self._socket.close()
+        self._thread.join(5)
+
+    @property
+    def profile(self) -> ResolvedProfile:
+        return ResolvedProfile(
+            name="open",
+            base_url=f"http://127.0.0.1:{self.port}/v1",
+            model="m",
+            api_key="none",
         )
-        task = asyncio.create_task(runtime.run())
-        await wait_for(pilot, stream.blocked.is_set)
 
-        runtime.request_stop()
-        outcome = await asyncio.wait_for(task, 10)
+    def _serve(self) -> None:
+        try:
+            conn, _ = self._socket.accept()
+        except OSError:
+            return
+        try:
+            conn.recv(65536)
+            conn.sendall(
+                b"HTTP/1.1 200 OK\r\n"
+                b"Content-Type: text/event-stream\r\n"
+                b"Transfer-Encoding: chunked\r\n\r\n"
+            )
+            body = (
+                b'data: {"id":"1","object":"chat.completion.chunk","created":1,'
+                b'"model":"m","choices":[{"index":0,"delta":{"content":"partial"},'
+                b'"finish_reason":null}]}\n\n'
+            )
+            conn.sendall(b"%x\r\n" % len(body) + body + b"\r\n")
+            conn.settimeout(30)
+            while True:  # only a client disconnect ends this
+                if not conn.recv(1):
+                    self.disconnected.set()
+                    return
+        except OSError:
+            self.disconnected.set()
+        finally:
+            conn.close()
 
-        records = list(pilot.app.query_one("#chat", Transcript).history.records)
+
+async def test_stop_disconnects_a_provider_response_that_never_finishes():
+    """The transport boundary, with no test double anywhere in the path.
+
+    A real SSE response emits one token and then stays open forever. Stopping
+    must disconnect it and finish the run, which is only possible if the
+    cancellation reaches the read itself rather than a flag the reader checks
+    between items. Closing the response from another thread does not do this;
+    that is what this test exists to keep proving.
+    """
+    llm_client._client_cache.clear()
+    session = Session(persist=False)
+    with _OpenSSEServer() as server:
+        async with _Harness().run_test() as pilot:
+            runtime, _ = make_runtime(
+                pilot.app,
+                llm_client.stream_reply,
+                session=session,
+                profile=server.profile,
+            )
+            task = asyncio.create_task(runtime.run())
+            await wait_for(
+                pilot,
+                lambda: any("partial" in body for _, body in live_entries(pilot.app)),
+                tries=200,
+            )
+            # The token has arrived and been rendered, so the reader is now
+            # parked in a response that will never produce another one.
+            await pilot.pause(0.2)
+            assert not task.done()
+
+            runtime.request_stop()
+            outcome = await asyncio.wait_for(task, 5)
 
     assert outcome == RunOutcome("stopped")
-    assert stream.ended is True  # the reader was released before cancel raised
+    assert server.disconnected.wait(5), "the provider response was never closed"
     assert runtime.state.generating is False
     assert [m["content"] for m in session.messages] == [
         f"partial\n\n{INTERRUPTED_RESPONSE}"
     ]
-
-    logged = [
-        record
-        for record in caplog.records
-        if record.levelno == logging.ERROR and record.exc_info is not None
-    ]
-    assert logged, caplog.records
-    assert "close failed" in str(logged[0].exc_info[1])
-
-    warnings = [r for r in records if STREAM_CANCEL_ERROR in r.content]
-    assert len(warnings) == 1
-    assert "close failed" in warnings[0].content
-    # Visible only: the model sees the interruption, not the CLI's socket trouble.
-    assert not any(STREAM_CANCEL_ERROR in m["content"] for m in session.messages)
 
 
 async def test_a_history_write_failure_is_visible_and_does_not_end_the_run():
@@ -771,10 +838,12 @@ async def test_the_system_prompt_is_evaluated_per_completion():
     prompts = iter(["FIRST", "SECOND"])
     calls = {"n": 0}
 
-    def fake(profile, temperature, messages):
+    async def fake(profile, temperature, messages):
         calls["n"] += 1
         seen.append(messages[0]["content"])
-        yield command_call("echo x") if calls["n"] == 1 else "done"
+        return _ScriptedReplyStream(
+            command_call("echo x") if calls["n"] == 1 else "done"
+        )
 
     async with _Harness().run_test() as pilot:
         runtime, _ = make_runtime(pilot.app, fake)
@@ -783,17 +852,17 @@ async def test_the_system_prompt_is_evaluated_per_completion():
     assert seen == ["FIRST", "SECOND"]
 
 
-async def test_the_provider_thread_never_sees_a_live_message_list():
-    """The snapshot is taken on the event loop, so a mutation afterwards
+async def test_the_provider_task_never_sees_a_live_message_list():
+    """The snapshot is taken before the task starts, so a mutation afterwards
     cannot reach the request already in flight."""
     session = Session(persist=False)
     session.add("user", "original")
     captured: list[list[dict]] = []
 
-    def fake(profile, temperature, messages):
+    async def fake(profile, temperature, messages):
         captured.append(messages)
         session.messages.append({"role": "user", "content": "injected"})
-        yield "done"
+        return _ScriptedReplyStream("done")
 
     async with _Harness().run_test() as pilot:
         runtime, _ = make_runtime(pilot.app, fake, session=session)

@@ -37,6 +37,11 @@ def _isolated_client_cache():
     llm_client._client_cache.clear()
 
 
+async def items_of(stream):
+    """Every `StreamItem` an opened stream produces, in order."""
+    return [item async for item in stream]
+
+
 def _chunk(content):
     return SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content=content))])
 
@@ -79,20 +84,24 @@ def unsupported_param_error():
 
 
 class _SDKStream:
-    """One SDK completion stream: iterable once, with a counted ``close()``.
+    """One SDK completion stream: async-iterable, with a counted ``close()``.
 
-    Shaped like ``openai.Stream``, which is what production now keeps a handle
-    on so it can be closed from another thread.
+    Shaped like ``openai.AsyncStream``, which is what production wraps so that
+    every read is a cancellable await.
     """
 
     def __init__(self, chunks):
-        self._chunks = iter(list(chunks))
+        self._chunks = list(chunks)
         self.closed = 0
 
-    def __iter__(self):
-        return self._chunks
+    def __aiter__(self):
+        return self._items()
 
-    def close(self):
+    async def _items(self):
+        for chunk in self._chunks:
+            yield chunk
+
+    async def close(self):
         self.closed += 1
 
 
@@ -126,10 +135,10 @@ def fake_openai(monkeypatch, chunks=(), fail_on_stream_options=False, raises=Non
         def completions(self):
             return self
 
-        def close(self):
+        async def close(self):
             self.closed += 1
 
-        def create(self, **kwargs):
+        async def create(self, **kwargs):
             self.calls.append(kwargs)
             if raises is not None:
                 raise raises
@@ -144,17 +153,17 @@ def fake_openai(monkeypatch, chunks=(), fail_on_stream_options=False, raises=Non
             self.streams.append(stream)
             return stream
 
-    monkeypatch.setattr(llm_client, "OpenAI", _Client)
+    monkeypatch.setattr(llm_client, "AsyncOpenAI", _Client)
     return built
 
 
-def test_stream_reply_concatenates_deltas(monkeypatch):
+async def test_stream_reply_concatenates_deltas(monkeypatch):
     built = fake_openai(
         monkeypatch,
         [_empty_chunk(), _chunk("Hello"), _chunk(" world"), _empty_chunk()],
     )
     messages = [{"role": "user", "content": "hi"}]
-    assert "".join(stream_reply(LOCAL, 0.3, messages)) == "Hello world"
+    assert "".join(await items_of(await stream_reply(LOCAL, 0.3, messages))) == "Hello world"
 
     sent = built[0].sent
     assert sent["model"] == "qwen3"
@@ -205,19 +214,19 @@ def test_two_credentials_for_one_url_never_share_a_client(monkeypatch):
     assert built[1].kwargs["api_key"] == "sk-other"
 
 
-def test_the_model_comes_only_from_the_profile(monkeypatch):
+async def test_the_model_comes_only_from_the_profile(monkeypatch):
     """No 'default' fallback remains: an empty model is sent as empty."""
     built = fake_openai(monkeypatch, [_chunk("x")])
     empty_model = ResolvedProfile(
         name="local", base_url="http://host:9000/v1", model="", api_key="none"
     )
-    list(stream_reply(empty_model, 0.7, []))
+    await items_of(await stream_reply(empty_model, 0.7, []))
     assert built[0].sent["model"] == ""
 
 
-def test_stream_options_failure_retries_without_them(monkeypatch):
+async def test_stream_options_failure_retries_without_them(monkeypatch):
     built = fake_openai(monkeypatch, [_chunk("hi")], fail_on_stream_options=True)
-    assert "".join(stream_reply(LOCAL, 0.7, [])) == "hi"
+    assert "".join(await items_of(await stream_reply(LOCAL, 0.7, []))) == "hi"
 
     client = built[0]
     assert "stream_options" in client.calls[0]
@@ -254,10 +263,10 @@ def test_stream_options_failure_retries_without_them(monkeypatch):
         ),
     ],
 )
-def test_a_server_refusing_the_usage_option_retries_without_it(monkeypatch, name, refusal):
+async def test_a_server_refusing_the_usage_option_retries_without_it(monkeypatch, name, refusal):
     """A rejected *request* that identifies the argument is the real trigger."""
     built = fake_openai(monkeypatch, [_chunk("hi")], fail_on_stream_options=refusal)
-    assert "".join(stream_reply(LOCAL, 0.7, [])) == "hi", name
+    assert "".join(await items_of(await stream_reply(LOCAL, 0.7, []))) == "hi", name
 
     client = built[0]
     assert "stream_options" in client.calls[0]
@@ -282,7 +291,7 @@ def test_a_server_refusing_the_usage_option_retries_without_it(monkeypatch, name
         ("unrelated TypeError", TypeError("messages must be a list")),
     ],
 )
-def test_an_unrelated_failure_is_never_retried(monkeypatch, name, failure):
+async def test_an_unrelated_failure_is_never_retried(monkeypatch, name, failure):
     """Only a refusal *of this argument* justifies a second request.
 
     Retrying anything else spends a call the caller never asked for and, when
@@ -292,40 +301,40 @@ def test_an_unrelated_failure_is_never_retried(monkeypatch, name, failure):
     built = fake_openai(monkeypatch, [_chunk("hi")], fail_on_stream_options=failure)
 
     with pytest.raises(type(failure)):
-        list(stream_reply(LOCAL, 0.7, []))
+        await stream_reply(LOCAL, 0.7, [])
 
     assert len(built[0].calls) == 1, (name, built[0].calls)
 
 
-def test_a_transport_failure_is_not_swallowed_by_the_usage_retry(monkeypatch):
+async def test_a_transport_failure_is_not_swallowed_by_the_usage_retry(monkeypatch):
     """The retry exists for a refused argument, not for an endpoint that is down."""
     built = fake_openai(
         monkeypatch, raises=APIConnectionError(request=_REQUEST)
     )
 
     with pytest.raises(APIConnectionError):
-        list(stream_reply(LOCAL, 0.7, []))
+        await stream_reply(LOCAL, 0.7, [])
 
     assert len(built[0].calls) == 1, built[0].calls
 
 
-def test_an_old_sdk_naming_the_keyword_still_retries(monkeypatch):
+async def test_an_old_sdk_naming_the_keyword_still_retries(monkeypatch):
     """The `TypeError` branch is narrowed to the message that names the keyword."""
     refusal = TypeError("create() got an unexpected keyword argument 'stream_options'")
     built = fake_openai(monkeypatch, [_chunk("hi")], fail_on_stream_options=refusal)
-    assert "".join(stream_reply(LOCAL, 0.7, [])) == "hi"
+    assert "".join(await items_of(await stream_reply(LOCAL, 0.7, []))) == "hi"
     assert len(built[0].calls) == 2
 
 
-def test_stream_reply_emits_usage_from_the_choiceless_final_chunk(monkeypatch):
+async def test_stream_reply_emits_usage_from_the_choiceless_final_chunk(monkeypatch):
     """The usage chunk has no choices, so it must be read before that guard."""
     fake_openai(monkeypatch, [_chunk("hi"), _usage_chunk(4242)])
-    items = list(stream_reply(LOCAL, 0.7, []))
+    items = await items_of(await stream_reply(LOCAL, 0.7, []))
     assert ("usage", {"prompt_tokens": 4242}) in items
     assert "".join(i for i in items if isinstance(i, str)) == "hi"
 
 
-def test_reasoning_and_timings_events_are_preserved(monkeypatch):
+async def test_reasoning_and_timings_events_are_preserved(monkeypatch):
     reasoning = SimpleNamespace(
         choices=[
             SimpleNamespace(
@@ -343,7 +352,7 @@ def test_reasoning_and_timings_events_are_preserved(monkeypatch):
         timings={"prompt_n": 12},
     )
     fake_openai(monkeypatch, [reasoning, final])
-    items = list(stream_reply(LOCAL, 0.7, []))
+    items = await items_of(await stream_reply(LOCAL, 0.7, []))
     assert ("reasoning", "hmm") in items
     assert ("timings", {"prompt_n": 12}) in items
     assert "".join(i for i in items if isinstance(i, str)) == "4"
@@ -352,28 +361,28 @@ def test_reasoning_and_timings_events_are_preserved(monkeypatch):
 # ------------------------------------------------------ cancellation
 
 
-def test_reply_stream_cancel_closes_only_its_sdk_stream(monkeypatch):
-    """Cancelling one response must not close the pool every agent shares."""
+async def test_reply_stream_close_affects_only_its_sdk_stream(monkeypatch):
+    """Closing one response must not close the pool every agent shares."""
     built = fake_openai(monkeypatch, [_chunk("hi")])
-    first = stream_reply(LOCAL, 0.7, [])
+    first = await stream_reply(LOCAL, 0.7, [])
     client = built[0]
 
-    first.cancel()
+    await first.aclose()
 
     assert client.streams[0].closed == 1
     assert client.closed == 0
 
-    second = stream_reply(LOCAL, 0.7, [])
+    second = await stream_reply(LOCAL, 0.7, [])
     assert built == [client]  # the same cached client answered both
-    assert "".join(second) == "hi"
+    assert "".join(await items_of(second)) == "hi"
     assert client.streams[1].closed == 0
 
 
-def test_reply_stream_preserves_event_order_after_becoming_closeable(monkeypatch):
+async def test_reply_stream_preserves_event_order_across_the_async_move(monkeypatch):
     """One chunk carrying everything still yields in the documented order.
 
-    The chunk-to-``StreamItem`` loop moved from a generator function into an
-    adapter method; this is what would notice if the move reordered it.
+    The chunk-to-``StreamItem`` loop moved from a sync generator function into
+    an async adapter method; this is what would notice a reordering.
     """
     everything = SimpleNamespace(
         choices=[
@@ -387,7 +396,7 @@ def test_reply_stream_preserves_event_order_after_becoming_closeable(monkeypatch
     )
     fake_openai(monkeypatch, [everything])
 
-    assert list(stream_reply(LOCAL, 0.7, [])) == [
+    assert await items_of(await stream_reply(LOCAL, 0.7, [])) == [
         ("usage", {"prompt_tokens": 11}),
         ("reasoning", "hmm"),
         "4",
@@ -406,13 +415,13 @@ def test_concurrent_lookups_of_one_identity_build_exactly_one_client(monkeypatch
     leave every one but the last orphaned.
     """
     built = fake_openai(monkeypatch)
-    real = llm_client.OpenAI
+    real = llm_client.AsyncOpenAI
 
     def slow(**kwargs):
         threading.Event().wait(0.02)
         return real(**kwargs)
 
-    monkeypatch.setattr(llm_client, "OpenAI", slow)
+    monkeypatch.setattr(llm_client, "AsyncOpenAI", slow)
 
     start = threading.Barrier(8)
     clients: list[object] = []
