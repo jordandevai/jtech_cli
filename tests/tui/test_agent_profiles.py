@@ -19,6 +19,7 @@ from .support import (
     dispatch_call,
     local_settings,
     make_app,
+    result_call,
     run_primary,
     sync_stream,
     two_profile_settings,
@@ -35,7 +36,7 @@ async def test_each_agent_uses_its_own_resolved_profile(tmp_path, monkeypatch):
             ),
             "all done",
         ],
-        ["one", "two"],
+        [result_call("completed", "one"), result_call("completed", "two")],
     )
     monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(stream))
     monkeypatch.setenv("CLOUD_API_KEY", "sk-secret")
@@ -64,7 +65,9 @@ async def test_each_agent_uses_its_own_resolved_profile(tmp_path, monkeypatch):
 
 
 async def test_an_explicit_model_skips_discovery(tmp_path, monkeypatch):
-    stream = Conversation([dispatch_call(), "all done"], ["ok"])
+    stream = Conversation(
+        [dispatch_call(), "all done"], [result_call("completed", "ok")]
+    )
     monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(stream))
     probed: list[Profile] = []
 
@@ -83,7 +86,9 @@ async def test_an_explicit_model_skips_discovery(tmp_path, monkeypatch):
 async def test_an_empty_model_on_the_active_profile_uses_the_discovered_one(
     tmp_path, monkeypatch
 ):
-    stream = Conversation([dispatch_call(), "all done"], ["ok"])
+    stream = Conversation(
+        [dispatch_call(), "all done"], [result_call("completed", "ok")]
+    )
     monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(stream))
     settings = local_settings()
     settings.profiles = Profiles(
@@ -105,7 +110,9 @@ async def test_an_empty_model_on_the_active_profile_uses_the_discovered_one(
 async def test_an_empty_model_elsewhere_is_discovered_without_touching_primary(
     tmp_path, monkeypatch
 ):
-    stream = Conversation([dispatch_call(profile="cloud"), "all done"], ["ok"])
+    stream = Conversation(
+        [dispatch_call(profile="cloud"), "all done"], [result_call("completed", "ok")]
+    )
     monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(stream))
     monkeypatch.setenv("CLOUD_API_KEY", "sk-secret")
     cloud = Profile(
@@ -158,7 +165,7 @@ async def test_a_profile_failure_fails_only_its_own_task(
             ),
             "all done",
         ],
-        ["good answer"],
+        [result_call("completed", "good answer")],
     )
     monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(stream))
     app = make_app(tmp_path, settings=two_profile_settings())
@@ -206,7 +213,9 @@ async def test_an_unreachable_discovery_endpoint_fails_only_its_task(
 async def test_a_cli_override_is_advertised_once_and_dispatchable(
     tmp_path, monkeypatch
 ):
-    stream = Conversation([dispatch_call(profile="local"), "all done"], ["ok"])
+    stream = Conversation(
+        [dispatch_call(profile="local"), "all done"], [result_call("completed", "ok")]
+    )
     monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(stream))
     settings = two_profile_settings()
     settings.profile_override = Profile(
@@ -244,7 +253,7 @@ async def test_each_continuation_re_resolves_the_named_profile(tmp_path, monkeyp
             if calls["worker"] == 1:
                 inside.set()
                 release.wait(5)
-            yield "worker answer"
+            yield result_call("completed", "worker answer")
             return
         calls["n"] += 1
         if calls["n"] == 1:

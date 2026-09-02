@@ -8,9 +8,11 @@ profile lookup, the agent catalog, result ordering) stays behind
 :class:`RuntimeHost`.
 
 The stop rule is the whole contract: a run continues after every recognized
-tool call and after every empty response, and ends normally only when the model
-emits a non-whitespace response containing no recognized tool call. There is no
-command, round, repetition, retry, concurrency, or elapsed-time budget here.
+tool call and after every empty response, and ends normally only on the one
+reply its kind accepts as terminal — a non-whitespace response with no
+recognized tool call for Primary, an explicit ``jtech_result(...)`` call for a
+subagent. There is no command, round, repetition, retry, concurrency, or
+elapsed-time budget here.
 """
 
 from __future__ import annotations
@@ -83,6 +85,18 @@ SUBAGENT_DISPATCH_ERROR = (
     "Tool protocol error: a subagent cannot dispatch agents, so no call from "
     "the response was executed. Finish the assignment yourself with shell "
     "commands and report the result."
+)
+#: Sent to the coordinator, not to the model: a subagent that ends in prose has
+#: already ended its turn, and the coordinator owns what happens next.
+SUBAGENT_RESULT_REQUIRED = (
+    "Subagent protocol error: a subagent must end with exactly one "
+    'jtech_result("completed", report) or jtech_result("failed", report) call.'
+)
+PRIMARY_RESULT_FORBIDDEN = (
+    "Tool protocol error: jtech_result is available only to dispatched subagents."
+)
+MIXED_RESULT_ERROR = (
+    "Tool protocol error: jtech_result must be the only protocol call in its response."
 )
 
 StreamReply = Callable[[ResolvedProfile, float, list[dict]], Awaitable[ReplyStream]]
@@ -515,7 +529,13 @@ class AutonomousRuntime:
     # ------------------------------------------------------------- lifecycle
 
     async def run(self) -> RunOutcome:
-        """Run until final prose, a typed failure, or an explicit stop.
+        """Run until the reply that ends this run, a typed failure, or a stop.
+
+        What ends the run depends on its kind. Primary ends on final prose, the
+        answer it returns to the user. A subagent ends on an explicit
+        ``jtech_result(...)`` call and nothing else: its outcome is the status
+        that call declares, so prose alone can never report a dispatched task
+        as completed.
 
         The caller has already recorded the user message or task that starts
         this run; this requests the first completion and applies the loop.
@@ -572,14 +592,20 @@ class AutonomousRuntime:
     # ------------------------------------------------------------- tool loop
 
     async def _tool_rounds(self, first: _CompletionOutcome) -> RunOutcome:
-        """Continue the conversation until one reply is a final answer.
+        """Continue the conversation until one reply ends the run.
 
         Tool output must reach the model before its next decision, so this loop
-        owns the only normal exit: a reply with non-whitespace text and no
-        recognized tool call. Any call — however often it repeats, and whatever
-        it produced — costs another round, and an empty reply is nudged rather
-        than treated as an answer. There is no round, repetition, retry, or
-        elapsed-time budget anywhere in this control flow.
+        owns every normal exit, and which reply is one depends on the run.
+        Primary ends on a reply with non-whitespace text and no recognized tool
+        call. A subagent ends only on a ``jtech_result(...)`` call, whose typed
+        status becomes the outcome the coordinator receives; untyped final
+        prose from a subagent is a failure, because nothing else in the reply
+        distinguishes finished work from abandoned work.
+
+        Any call — however often it repeats, and whatever it produced — costs
+        another round, and an empty reply is nudged rather than treated as an
+        answer. There is no round, repetition, retry, or elapsed-time budget
+        anywhere in this control flow.
         """
         self._set_tool_rounds_active(True)
         try:
@@ -595,6 +621,25 @@ class AutonomousRuntime:
                     # Atomic: a reply with any diagnostic executes none of its
                     # calls, so a malformed batch is never half-run.
                     self._record_protocol_error(parse_errors_message(parsed.errors))
+                elif parsed.result is not None and (
+                    parsed.commands or parsed.dispatches
+                ):
+                    # A terminal status alongside work still to do says two
+                    # contradictory things, so neither is acted on.
+                    self._record_protocol_error(MIXED_RESULT_ERROR)
+                elif parsed.result is not None:
+                    if self._state.kind == "primary":
+                        self._record_protocol_error(PRIMARY_RESULT_FORBIDDEN)
+                    elif parsed.result.status == "completed":
+                        # ``parsed.commentary`` is deliberately dropped: the
+                        # report argument is the whole of what the coordinator
+                        # receives, exactly as commentary around a command or a
+                        # dispatch call is not part of that call.
+                        return RunOutcome(
+                            "completed", final_text=parsed.result.content
+                        )
+                    else:
+                        return RunOutcome("failed", error=parsed.result.content)
                 elif parsed.commands and parsed.dispatches:
                     self._record_protocol_error(MIXED_TOOLS_ERROR)
                 elif parsed.commands:
@@ -609,7 +654,21 @@ class AutonomousRuntime:
                         )
                         self._record_agent_outcomes(outcomes)
                 elif reply.strip():
-                    return RunOutcome("completed", final_text=reply)
+                    if self._state.kind == "primary":
+                        return RunOutcome("completed", final_text=reply)
+                    # No corrective round: terminal status is the boundary the
+                    # coordinator reads, the coordinator already owns retry
+                    # decisions, and asking again would let a missing status
+                    # consume completions without bound. The prose goes with
+                    # the failure so nothing the subagent did is lost — only
+                    # the claim that it succeeded is withheld.
+                    return RunOutcome(
+                        "failed",
+                        error=(
+                            f"{SUBAGENT_RESULT_REQUIRED}\n\n"
+                            f"The untyped final response was:\n\n{reply}"
+                        ),
+                    )
                 else:
                     outcome = await self._nudge()
                     continue
@@ -1265,12 +1324,15 @@ class AutonomousRuntime:
 __all__ = [
     "CONNECTION_ERROR",
     "INTERRUPTED_RESPONSE",
+    "MIXED_RESULT_ERROR",
     "MIXED_TOOLS_ERROR",
+    "PRIMARY_RESULT_FORBIDDEN",
     "RENDER_ERROR",
     "SPINNER_FRAMES",
     "STOPPED_LABEL",
     "STREAM_CANCEL_ERROR",
     "SUBAGENT_DISPATCH_ERROR",
+    "SUBAGENT_RESULT_REQUIRED",
     "AgentOutcome",
     "AgentRunState",
     "AutonomousRuntime",

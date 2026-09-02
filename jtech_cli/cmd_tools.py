@@ -1,9 +1,12 @@
 """Guarded tool protocol, shell command policy, and executor.
 
 The AI requests work with standalone ``jtech_cmd(...)`` and ``jtech_agent(...)``
-calls. One scanner owns both: they differ only in name, arity, and argument
-validation, so fence handling, HTML-wrapper handling, quoted-literal parsing,
-standalone-line detection, span masking, and diagnostics are written once.
+calls, and a dispatched subagent ends its turn with ``jtech_result(...)``. That
+third call executes nothing: it is terminal, carrying the status and the report
+the coordinator receives. One scanner owns all three, because they differ only
+in name, arity, and argument validation, so fence handling, HTML-wrapper
+handling, quoted-literal parsing, standalone-line detection, span masking, and
+diagnostics are written once.
 
 Shell calls are then decided in order: absolute blacklist (immutable, all
 modes) -> mode (off/yolo) -> allowlist -> prompt. Pure logic lives here so it
@@ -19,7 +22,7 @@ import subprocess
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal
+from typing import Literal, get_args
 
 import bashlex
 from bashlex.errors import ParsingError
@@ -80,7 +83,8 @@ class CmdPolicy:
 _AGENT_KEY_PATTERN = re.compile(r"[a-z0-9][a-z0-9_-]*")
 RESERVED_AGENT_KEY = "primary"
 
-ToolName = Literal["jtech_cmd", "jtech_agent"]
+ToolName = Literal["jtech_cmd", "jtech_agent", "jtech_result"]
+AgentResultStatus = Literal["completed", "failed"]
 
 
 def _single_line(field_name: str, value: str) -> str:
@@ -153,6 +157,46 @@ class AgentDispatch:
 
 
 @dataclass(frozen=True, slots=True)
+class AgentResult:
+    """One validated ``jtech_result(...)`` call: a subagent's terminal status.
+
+    The boundary value between the tool protocol and the coordinator, and the
+    only thing that may end a subagent's turn. Prose is not a status, so a run
+    can be reported completed only once this value exists — which is what stops
+    a model saying the work failed from being recorded as a success.
+
+    ``content`` is normalized (outer whitespace stripped) and validated here,
+    and its internal newlines are preserved exactly: it reaches the coordinator
+    verbatim as the whole of what the subagent has to report.
+
+    Args:
+        status: ``completed`` only when the assignment was actually achieved,
+            ``failed`` when an unresolved blocker prevented it.
+        content: The self-contained report. May be multiline.
+
+    Raises:
+        ValueError: on any other status, or on an empty report.
+    """
+
+    status: AgentResultStatus
+    content: str
+
+    def __post_init__(self) -> None:
+        valid = get_args(AgentResultStatus)
+        if self.status not in valid:
+            raise ValueError(
+                f"status {self.status!r} is invalid: use "
+                + " or ".join(repr(name) for name in valid)
+            )
+        content = self.content.strip()
+        if not content:
+            raise ValueError("content must not be empty")
+        # ``object.__setattr__`` because the boundary value is frozen: this is
+        # normalization at construction, not mutation afterwards.
+        object.__setattr__(self, "content", content)
+
+
+@dataclass(frozen=True, slots=True)
 class ToolProtocolError:
     """One recognized tool call the runtime refuses to execute.
 
@@ -169,12 +213,19 @@ class ToolProtocolError:
 
 @dataclass
 class ParsedReply:
-    """The executable tool calls, diagnostics, and surrounding commentary."""
+    """The executable tool calls, the terminal result, diagnostics, and commentary.
+
+    ``result`` and ``errors`` are never both populated for the same result
+    call: a boundary carrying a diagnostic *and* an apparently usable terminal
+    status is internally contradictory, so an invalid or repeated
+    ``jtech_result`` yields diagnostics and no result at all.
+    """
 
     commands: list[str]
     commentary: str = ""
     dispatches: list[AgentDispatch] = field(default_factory=list)
     errors: list[ToolProtocolError] = field(default_factory=list)
+    result: AgentResult | None = None
 
 
 class ShellParseError(ValueError):
@@ -278,8 +329,11 @@ def _analyze_shell(command: str) -> _ShellAnalysis:
 
 _JTECH_CMD = "jtech_cmd"
 _JTECH_AGENT = "jtech_agent"
+_JTECH_RESULT = "jtech_result"
 #: The complete tool vocabulary, and how many string arguments each call takes.
-_TOOL_ARITY: dict[str, int] = {_JTECH_CMD: 1, _JTECH_AGENT: 5}
+#: Membership here is what makes a name recognized at all, so the terminal
+#: result call gets the same near-miss diagnostics as the executable ones.
+_TOOL_ARITY: dict[str, int] = {_JTECH_CMD: 1, _JTECH_AGENT: 5, _JTECH_RESULT: 2}
 
 
 class _CallSyntaxError(ValueError):
@@ -580,7 +634,11 @@ def parse_jtech_reply(reply: str) -> ParsedReply:
     are inert in every form Markdown gives them — backtick and tilde fences of
     any marker length, and indentation, which needs no fence at all — as are
     HTML ``<code>`` blocks; a whole-response ``<code>`` wrapper remains
-    supported for either tool.
+    supported for any of the three tools.
+
+    A ``jtech_result(...)`` call is recognized by the same scan but executes
+    nothing: it lands in ``result`` as the subagent's terminal status, and only
+    one may appear in a reply, because two would leave the status ambiguous.
 
     A line that opens with a tool name but is malformed, mis-typed, wrongly
     sized, or followed by other text becomes a :class:`ToolProtocolError`
@@ -595,11 +653,15 @@ def parse_jtech_reply(reply: str) -> ParsedReply:
     """
     text, base_line = _scan_source(reply)
     if not text:
-        return ParsedReply([])
+        return ParsedReply(commands=[])
 
     commands: list[str] = []
     dispatches: list[AgentDispatch] = []
     errors: list[ToolProtocolError] = []
+    result: AgentResult | None = None
+    # Counted rather than inferred from ``result``: the second call clears it,
+    # and a third must not be allowed to fill it back in.
+    result_calls = 0
     spans: list[tuple[int, int]] = []
     # Position and wrapper kind of every line the scan passes over. Recorded
     # unconditionally because the scan owns the fence/HTML state a second pass
@@ -666,6 +728,31 @@ def parse_jtech_reply(reply: str) -> ParsedReply:
             if call.name == _JTECH_CMD:
                 commands.append(call.args[0])
                 continue
+            if call.name == _JTECH_RESULT:
+                result_calls += 1
+                if result_calls > 1:
+                    # Two terminal statuses cannot both be the answer, and
+                    # picking one would invent an intent the model never
+                    # expressed, so the reply carries none.
+                    result = None
+                    errors.append(
+                        ToolProtocolError(
+                            _JTECH_RESULT,
+                            line_of(call.start),
+                            f"{_JTECH_RESULT} may be called only once in a "
+                            "response, so no terminal result was recorded",
+                        )
+                    )
+                    continue
+                try:
+                    result = AgentResult(*call.args)
+                except ValueError as error:
+                    errors.append(
+                        ToolProtocolError(
+                            _JTECH_RESULT, line_of(call.start), str(error)
+                        )
+                    )
+                continue
             try:
                 dispatches.append(AgentDispatch(*call.args))
             except ValueError as error:
@@ -679,10 +766,11 @@ def parse_jtech_reply(reply: str) -> ParsedReply:
         # diagnostic already says why; otherwise a wrapped call is the one
         # remaining explanation worth giving.
         return ParsedReply(
-            commands,
-            text,
-            dispatches,
-            errors or _near_miss_errors(text, skipped, base_line),
+            commands=commands,
+            commentary=text,
+            dispatches=dispatches,
+            errors=errors or _near_miss_errors(text, skipped, base_line),
+            result=result,
         )
 
     masked = list(text)
@@ -691,7 +779,13 @@ def parse_jtech_reply(reply: str) -> ParsedReply:
             if masked[index] != "\n":
                 masked[index] = " "
     commentary = "".join(masked).strip()
-    return ParsedReply(commands, commentary, dispatches, errors)
+    return ParsedReply(
+        commands=commands,
+        commentary=commentary,
+        dispatches=dispatches,
+        errors=errors,
+        result=result,
+    )
 
 
 def duplicate_agent_keys(dispatches: Sequence[AgentDispatch]) -> tuple[str, ...]:

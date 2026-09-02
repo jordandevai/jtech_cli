@@ -8,6 +8,7 @@ import pytest
 from jtech_cli import cmd_tools
 from jtech_cli.cmd_tools import (
     AgentDispatch,
+    AgentResult,
     BoundedOutput,
     CmdPolicy,
     ShellParseError,
@@ -433,6 +434,146 @@ def test_duplicate_agent_keys_are_reported_for_the_whole_batch():
     parsed = parse_jtech_reply(reply)
     assert duplicate_agent_keys(parsed.dispatches) == ("a",)
     assert duplicate_agent_keys(parsed.dispatches[:2]) == ()
+
+
+# --------------------------------------------------------- terminal result
+
+RESULT = 'jtech_result("completed", "The parser change is in place.")'
+
+
+def test_a_completed_result_parses_into_the_boundary_value():
+    parsed = parse_jtech_reply(RESULT)
+    assert parsed.result == AgentResult("completed", "The parser change is in place.")
+    assert parsed.commands == []
+    assert parsed.dispatches == []
+    assert parsed.errors == []
+
+
+def test_a_failed_result_keeps_its_own_status():
+    parsed = parse_jtech_reply('jtech_result("failed", "The toolchain is missing.")')
+    assert parsed.result == AgentResult("failed", "The toolchain is missing.")
+
+
+def test_a_report_loses_its_padding_and_keeps_its_own_newlines():
+    """The report is delivered verbatim, so only the outer whitespace goes."""
+    reply = 'jtech_result("completed", """\n  Ran the tests.\n\n  12 passed.\n""")'
+    assert parse_jtech_reply(reply).result.content == "Ran the tests.\n\n  12 passed."
+
+
+@pytest.mark.parametrize(
+    ("reply", "fragment"),
+    [
+        ('jtech_result("done", "x")', "status 'done' is invalid"),
+        ('jtech_result("Completed", "x")', "status 'Completed' is invalid"),
+        ('jtech_result("", "x")', "status '' is invalid"),
+        ('jtech_result("completed", "   ")', "content must not be empty"),
+        ('jtech_result("completed")', "takes exactly 2 string arguments"),
+        ('jtech_result("completed", "x", "y")', "takes exactly 2"),
+        ('jtech_result("completed", 3)', "argument 2 must be a quoted string"),
+        ('jtech_result("completed", "x"', "must be followed by ',' or ')'"),
+        ('jtech_result("completed", "x") and then', "may not carry other text"),
+    ],
+)
+def test_an_invalid_result_is_reported_and_carries_no_status(reply, fragment):
+    parsed = parse_jtech_reply(reply)
+    assert parsed.result is None
+    assert len(parsed.errors) == 1
+    error = parsed.errors[0]
+    assert error.tool_name == "jtech_result"
+    assert error.line == 1
+    assert fragment in error.message
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        "jtech_result is how a subagent finishes.",
+        'jtech_result("completed"',
+        "jtech_result()",
+    ],
+)
+def test_a_line_opening_with_the_result_name_is_a_failed_call_not_prose(reply):
+    """The same rule as the executable tools: the name at column zero is a call.
+
+    Reverting a malformed one to commentary would end a subagent's turn in the
+    silence the diagnostics exist to prevent.
+    """
+    parsed = parse_jtech_reply(reply)
+    assert parsed.result is None
+    assert [error.tool_name for error in parsed.errors] == ["jtech_result"]
+
+
+def test_two_results_in_one_reply_leave_no_result_at_all():
+    """A boundary carrying both an error and a usable status contradicts itself."""
+    reply = 'jtech_result("completed", "a")\njtech_result("failed", "b")'
+    parsed = parse_jtech_reply(reply)
+    assert parsed.result is None
+    assert [(error.tool_name, error.line) for error in parsed.errors] == [
+        ("jtech_result", 2)
+    ]
+    assert "only once" in parsed.errors[0].message
+
+
+def test_a_third_result_cannot_refill_the_status_the_second_cleared():
+    reply = (
+        'jtech_result("completed", "a")\n'
+        'jtech_result("failed", "b")\n'
+        'jtech_result("completed", "c")'
+    )
+    parsed = parse_jtech_reply(reply)
+    assert parsed.result is None
+    assert [error.line for error in parsed.errors] == [2, 3]
+
+
+def test_a_result_parses_alongside_other_calls_for_the_runtime_to_refuse():
+    """The parser judges syntax, not who may call what: it hands the runtime
+    both so the contradiction is visible and the whole reply can be refused."""
+    reply = f'jtech_cmd("ls")\n{DISPATCH}\n{RESULT}'
+    parsed = parse_jtech_reply(reply)
+    assert parsed.commands == ["ls"]
+    assert [dispatch.agent_key for dispatch in parsed.dispatches] == ["coder"]
+    assert parsed.result == AgentResult("completed", "The parser change is in place.")
+    assert parsed.errors == []
+
+
+@pytest.mark.parametrize(
+    ("name", "reply"),
+    [
+        ("fenced", f"{BT3}\n{RESULT}\n{BT3}"),
+        ("four-space indented", f"Example:\n\n    {RESULT}\n"),
+        ("bulleted", f"- {RESULT}"),
+        ("quoted", f"> {RESULT}"),
+        ("html code block", f"Here:\n<code>{RESULT}</code>"),
+    ],
+)
+def test_a_wrapped_result_is_reported_rather_than_ending_the_turn(name, reply):
+    parsed = parse_jtech_reply(reply)
+    assert parsed.result is None, name
+    assert [error.tool_name for error in parsed.errors] == ["jtech_result"], name
+    assert "did not run" in parsed.errors[0].message, name
+
+
+def test_the_result_call_leaves_the_commentary_around_it_intact():
+    reply = f"I finished the work.\n\n{RESULT}\n\nNothing else was touched."
+    parsed = parse_jtech_reply(reply)
+    assert parsed.result is not None
+    assert "jtech_result" not in parsed.commentary
+    assert "I finished the work." in parsed.commentary
+    assert "Nothing else was touched." in parsed.commentary
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        f"End your turn with {RESULT} when the work is done.",
+        '- Finish by calling `jtech_result("completed", "…")` on its own line.',
+        "The status argument of jtech_result is completed or failed.",
+    ],
+)
+def test_a_result_mentioned_after_other_words_stays_ordinary_prose(reply):
+    parsed = parse_jtech_reply(reply)
+    assert parsed.result is None
+    assert parsed.errors == []
 
 
 def test_quoted_commands_support_escaped_values():

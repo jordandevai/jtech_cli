@@ -129,13 +129,23 @@ class ScriptedReplyStream:
 
 
 def scripted_stream(*replies):
-    """A stream fake yielding one scripted reply per completion, in order."""
+    """A stream fake yielding one scripted reply per completion, in order.
+
+    An exhausted script raises rather than answering. The empty reply this used
+    to fall back to is the runtime's nudge trigger, so a script one entry short
+    fed the nudge loop forever instead of failing the test.
+    """
     calls = {"n": 0}
 
     async def fake(profile, temperature, messages):
         index = calls["n"]
         calls["n"] += 1
-        reply = replies[index] if index < len(replies) else ""
+        if index >= len(replies):
+            raise AssertionError(
+                f"the scripted stream is exhausted: no reply for completion "
+                f"{index + 1} of {len(replies)}"
+            )
+        reply = replies[index]
         if isinstance(reply, Exception):
             raise reply
         return ScriptedReplyStream(reply)
@@ -145,6 +155,11 @@ def scripted_stream(*replies):
 
 def command_call(command: str) -> str:
     return f"jtech_cmd({command!r})"
+
+
+def result_call(status: str, content: str) -> str:
+    """Format one subagent terminal result using the production protocol."""
+    return f"jtech_result({status!r}, {content!r})"
 
 
 def dispatch_call(key="coder", label="Coder", profile="local", task_label="t", task="x"):

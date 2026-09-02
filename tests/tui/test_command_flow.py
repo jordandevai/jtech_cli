@@ -578,8 +578,17 @@ async def test_declined_command_ends_tool_turn(tmp_path, monkeypatch):
     assert [m["role"] for m in app.session.messages] == [
         "user", "assistant", "system", "system", "assistant",
     ]
-    # the model is told to ask the user, not to silently adapt
-    assert any("ask the user" in m["content"] for m in app.session.messages)
+    # The model is told not to retry and how to end if it cannot adapt. The
+    # guidance is role-neutral: a subagent runs this same prompt and cannot
+    # talk to the user at all, so it must never be told to ask them.
+    contents = [m["content"] for m in app.session.messages]
+    assert any("Do not retry it" in content for content in contents)
+    assert any(
+        "adapt and continue with a permitted approach" in content
+        for content in contents
+    )
+    assert any('jtech_result("failed"' in content for content in contents)
+    assert not any("ask the user" in content for content in contents)
 
 
 async def test_blocked_command_ends_tool_turn(tmp_path, monkeypatch):

@@ -18,6 +18,7 @@ from .support import (
     live_entries,
     make_runtime,
     model_messages,
+    result_call,
     scripted_stream,
     transcript_text,
     wait_for_shell,
@@ -181,7 +182,9 @@ async def test_a_finished_command_redraws_even_while_compaction_waits(tmp_path):
 
 async def test_a_subagent_command_entry_stays_in_its_own_transcript(tmp_path):
     """The entry is written to this run's injected transcript and nowhere else."""
-    stream, _ = scripted_stream(command_call("echo agent-out"), "done")
+    stream, _ = scripted_stream(
+        command_call("echo agent-out"), result_call("completed", "done")
+    )
     async with Harness().run_test() as pilot:
         agent_chat = Transcript(id="agent")
         await pilot.app.mount(agent_chat)

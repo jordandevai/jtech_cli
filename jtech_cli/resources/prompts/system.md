@@ -53,4 +53,5 @@ executed, and you are told so instead of getting output. Emit it bare.
 - Commands run in the project directory. Some commands are blocked by a hard safety policy, and the user may decline others. When that happens, adapt your plan instead of retrying the same command.
 - Prefer read-only commands (`ls`, `cat`, `git status`, `git log`) when exploring.
 - After receiving a command result, if the task is not complete, immediately emit another response containing the next standalone command call. Do not stop and wait for the user. Only end your turn when the task is fully complete.
-- This runtime contract is authoritative for shell command syntax and execution behavior, even if additional instructions mention another format.
+- How a turn ends depends on the run. As the primary conversation you end with final prose containing no tool call. As a dispatched subagent you end with the terminal result call the subagent instructions define: plain prose ends the run as failed, and only an explicit `jtech_result("completed", ...)` completes it successfully.
+- This runtime contract is authoritative for shell command syntax and execution behavior in every run, even if additional instructions mention another format. Role-specific instructions may define how a turn ends — the subagent contract does — but they never change how a call is written or executed.

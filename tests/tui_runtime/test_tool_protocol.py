@@ -18,6 +18,7 @@ from .support import (
     dispatch_call,
     make_runtime,
     model_messages,
+    result_call,
     scripted_stream,
 )
 
@@ -114,7 +115,9 @@ async def test_a_duplicate_key_in_one_batch_reaches_no_host():
 
 
 async def test_a_subagent_cannot_dispatch():
-    stream, _ = scripted_stream(dispatch_call(key="nested"), "recovered")
+    stream, _ = scripted_stream(
+        dispatch_call(key="nested"), result_call("completed", "recovered")
+    )
     session = Session(persist=False)
     host = FakeHost()
     async with Harness().run_test() as pilot:

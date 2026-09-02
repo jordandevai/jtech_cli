@@ -23,6 +23,7 @@ from .support import (
     make_app,
     make_app_with_cmd,
     primary_summary,
+    result_call,
     run_primary,
     select_agent,
     settle,
@@ -37,7 +38,8 @@ from .support import (
 async def test_a_first_dispatch_creates_one_agent_view_session_and_task(
     tmp_path, monkeypatch
 ):
-    stream = Conversation([dispatch_call(), "all done"], ["worker answer"])
+    worker_reply = result_call("completed", "worker answer")
+    stream = Conversation([dispatch_call(), "all done"], [worker_reply])
     monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(stream))
     app = make_app(tmp_path)
     async with app.run_test() as pilot:
@@ -51,7 +53,7 @@ async def test_a_first_dispatch_creates_one_agent_view_session_and_task(
         managed = app.agents["coder"]
         assert [m["content"] for m in managed.session.messages] == [
             "do the work",
-            "worker answer",
+            worker_reply,
         ]
         assert agent_activity(app, "coder")[0] == "do the work"
         worker_prompts = stream.sent_to("worker")
@@ -81,7 +83,10 @@ async def test_a_repeated_key_continues_one_conversation(tmp_path, monkeypatch):
             dispatch_call(task_label="Second", task="second task"),
             "all done",
         ],
-        ["first answer", "second answer"],
+        [
+            result_call("completed", "first answer"),
+            result_call("completed", "second answer"),
+        ],
     )
     monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(stream))
     app = make_app(tmp_path)
@@ -97,15 +102,15 @@ async def test_a_repeated_key_continues_one_conversation(tmp_path, monkeypatch):
         ]
         assert [m["content"] for m in app.agents["coder"].session.messages] == [
             "first task",
-            "first answer",
+            result_call("completed", "first answer"),
             "second task",
-            "second answer",
+            result_call("completed", "second answer"),
         ]
         # The second request carried the first exchange, so context survived.
         second_request = stream.sent_to("worker")[1]
         assert [m["content"] for m in second_request[1:]] == [
             "first task",
-            "first answer",
+            result_call("completed", "first answer"),
             "second task",
         ]
         assert agent_activity(app, "coder").count("second task") == 1
@@ -129,7 +134,7 @@ async def test_a_label_or_profile_change_for_one_key_fails_without_mutating(
             dispatch_call(profile="cloud", task_label="Third"),
             "all done",
         ],
-        ["worker answer"],
+        [result_call("completed", "worker answer")],
     )
     monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(stream))
     app = make_app(tmp_path, settings=two_profile_settings())
@@ -159,7 +164,10 @@ async def test_two_agents_never_share_a_session_or_a_transcript(
     stream = Conversation(
         [f'{dispatch_call(key="a", label="A")}\n{dispatch_call(key="b", label="B")}',
          "all done"],
-        ["answer one", "answer two"],
+        [
+            result_call("completed", "answer one"),
+            result_call("completed", "answer two"),
+        ],
     )
     monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(stream))
     app = make_app(tmp_path)
@@ -179,7 +187,9 @@ async def test_two_agents_never_share_a_session_or_a_transcript(
 
 
 async def test_subagent_sessions_never_touch_the_filesystem(tmp_path, monkeypatch):
-    stream = Conversation([dispatch_call(), "all done"], ["worker answer"])
+    stream = Conversation(
+        [dispatch_call(), "all done"], [result_call("completed", "worker answer")]
+    )
     monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(stream))
     worker_history = tmp_path / "never" / "session.jsonl"
     monkeypatch.setattr(
@@ -205,7 +215,7 @@ async def test_a_failed_agent_stays_selectable_and_can_take_another_task(
             calls["worker"] += 1
             if calls["worker"] == 1:
                 raise RuntimeError("provider exploded")
-            yield "recovered"
+            yield result_call("completed", "recovered")
             return
         calls["n"] += 1
         if calls["n"] == 1:
@@ -237,7 +247,9 @@ async def test_a_failed_agent_stays_selectable_and_can_take_another_task(
 
 
 async def test_a_relaunch_restores_primary_history_only(tmp_path, monkeypatch):
-    stream = Conversation([dispatch_call(), "all done"], ["worker answer"])
+    stream = Conversation(
+        [dispatch_call(), "all done"], [result_call("completed", "worker answer")]
+    )
     monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(stream))
     session = Session(tmp_path / "s.jsonl")
     app = make_app(tmp_path, session=session)
@@ -266,7 +278,7 @@ async def test_dispatch_never_disturbs_the_composer_selection_or_queue(
         system = messages[0]["content"]
         if "You are a subagent" in system:
             gate.wait(5)
-            yield "worker answer"
+            yield result_call("completed", "worker answer")
             return
         calls["n"] += 1
         yield dispatch_call() if calls["n"] == 1 else "all done"
@@ -296,7 +308,9 @@ async def test_dispatch_never_disturbs_the_composer_selection_or_queue(
 async def test_a_result_is_recorded_once_with_its_exact_identity(
     tmp_path, monkeypatch
 ):
-    stream = Conversation([dispatch_call(), "all done"], ["the worker answer"])
+    stream = Conversation(
+        [dispatch_call(), "all done"], [result_call("completed", "the worker answer")]
+    )
     monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(stream))
     app = make_app(tmp_path)
     async with app.run_test() as pilot:
@@ -323,7 +337,9 @@ async def test_a_result_is_recorded_once_with_its_exact_identity(
 async def test_a_primary_history_failure_is_visible_but_keeps_the_result(
     tmp_path, monkeypatch
 ):
-    stream = Conversation([dispatch_call(), "all done"], ["worker answer"])
+    stream = Conversation(
+        [dispatch_call(), "all done"], [result_call("completed", "worker answer")]
+    )
     monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(stream))
     app = make_app(tmp_path)
     original = app.session.add
@@ -371,6 +387,81 @@ async def test_primary_reports_waiting_while_its_own_command_awaits_approval(
         await pilot.press("y")
         await wait_until(app, pilot, lambda: app._primary_turn_depth == 0, tries=100)
         assert primary_summary(app).status == "idle"
+
+
+async def test_a_refused_command_and_a_failed_result_never_read_as_success(
+    tmp_path, monkeypatch
+):
+    """The reported failure, end to end through the real coordinator.
+
+    A subagent whose only command policy refuses used to close with prose, and
+    prose was the success signal: the sidebar and the coordinator both said
+    completed while nothing had run. The blocked command is written so that
+    executing it would leave a file behind, so "it did not run" is proved by
+    the filesystem rather than by the absence of a bubble.
+    """
+    marker = tmp_path / "ran.txt"
+    report = "The only command I had is blocked by policy. Nothing was changed."
+    stream = Conversation(
+        [dispatch_call(), "all done"],
+        [
+            command_call(f"iptables -L > {marker}"),
+            result_call("failed", report),
+        ],
+    )
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(stream))
+    app = make_app_with_cmd(tmp_path, CmdPolicy(mode="yolo"))
+    async with app.run_test() as pilot:
+        await run_primary(app, pilot)
+
+        assert not marker.exists()
+        activity = agent_activity(app, "coder")
+        assert any("absolute blacklist" in line for line in activity)
+
+        summary = agent_summary(app, "coder")
+        assert summary.status == "failed"
+        assert [(t.label, t.status) for t in summary.tasks] == [("Task", "failed")]
+
+        results = agent_results(app)
+        assert [r["status"] for r in results] == ["failed"]
+        assert results[0]["content"] == report
+        record = next(
+            m for m in app.session.messages
+            if m.get("_model_content", "").startswith("[JTECH agent result]")
+        )
+        assert record["content"] == "Coder failed: Task"
+
+
+async def test_a_retried_assignment_produces_two_distinct_failed_results(
+    tmp_path, monkeypatch
+):
+    """A retry is another task, not an amended one: two failed rows and two
+    failed results, rather than one completed result carrying failure prose."""
+    first = "The first attempt hit a blocked command."
+    second = "The retry hit the same blocker."
+    stream = Conversation(
+        [
+            dispatch_call(task_label="First"),
+            dispatch_call(task_label="Second"),
+            "all done",
+        ],
+        [result_call("failed", first), result_call("failed", second)],
+    )
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(stream))
+    app = make_app(tmp_path)
+    async with app.run_test() as pilot:
+        await run_primary(app, pilot)
+
+        summary = agent_summary(app, "coder")
+        assert summary.status == "failed"
+        assert [(t.label, t.status) for t in summary.tasks] == [
+            ("First", "failed"),
+            ("Second", "failed"),
+        ]
+        results = agent_results(app)
+        assert [r["status"] for r in results] == ["failed", "failed"]
+        assert [r["content"] for r in results] == [first, second]
+        assert len({r["task_id"] for r in results}) == 2
 
 
 async def test_a_late_runtime_notification_after_exit_is_not_an_error(tmp_path):

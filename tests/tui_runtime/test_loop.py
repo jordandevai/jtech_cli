@@ -6,7 +6,14 @@ import pytest
 
 from jtech_cli.prompts import NUDGE_PROMPT
 from jtech_cli.session import Session
-from jtech_cli.tui_runtime import AgentOutcome, RunOutcome, _CompletionOutcome
+from jtech_cli.tui_runtime import (
+    MIXED_RESULT_ERROR,
+    PRIMARY_RESULT_FORBIDDEN,
+    SUBAGENT_RESULT_REQUIRED,
+    AgentOutcome,
+    RunOutcome,
+    _CompletionOutcome,
+)
 from jtech_cli.tui_widgets import Transcript
 
 from .support import (
@@ -17,7 +24,9 @@ from .support import (
     command_call,
     dispatch_call,
     make_runtime,
+    model_messages,
     reply_stream_factory,
+    result_call,
     scripted_stream,
     transcript_text,
     wait_for,
@@ -50,7 +59,7 @@ def test_completion_outcome_rejects_a_reasonless_failure():
         _CompletionOutcome("failed")
 
 
-async def test_final_prose_is_the_only_normal_exit():
+async def test_final_prose_is_the_normal_exit_for_primary():
     stream, calls = scripted_stream("all done")
     async with Harness().run_test() as pilot:
         runtime, host = make_runtime(pilot.app, stream)
@@ -58,6 +67,88 @@ async def test_final_prose_is_the_only_normal_exit():
     assert outcome == RunOutcome("completed", final_text="all done")
     assert calls["n"] == 1
     assert host.phases[-1] == "completed"
+
+
+async def test_a_subagent_ending_in_plain_prose_fails_instead_of_completing():
+    """The false success this protocol exists to prevent: closing prose read as
+    a finished assignment. It fails on the spot — no corrective round, because
+    the coordinator, not this loop, owns what a missing status costs."""
+    prose = "I could not run anything, but here is what the files look like."
+    stream, calls = scripted_stream(prose)
+    async with Harness().run_test() as pilot:
+        runtime, host = make_runtime(pilot.app, stream, kind="subagent")
+        outcome = await runtime.run()
+    assert outcome.status == "failed"
+    assert SUBAGENT_RESULT_REQUIRED in outcome.error
+    # The work is preserved for the coordinator; only the claim of success is not.
+    assert prose in outcome.error
+    assert calls["n"] == 1
+    assert host.phases[-1] == "failed"
+
+
+async def test_a_completed_result_becomes_the_runs_final_text():
+    report = "Ran the focused tests.\n\n  12 passed, 0 failed."
+    stream, calls = scripted_stream(result_call("completed", report))
+    async with Harness().run_test() as pilot:
+        runtime, _ = make_runtime(pilot.app, stream, kind="subagent")
+        outcome = await runtime.run()
+    assert outcome == RunOutcome("completed", final_text=report)
+    assert calls["n"] == 1
+
+
+async def test_a_failed_result_becomes_the_runs_error():
+    report = "The toolchain is missing.\nNothing was changed."
+    stream, _ = scripted_stream(result_call("failed", report))
+    async with Harness().run_test() as pilot:
+        runtime, host = make_runtime(pilot.app, stream, kind="subagent")
+        outcome = await runtime.run()
+    assert outcome == RunOutcome("failed", error=report)
+    assert host.phases[-1] == "failed"
+
+
+async def test_primary_is_refused_the_result_call_and_keeps_going():
+    stream, calls = scripted_stream(
+        result_call("completed", "done early"), "all done"
+    )
+    session = Session(persist=False)
+    async with Harness().run_test() as pilot:
+        runtime, _ = make_runtime(pilot.app, stream, session=session)
+        outcome = await runtime.run()
+    assert outcome == RunOutcome("completed", final_text="all done")
+    assert calls["n"] == 2
+    assert PRIMARY_RESULT_FORBIDDEN in model_messages(session)[-2]["content"]
+
+
+async def test_a_result_sharing_its_response_with_a_command_executes_nothing():
+    stream, _ = scripted_stream(
+        f'{command_call("echo x")}\n{result_call("completed", "done")}',
+        result_call("completed", "corrected"),
+    )
+    session = Session(persist=False)
+    host = FakeHost()
+    async with Harness().run_test() as pilot:
+        runtime, _ = make_runtime(
+            pilot.app, stream, host=host, kind="subagent", session=session
+        )
+        outcome = await runtime.run()
+    assert outcome == RunOutcome("completed", final_text="corrected")
+    assert host.authorized == []
+    assert MIXED_RESULT_ERROR in model_messages(session)[-2]["content"]
+
+
+async def test_commentary_around_a_result_is_never_part_of_the_report():
+    """Commentary is permitted around every call and is part of none of them;
+    the report argument alone is what the coordinator receives."""
+    report = "The endpoint refused every request."
+    stream, _ = scripted_stream(
+        "Here is what happened.\n\n"
+        + result_call("failed", report)
+        + "\n\nI stopped after the third attempt."
+    )
+    async with Harness().run_test() as pilot:
+        runtime, _ = make_runtime(pilot.app, stream, kind="subagent")
+        outcome = await runtime.run()
+    assert outcome == RunOutcome("failed", error=report)
 
 
 async def test_an_empty_reply_is_nudged_not_completed():

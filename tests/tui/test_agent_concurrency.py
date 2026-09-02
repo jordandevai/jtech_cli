@@ -19,6 +19,7 @@ from .support import (
     make_app,
     make_app_with_cmd,
     primary_summary,
+    result_call,
     run_primary,
     select_agent,
     settle,
@@ -40,7 +41,7 @@ async def test_distinct_calls_all_start_before_any_of_them_finishes(
         if "You are a subagent" in messages[0]["content"]:
             live.release()
             release.wait(5)
-            yield "worker answer"
+            yield result_call("completed", "worker answer")
             return
         calls["n"] += 1
         if calls["n"] == 1:
@@ -88,7 +89,7 @@ async def test_results_are_ordered_by_call_not_by_completion(tmp_path, monkeypat
             if task == "slow task":
                 slow.wait(5)
             finished.append(task)
-            yield f"answer for {task}"
+            yield result_call("completed", f"answer for {task}")
             return
         calls["n"] += 1
         if calls["n"] == 1:
@@ -123,7 +124,7 @@ async def test_one_failing_agent_does_not_cancel_its_siblings(tmp_path, monkeypa
         if "You are a subagent" in system:
             if messages[1]["content"] == "bad task":
                 raise RuntimeError("provider exploded")
-            yield "sibling answer"
+            yield result_call("completed", "sibling answer")
             return
         calls["n"] += 1
         if calls["n"] == 1:
@@ -160,7 +161,7 @@ async def test_one_agent_runs_its_own_tasks_sequentially(tmp_path, monkeypatch):
         if "You are a subagent" in messages[0]["content"]:
             inside.set()
             release.wait(5)
-            yield "worker answer"
+            yield result_call("completed", "worker answer")
             return
         calls["n"] += 1
         if calls["n"] == 1:
@@ -200,7 +201,7 @@ async def test_one_modal_at_a_time_names_each_requesting_agent(
             if len(worker_replies) == 1:
                 yield command_call("echo from-agent")
             else:
-                yield "worker done"
+                yield result_call("completed", "worker done")
             return
         calls["n"] += 1
         if calls["n"] == 1:
@@ -264,7 +265,7 @@ async def test_an_agent_waiting_for_the_lock_re_reads_the_saved_rule(
             if len([m for m in messages if m["role"] == "user"]) == 1:
                 yield command_call("echo shared")
             else:
-                yield "worker done"
+                yield result_call("completed", "worker done")
             return
         calls["n"] += 1
         if calls["n"] == 1:
@@ -308,7 +309,7 @@ async def test_escape_never_stops_a_subagent(tmp_path, monkeypatch):
     def fake(profile, temperature, messages):
         if "You are a subagent" in messages[0]["content"]:
             release.wait(5)
-            yield "worker answer"
+            yield result_call("completed", "worker answer")
             return
         calls["n"] += 1
         yield dispatch_call() if calls["n"] == 1 else "all done"
@@ -341,7 +342,7 @@ async def test_exiting_signals_every_live_runtime(tmp_path, monkeypatch):
     def fake(profile, temperature, messages):
         if "You are a subagent" in messages[0]["content"]:
             release.wait(5)
-            yield "worker answer"
+            yield result_call("completed", "worker answer")
             return
         calls["n"] += 1
         yield dispatch_call() if calls["n"] == 1 else "all done"
@@ -437,7 +438,7 @@ async def test_an_unexpected_setup_failure_fails_only_its_own_call(
 
     def fake(profile, temperature, messages):
         if "You are a subagent" in messages[0]["content"]:
-            yield "sibling answer"
+            yield result_call("completed", "sibling answer")
             return
         calls["n"] += 1
         if calls["n"] == 1:
@@ -489,7 +490,7 @@ async def test_a_setup_failure_never_leaves_a_task_row_running_forever(
             if calls["worker"] == 1:
                 inside.set()
                 release.wait(5)
-            yield "worker answer"
+            yield result_call("completed", "worker answer")
             return
         calls["n"] += 1
         if calls["n"] == 1:
@@ -530,5 +531,5 @@ async def test_a_setup_failure_never_leaves_a_task_row_running_forever(
         # outstanding instruction.
         assert [m["content"] for m in app.agents["coder"].session.messages] == [
             "do the work",
-            "worker answer",
+            result_call("completed", "worker answer"),
         ]

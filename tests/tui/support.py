@@ -261,6 +261,16 @@ def command_call(command: str) -> str:
     return f"jtech_cmd({command!r})"
 
 
+def result_call(status: str, content: str) -> str:
+    """Format one subagent terminal result using the production protocol.
+
+    Never applied automatically to a worker script: a test that expects an
+    agent to finish has to show where the status was emitted, because that is
+    the thing under test.
+    """
+    return f"jtech_result({status!r}, {content!r})"
+
+
 CLOUD = Profile(
     name="cloud",
     base_url="https://api.example.com/v1",
@@ -360,6 +370,11 @@ class Conversation:
     Keyed by the system prompt's role — coordinator or worker — and then by how
     many completions that conversation has already had, so one fixture can drive
     Primary and several agents at once and record exactly what each was sent.
+
+    An exhausted script raises rather than answering something plausible. A
+    fallback reply is a test writing its own script mid-run: it hid a run that
+    took one more completion than the test claimed, and for a worker it hid a
+    missing terminal result behind an invented one.
     """
 
     def __init__(self, primary: list[str], worker: list[str] | None = None) -> None:
@@ -377,7 +392,12 @@ class Conversation:
         self.requests.append((role, messages))
         self.profiles.append(profile)
         script = self.primary if role == "primary" else self.worker
-        yield script[index] if index < len(script) else "finished"
+        if index >= len(script):
+            raise AssertionError(
+                f"the {role} script is exhausted: no reply for completion "
+                f"{index + 1} of {len(script)}"
+            )
+        yield script[index]
 
     def sent_to(self, role: str) -> list[list[dict]]:
         return [messages for name, messages in self.requests if name == role]
