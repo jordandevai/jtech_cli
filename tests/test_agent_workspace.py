@@ -1,9 +1,9 @@
 """Tests for the agent workspace: sidebar rendering, selection, and isolation.
 
-These are focused component tests. ``tests/test_tui.py`` owns the app-level
-contract; this module owns the workspace's own rendering and selection rules,
-which are testable with a minimal host and, for the pure helper, with no host
-at all.
+These are focused component tests. ``tests/tui/test_workspace_integration.py``
+owns the app-level contract; this module owns the workspace's own rendering
+and selection rules, which are testable with a minimal host and, for the pure
+helper, with no host at all.
 """
 
 import asyncio
