@@ -838,6 +838,95 @@ async def test_teardown_close_failure_is_logged_but_not_drawn(caplog):
     assert runtime.state.generating is False
 
 
+class _GatedCloseStream(_BlockingReplyStream):
+    """A stream whose response close finishes only when the test says so.
+
+    The gate is what makes the interleaving deterministic: releasing it and
+    cancelling the run in the same synchronous block puts both on the same pass
+    of the loop, which is the collision these tests are about.
+    """
+
+    def __init__(self, first="partial", *, close_error=None):
+        super().__init__(first)
+        self._close_error = close_error
+        self.close_started = asyncio.Event()
+        self.release_close = asyncio.Event()
+
+    async def aclose(self):
+        self.close_started.set()
+        await self.release_close.wait()
+        if self._close_error is not None:
+            raise self._close_error
+        self.closed += 1
+
+
+async def test_teardown_cancellation_survives_a_close_that_lands_with_it():
+    """A close finishing alongside teardown is not an answer to teardown.
+
+    Provenance used to be inferred from whether the awaited close had
+    finished, so a close completing in the same tick as the cancel request
+    read as the close's own — and the run reported a completed turn for an app
+    that was shutting down.
+    """
+    stream = _GatedCloseStream()
+    session = Session(persist=False)
+    async with _Harness().run_test() as pilot:
+        runtime, _ = make_runtime(
+            pilot.app, reply_stream_factory(stream), session=session
+        )
+        task = asyncio.create_task(runtime.run())
+        await wait_for(pilot, stream.blocked.is_set)
+
+        runtime.request_stop()
+        await wait_for(pilot, stream.close_started.is_set)
+
+        # Nothing awaits between these two, so the close completes and the run
+        # is cancelled on the same pass of the loop.
+        stream.release_close.set()
+        task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 10)
+
+    assert stream.closed == 1  # the close still ran to completion
+    assert runtime.state.generating is False
+
+
+async def test_a_close_failure_lands_in_the_log_even_when_teardown_lands_on_it(caplog):
+    """Cleanup reports its result before handing the cancellation back.
+
+    Restoring the cancellation first skipped the report, and the ``finally``
+    then found the release already done and skipped it too — so a response the
+    CLI could not close went unmentioned anywhere.
+    """
+    caplog.set_level(logging.ERROR, logger="jtech_cli.tui_runtime")
+    stream = _GatedCloseStream(close_error=RuntimeError("close failed"))
+    session = Session(persist=False)
+    async with _Harness().run_test() as pilot:
+        runtime, _ = make_runtime(
+            pilot.app, reply_stream_factory(stream), session=session
+        )
+        task = asyncio.create_task(runtime.run())
+        await wait_for(pilot, stream.blocked.is_set)
+
+        runtime.request_stop()
+        await wait_for(pilot, stream.close_started.is_set)
+
+        stream.release_close.set()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 10)
+        records = list(pilot.app.query_one("#chat", Transcript).history.records)
+
+    logged = [r for r in caplog.records if r.levelno == logging.ERROR and r.exc_info]
+    assert logged, caplog.records
+    assert "close failed" in str(logged[0].exc_info[1])
+    # The run is unwinding, so the log is the whole report.
+    assert not any(STREAM_CANCEL_ERROR in r.content for r in records)
+    assert not any(STREAM_CANCEL_ERROR in m["content"] for m in session.messages)
+    assert runtime.state.generating is False
+
+
 async def test_stream_events_coalesce_a_burst_behind_one_drain():
     """A burst queued while the consumer was busy comes back as one batch."""
     events = tui_runtime._StreamEvents()

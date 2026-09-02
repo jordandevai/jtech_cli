@@ -351,16 +351,30 @@ async def _await_through_cancel(task: asyncio.Future) -> asyncio.CancelledError 
     ``Esc``, or application teardown. They are held rather than obeyed, and
     returned so the caller can restore them once the cleanup is finished —
     absorbing one outright would strand the caller's own unwinding.
+
+    ``shield`` reports ``CancelledError`` for two unrelated events: this
+    coroutine was cancelled, or ``task`` cancelled itself. Only the first is
+    the caller's to get back, and they are told apart by whether the enclosing
+    task's own cancellation count moved — the one signal that records who
+    asked. Whether ``task`` finished cannot stand in for it: a request landing
+    in the same tick the child completes leaves it done either way, so reading
+    completion as provenance drops a real teardown on the floor.
     """
     deferred: asyncio.CancelledError | None = None
+    current = asyncio.current_task()
     while not task.done():
+        # Read immediately before suspending. Nothing between here and the
+        # ``await`` yields, so no cancellation can land unrecorded in between.
+        requested = current.cancelling() if current is not None else 0
         try:
             await asyncio.shield(task)
         except asyncio.CancelledError as cancelled:
-            if task.done():
-                # ``task`` cancelled itself. That is its outcome for the caller
-                # to inspect, not a cancellation of this coroutine to restore.
+            if current is None or current.cancelling() == requested:
+                # Nobody cancelled us, so ``shield`` is relaying ``task``'s own
+                # cancellation: its outcome for the caller to inspect.
                 break
+            # Held, not cleared. The count stays raised because the
+            # cancellation really is still in flight until it is re-raised.
             deferred = cancelled
         except Exception:  # noqa: BLE001 - the caller inspects the task
             break
@@ -686,7 +700,6 @@ class AutonomousRuntime:
         timer: Timer | None = None
         provider_task: asyncio.Task[None] | None = None
         stream: ReplyStream | None = None
-        close_error: Exception | None = None
         released = False
         # Everything below is live state. Acquiring it is fallible — a widget
         # mount, a Markdown stream, a timer — so the release path starts here
@@ -779,18 +792,27 @@ class AutonomousRuntime:
                 tick_count += 1
                 update_label()
 
-            async def release_stream() -> None:
-                """End the reader and close its response, exactly once.
+            async def release_stream(*, visible: bool) -> None:
+                """End the reader, close its response, and report that, once.
 
                 Idempotent because the normal path calls it as soon as the
                 stream is done with, and the ``finally`` calls it again for the
                 paths that never got there.
+
+                Reporting belongs here rather than at the call site: a restored
+                cancellation never reaches the caller's next statement, and the
+                caller in the ``finally`` finds the work already done and skips
+                it — so a failure left for the caller to report is a failure
+                nobody reports. A pending cancellation also demotes the report
+                to log-only whatever the call site asked for, because the run is
+                unwinding and no reader is left for a transcript write.
                 """
-                nonlocal released, close_error
+                nonlocal released
                 if released:
                     return
                 released = True
                 deferred: asyncio.CancelledError | None = None
+                close_error: Exception | None = None
                 if provider_task is not None:
                     if not provider_task.done():
                         provider_task.cancel()
@@ -798,9 +820,13 @@ class AutonomousRuntime:
                 if stream is not None:
                     close_error, close_deferred = await _close_response(stream)
                     deferred = deferred or close_deferred
+                self._report_close_failure(
+                    close_error, visible=visible and deferred is None
+                )
                 if deferred is not None:
-                    # The cleanup is done; the caller's cancellation is not this
-                    # coroutine's to discard, so it goes back the way it came.
+                    # The cleanup is done and said so; the caller's cancellation
+                    # is not this coroutine's to discard, so it goes back the
+                    # way it came.
                     raise deferred
 
             # The timer belongs to the transcript it repaints, so it is scoped
@@ -879,8 +905,7 @@ class AutonomousRuntime:
 
             # The reader is finished with, and its response is released, before
             # anything below decides what this completion was.
-            await release_stream()
-            self._report_close_failure(close_error, visible=True)
+            await release_stream(visible=True)
             if not provider_task.cancelled():
                 stream_error = provider_task.exception()
 
@@ -952,11 +977,10 @@ class AutonomousRuntime:
                     # response has been closed — releasing earlier would let the
                     # queued message open a second, overlapping request against
                     # a live connection.
-                    await release_stream()
                     # Log only. This path is teardown or an already-reported
                     # failure, and run() is explicit that teardown has no reader
                     # left for a status write.
-                    self._report_close_failure(close_error, visible=False)
+                    await release_stream(visible=False)
             finally:
                 # Runs even when the release restores a deferred cancellation:
                 # a latched ``generating`` would queue every later message
