@@ -905,7 +905,13 @@ class AutonomousRuntime:
 
             # The reader is finished with, and its response is released, before
             # anything below decides what this completion was.
-            await release_stream(visible=True)
+            #
+            # Log-only when a render failure is what ended the read: this turn
+            # already ends in a visible ``RENDER_ERROR`` bubble explaining that
+            # it died, and a close warning stacked on top reports the same dead
+            # turn twice. An interactive stop has no such bubble, so there the
+            # warning is the only thing that would say the response leaked.
+            await release_stream(visible=render_error is None)
             if not provider_task.cancelled():
                 stream_error = provider_task.exception()
 

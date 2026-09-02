@@ -18,6 +18,7 @@ from unittest import mock
 
 import pytest
 from textual.app import App, ComposeResult
+from textual.widgets.markdown import MarkdownStream
 
 from jtech_cli import llm_client, tui_runtime
 from jtech_cli.cmd_tools import AgentDispatch, CmdPolicy, truncate_output
@@ -28,6 +29,7 @@ from jtech_cli.tui_runtime import (
     INTERRUPTED_RESPONSE,
     MIXED_TOOLS_ERROR,
     PROMPT_ERROR,
+    RENDER_ERROR,
     STOPPED_LABEL,
     STREAM_CANCEL_ERROR,
     SUBAGENT_DISPATCH_ERROR,
@@ -925,6 +927,39 @@ async def test_a_close_failure_lands_in_the_log_even_when_teardown_lands_on_it(c
     assert not any(STREAM_CANCEL_ERROR in r.content for r in records)
     assert not any(STREAM_CANCEL_ERROR in m["content"] for m in session.messages)
     assert runtime.state.generating is False
+
+
+async def test_a_render_failure_reports_its_close_failure_to_the_log_alone(
+    caplog, monkeypatch
+):
+    """A dead turn is reported once, by the failure that killed it.
+
+    Cleanup here is triggered by the renderer, and the turn already ends in a
+    visible ``RENDER_ERROR`` bubble saying so. Adding a close warning beside it
+    reports the same dead turn twice; the log is where that detail belongs.
+    """
+    caplog.set_level(logging.ERROR, logger="jtech_cli.tui_runtime")
+
+    async def failing_write(self, markdown_fragment: str) -> None:
+        raise RuntimeError("renderer failed")
+
+    monkeypatch.setattr(MarkdownStream, "write", failing_write)
+    stream = _SlowClosingStream(close_delay=0, close_error=RuntimeError("close failed"))
+    session = Session(persist=False)
+    async with _Harness().run_test() as pilot:
+        runtime, _ = make_runtime(
+            pilot.app, reply_stream_factory(stream), session=session
+        )
+        outcome = await asyncio.wait_for(runtime.run(), 10)
+        records = list(pilot.app.query_one("#chat", Transcript).history.records)
+
+    assert outcome.status == "failed"
+    assert RENDER_ERROR in outcome.error
+    logged = [r for r in caplog.records if r.levelno == logging.ERROR and r.exc_info]
+    assert logged, caplog.records
+    assert "close failed" in str(logged[0].exc_info[1])
+    assert not any(STREAM_CANCEL_ERROR in r.content for r in records)
+    assert not any(STREAM_CANCEL_ERROR in m["content"] for m in session.messages)
 
 
 async def test_stream_events_coalesce_a_burst_behind_one_drain():
