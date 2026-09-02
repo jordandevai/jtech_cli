@@ -178,7 +178,7 @@ async def test_one_agent_runs_its_own_tasks_sequentially(tmp_path, monkeypatch):
         await pilot.press("enter")
         await wait_until(app, pilot, lambda: inside.is_set())
         # Reach into the live batch: a second task for the busy key is refused.
-        managed = app._agents["coder"]
+        managed = app.agents["coder"]
         assert managed.runtime is not None
         release.set()
         await wait_until(app, pilot, lambda: app._primary_turn_depth == 0)
@@ -319,8 +319,8 @@ async def test_escape_never_stops_a_subagent(tmp_path, monkeypatch):
         inp = app.query_one("#input", Input)
         inp.value = "go"
         await pilot.press("enter")
-        await wait_until(app, pilot, lambda: "coder" in app._agents)
-        worker = app._agents["coder"].runtime
+        await wait_until(app, pilot, lambda: "coder" in app.agents)
+        worker = app.agents["coder"].runtime
         assert worker is not None
 
         await pilot.press("escape")
@@ -356,12 +356,12 @@ async def test_exiting_signals_every_live_runtime(tmp_path, monkeypatch):
             await wait_until(
                 app,
                 pilot,
-                lambda: app._agents.get("coder") is not None
-                and app._agents["coder"].runtime is not None
-                and app._agents["coder"].runtime.state.generating,
+                lambda: app.agents.get("coder") is not None
+                and app.agents["coder"].runtime is not None
+                and app.agents["coder"].runtime.state.generating,
             )
-            worker = app._agents["coder"].runtime
-            primary = app._primary_runtime
+            worker = app.agents["coder"].runtime
+            primary = app.primary_runtime
             app.exit()
             assert worker.state.stop_event.is_set()
             assert primary is not None
@@ -393,7 +393,7 @@ async def test_exiting_kills_a_subagent_command_and_everything_it_started(
         await pilot.press("enter")
 
         def descendants() -> list[str]:
-            runtime = (app._agents.get("coder") or _ManagedAgentStub).runtime
+            runtime = (app.agents.get("coder") or _ManagedAgentStub).runtime
             proc = None if runtime is None else runtime.state.running_proc
             if proc is None:
                 return []
@@ -406,7 +406,7 @@ async def test_exiting_kills_a_subagent_command_and_everything_it_started(
             return found.stdout.split()
 
         await wait_until(app, pilot, lambda: len(descendants()) >= 2)
-        proc = app._agents["coder"].runtime.state.running_proc
+        proc = app.agents["coder"].runtime.state.running_proc
         children = descendants()
 
         app.exit()
@@ -451,14 +451,14 @@ async def test_an_unexpected_setup_failure_fails_only_its_own_call(
 
     monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(fake))
     app = make_app(tmp_path)
-    original = app._begin_agent_task
+    original = app.agents._begin_agent_task
 
     async def flaky(call, task_id):
         if call.agent_key == "a":
             raise RuntimeError("setup boom")
         return await original(call, task_id)
 
-    monkeypatch.setattr(app, "_begin_agent_task", flaky)
+    monkeypatch.setattr(app.agents, "_begin_agent_task", flaky)
     async with app.run_test() as pilot:
         await run_primary(app, pilot)
 
@@ -470,7 +470,7 @@ async def test_an_unexpected_setup_failure_fails_only_its_own_call(
         assert "RuntimeError: setup boom" in results[0]["content"]
         assert results[1]["content"] == "sibling answer"
         # The failing call created nothing; the sibling ran normally.
-        assert list(app._agents) == ["b"]
+        assert list(app.agents) == ["b"]
         assert agent_summary(app, "b").status == "completed"
 
 
@@ -508,7 +508,7 @@ async def test_a_setup_failure_never_leaves_a_task_row_running_forever(
         # The first task is committed and running; break the second one's
         # transcript write before the coordinator sends it.
         await wait_until(app, pilot, lambda: inside.is_set())
-        managed = app._agents["coder"]
+        managed = app.agents["coder"]
 
         def exploding_append(record):
             raise RuntimeError("transcript boom")
@@ -528,7 +528,7 @@ async def test_a_setup_failure_never_leaves_a_task_row_running_forever(
         # And the assignment that never ran is not left in the worker's
         # context, where the agent's next task would read it as an
         # outstanding instruction.
-        assert [m["content"] for m in app._agents["coder"].session.messages] == [
+        assert [m["content"] for m in app.agents["coder"].session.messages] == [
             "do the work",
             "worker answer",
         ]

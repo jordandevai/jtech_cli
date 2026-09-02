@@ -267,7 +267,7 @@ async def test_esc_stops_stream_and_retains_marked_partial(tmp_path, monkeypatch
         await wait_until(app, pilot, stream.blocked.is_set)
 
         await pilot.press("escape")
-        await wait_until(app, pilot, lambda: not app._generating, tries=100)
+        await wait_until(app, pilot, lambda: not app.generating, tries=100)
         await pilot.pause()
 
         interrupted = f"partial \n\n{INTERRUPTED_RESPONSE}"
@@ -361,9 +361,9 @@ async def test_timings_without_prompt_n_keeps_the_usage_count(tmp_path, monkeypa
         app.query_one("#input", Input).value = "go"
         await pilot.press("enter")
         await wait_until(app, pilot, lambda: calls["n"] >= 1, tries=50)
-        await wait_until(app, pilot, lambda: not app._generating, tries=50)
+        await wait_until(app, pilot, lambda: not app.generating, tries=50)
 
-        assert app._prompt_tokens == 8192
+        assert app.status.prompt_tokens == 8192
 
 
 async def test_unknown_stream_event_is_not_treated_as_timings(tmp_path, monkeypatch):
@@ -379,9 +379,9 @@ async def test_unknown_stream_event_is_not_treated_as_timings(tmp_path, monkeypa
         app.query_one("#input", Input).value = "go"
         await pilot.press("enter")
         await wait_until(app, pilot, lambda: calls["n"] >= 1, tries=50)
-        await wait_until(app, pilot, lambda: not app._generating, tries=50)
+        await wait_until(app, pilot, lambda: not app.generating, tries=50)
 
-        assert app._prompt_tokens == 512
+        assert app.status.prompt_tokens == 512
 
 
 async def test_timings_with_prompt_n_still_sets_the_count(tmp_path, monkeypatch):
@@ -393,9 +393,9 @@ async def test_timings_with_prompt_n_still_sets_the_count(tmp_path, monkeypatch)
         app.query_one("#input", Input).value = "go"
         await pilot.press("enter")
         await wait_until(app, pilot, lambda: calls["n"] >= 1, tries=50)
-        await wait_until(app, pilot, lambda: not app._generating, tries=50)
+        await wait_until(app, pilot, lambda: not app.generating, tries=50)
 
-        assert app._prompt_tokens == 2048
+        assert app.status.prompt_tokens == 2048
 
 
 def record_markdown_writes(monkeypatch, gate: asyncio.Event | None = None) -> list[str]:
@@ -494,7 +494,7 @@ async def test_chunks_produced_during_a_blocked_write_are_combined(tmp_path, mon
         stream.produced.set()
         await wait_until(app, pilot, stream.finished.is_set, tries=100)
         release.set()
-        await wait_until(app, pilot, lambda: not app._generating, tries=100)
+        await wait_until(app, pilot, lambda: not app.generating, tries=100)
 
         assert writes == ["A", "BCD"]
         assert app.session.messages[-1] == {"role": "assistant", "content": "ABCD"}
@@ -509,7 +509,7 @@ async def test_a_long_stream_costs_far_fewer_writes_than_deltas(tmp_path, monkey
     async with app.run_test() as pilot:
         app.query_one("#input", Input).value = "go"
         await pilot.press("enter")
-        await wait_until(app, pilot, lambda: not app._generating, tries=100)
+        await wait_until(app, pilot, lambda: not app.generating, tries=100)
 
         assert "".join(writes) == "".join(chunks)
         assert len(writes) < len(chunks)
@@ -524,7 +524,7 @@ async def test_markdown_writes_reproduce_the_provider_content(tmp_path, monkeypa
     async with app.run_test() as pilot:
         app.query_one("#input", Input).value = "go"
         await pilot.press("enter")
-        await wait_until(app, pilot, lambda: not app._generating, tries=100)
+        await wait_until(app, pilot, lambda: not app.generating, tries=100)
 
         assert "".join(writes) == "".join(chunks)
         assert app.session.messages[-1]["content"] == "".join(chunks)
@@ -543,11 +543,11 @@ async def test_finalization_waits_for_a_blocked_markdown_write(tmp_path, monkeyp
         for _ in range(5):
             await pilot.pause()
 
-        assert app._generating
+        assert app.generating
         assert app.session.messages == [{"role": "user", "content": "go"}]
 
         release.set()
-        await wait_until(app, pilot, lambda: not app._generating, tries=100)
+        await wait_until(app, pilot, lambda: not app.generating, tries=100)
         assert app.session.messages[-1] == {"role": "assistant", "content": "held"}
 
 
@@ -578,7 +578,7 @@ async def test_waiting_timer_repaints_only_the_label(tmp_path, monkeypatch):
         assert reasoning_updates(updates) == []
 
         gate.set()
-        await wait_until(app, pilot, lambda: not app._generating, tries=100)
+        await wait_until(app, pilot, lambda: not app.generating, tries=100)
         assert writes == ["spoke at last"]
 
 
@@ -660,7 +660,7 @@ async def test_usage_and_unknown_events_keep_the_usage_count(tmp_path, monkeypat
     async with app.run_test() as pilot:
         await send_and_drain(app, pilot, "go")
 
-        assert app._prompt_tokens == 512
+        assert app.status.prompt_tokens == 512
         assert "AI" in labels(app)  # no timings -> the plain done label
 
 
@@ -676,7 +676,7 @@ async def test_timings_still_reach_the_done_label(tmp_path, monkeypatch):
     async with app.run_test() as pilot:
         await send_and_drain(app, pilot, "go")
 
-        assert app._prompt_tokens == 2048
+        assert app.status.prompt_tokens == 2048
         assert any("2,048" in l and "286 t/s" in l for l in labels(app))
 
 
@@ -693,7 +693,7 @@ async def test_batched_provider_error_is_reported_after_its_content(tmp_path, mo
     async with app.run_test() as pilot:
         app.query_one("#input", Input).value = "go"
         await pilot.press("enter")
-        await wait_until(app, pilot, lambda: not app._generating, tries=100)
+        await wait_until(app, pilot, lambda: not app.generating, tries=100)
 
         assert writes == ["partial "]
         assert any(CONNECTION_ERROR in b and "boom" in b for b in bubbles(app))
@@ -722,7 +722,7 @@ async def test_manual_scroll_during_a_stream_is_not_overridden(tmp_path, monkeyp
         assert chat.scroll_offset.y == 0
 
         gate.set()
-        await wait_until(app, pilot, lambda: not app._generating, tries=100)
+        await wait_until(app, pilot, lambda: not app.generating, tries=100)
         for _ in range(5):
             await pilot.pause()
 
@@ -749,7 +749,7 @@ async def test_history_save_failure_is_reported_and_generation_continues(
     async with app.run_test() as pilot:
         app.query_one("#input", Input).value = "hi"
         await pilot.press("enter")
-        await wait_until(app, pilot, lambda: not app._generating, tries=100)
+        await wait_until(app, pilot, lambda: not app.generating, tries=100)
 
         assert any("Could not save history: disk full" in b for b in bubbles(app))
         assert any("ok" in b for b in bubbles(app))

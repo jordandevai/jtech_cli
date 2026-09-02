@@ -98,7 +98,7 @@ async def test_ctrl_c_copies_multiline_selection_without_clearing_editor(
 
         assert app.clipboard == "alpha"
         assert ta.text == "alpha\nbeta"
-        assert app._multiline_future is not None and not app._multiline_future.done()
+        assert app.composer.multiline_future is not None and not app.composer.multiline_future.done()
         assert not isinstance(app.screen, QuitScreen)
         assert exits == []
 
@@ -145,7 +145,7 @@ async def test_ctrl_c_clears_nonempty_multiline_without_canceling(
         assert ta.text == ""
         assert app.query_one("#multiline-input", TextArea) is ta
         assert app.focused is ta
-        assert app._multiline_future is not None and not app._multiline_future.done()
+        assert app.composer.multiline_future is not None and not app.composer.multiline_future.done()
         assert app.query_one("#input", Input).display is False
         assert not isinstance(app.screen, QuitScreen)
         assert exits == []
@@ -163,7 +163,7 @@ async def test_ctrl_c_on_empty_multiline_opens_quit_screen_without_canceling(
         await pilot.press("ctrl+c")
         await settle(pilot)
         assert isinstance(app.screen, QuitScreen)
-        assert app._multiline_future is not None and not app._multiline_future.done()
+        assert app.composer.multiline_future is not None and not app.composer.multiline_future.done()
 
         await pilot.press("escape")
         await settle(pilot)
@@ -171,7 +171,7 @@ async def test_ctrl_c_on_empty_multiline_opens_quit_screen_without_canceling(
         assert app.query_one("#multiline-input", TextArea) is ta
         assert ta.text == ""
         assert app.focused is ta
-        assert app._multiline_future is not None and not app._multiline_future.done()
+        assert app.composer.multiline_future is not None and not app.composer.multiline_future.done()
         assert exits == []
 
 

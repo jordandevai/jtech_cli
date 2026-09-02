@@ -341,7 +341,7 @@ async def test_ctrl_j_promotes_and_grows_composer_to_two_editable_rows(
         assert ta.outer_size.height == single_outer_height + 1
         assert inp.display is False
         assert app.session.messages == []
-        assert app._queue == []
+        assert app.composer.queue == []
 
 
 async def test_ctrl_j_edits_and_grows_open_multiline(tmp_path, monkeypatch) -> None:
@@ -368,7 +368,7 @@ async def test_ctrl_j_edits_and_grows_open_multiline(tmp_path, monkeypatch) -> N
         assert opened.size.height == 3
         assert opened.has_focus
         assert app.session.messages == []
-        assert app._queue == []
+        assert app.composer.queue == []
 
         await pilot.press("enter")
         await settle(pilot, 12)

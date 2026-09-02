@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import json
 import os
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from urllib.request import Request, urlopen
 
@@ -68,6 +68,14 @@ def _request(url: str, *, headers: dict[str, str], data: bytes | None = None) ->
 
 def _base(profile: Profile) -> str:
     return profile.base_url.rstrip("/")
+
+
+#: The discovery seam a host injects, so a test never reaches the network.
+FetchServerInfo = Callable[[Profile], "ServerInfo"]
+
+#: The token-count seam, injected the same way. ``None`` means the endpoint
+#: could not answer, which is distinct from a count of zero.
+FetchTokenCount = Callable[[Profile, str], "int | None"]
 
 
 def fetch_server_info(

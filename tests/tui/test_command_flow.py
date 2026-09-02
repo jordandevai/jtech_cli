@@ -168,7 +168,7 @@ async def test_every_command_in_one_reply_runs_in_source_order(tmp_path, monkeyp
         inp.value = "go"
         await pilot.press("enter")
         await wait_until(app, pilot, lambda: calls["n"] >= 2, tries=150)
-        await wait_until(app, pilot, lambda: not app._tool_rounds_active, tries=100)
+        await wait_until(app, pilot, lambda: not app.tool_rounds_active, tries=100)
         for _ in range(10):
             await pilot.pause()
 
@@ -199,7 +199,7 @@ async def test_different_command_rounds_are_not_limited(tmp_path, monkeypatch):
         inp.value = "go"
         await pilot.press("enter")
         await wait_until(app, pilot, lambda: calls["n"] >= 7, tries=200)
-        await wait_until(app, pilot, lambda: not app._tool_rounds_active, tries=100)
+        await wait_until(app, pilot, lambda: not app.tool_rounds_active, tries=100)
         for _ in range(10):
             await pilot.pause()
 
@@ -237,7 +237,7 @@ async def test_repeated_commands_and_results_do_not_stop_the_loop(
         inp.value = "go"
         await pilot.press("enter")
         await wait_until(app, pilot, lambda: calls["n"] >= repeats + 1, tries=200)
-        await wait_until(app, pilot, lambda: not app._tool_rounds_active, tries=100)
+        await wait_until(app, pilot, lambda: not app.tool_rounds_active, tries=100)
         for _ in range(10):
             await pilot.pause()
 
@@ -276,7 +276,7 @@ async def test_consecutive_empty_replies_are_each_nudged(tmp_path, monkeypatch):
         inp.value = "go"
         await pilot.press("enter")
         await wait_until(app, pilot, lambda: calls["n"] >= 5, tries=200)
-        await wait_until(app, pilot, lambda: not app._tool_rounds_active, tries=100)
+        await wait_until(app, pilot, lambda: not app.tool_rounds_active, tries=100)
         for _ in range(10):
             await pilot.pause()
 
@@ -322,7 +322,7 @@ async def test_nudge_is_shown_in_system_debug_mode(tmp_path, monkeypatch):
         inp.value = "go"
         await pilot.press("enter")
         await wait_until(app, pilot, lambda: calls["n"] >= 3, tries=100)
-        await wait_until(app, pilot, lambda: not app._tool_rounds_active, tries=100)
+        await wait_until(app, pilot, lambda: not app.tool_rounds_active, tries=100)
 
         assert any("Continue your task" in bubble for bubble in bubbles(app))
         nudges = [
@@ -355,7 +355,7 @@ async def test_nudge_can_continue_with_an_explicit_command(tmp_path, monkeypatch
         inp.value = "go"
         await pilot.press("enter")
         await wait_until(app, pilot, lambda: calls["n"] >= 4, tries=100)
-        await wait_until(app, pilot, lambda: not app._tool_rounds_active, tries=100)
+        await wait_until(app, pilot, lambda: not app.tool_rounds_active, tries=100)
 
         assert calls["n"] == 4
         system_messages = [
@@ -383,7 +383,7 @@ async def test_final_answer_after_tool_ends_turn_without_repeat(tmp_path, monkey
         inp.value = "whats the cwd?"
         await pilot.press("enter")
         await wait_until(app, pilot, lambda: calls["n"] >= 2, tries=100)
-        await wait_until(app, pilot, lambda: not app._tool_rounds_active, tries=100)
+        await wait_until(app, pilot, lambda: not app.tool_rounds_active, tries=100)
         for _ in range(10):
             await pilot.pause()
 
@@ -414,7 +414,7 @@ async def test_command_prefix_commentary_is_preserved_and_tool_round_continues(
         inp.value = "audit this project"
         await pilot.press("enter")
         await wait_until(app, pilot, lambda: calls["n"] >= 2, tries=100)
-        await wait_until(app, pilot, lambda: not app._tool_rounds_active, tries=100)
+        await wait_until(app, pilot, lambda: not app.tool_rounds_active, tries=100)
 
         assert calls["n"] == 2
         assert any("Let me inspect the project structure next." in b for b in bubbles(app))
@@ -450,7 +450,7 @@ async def test_interleaved_commentary_commands_start_one_tool_round(
         inp.value = "audit this project"
         await pilot.press("enter")
         await wait_until(app, pilot, lambda: calls["n"] >= 2, tries=100)
-        await wait_until(app, pilot, lambda: not app._tool_rounds_active, tries=100)
+        await wait_until(app, pilot, lambda: not app.tool_rounds_active, tries=100)
 
         assert calls["n"] == 2
         assert any("I'll audit the project." in b for b in bubbles(app))
@@ -479,7 +479,7 @@ async def test_html_wrapped_command_executes_once(tmp_path, monkeypatch):
         inp.value = "whats the cwd?"
         await pilot.press("enter")
         await wait_until(app, pilot, lambda: calls["n"] >= 2, tries=100)
-        await wait_until(app, pilot, lambda: not app._tool_rounds_active, tries=100)
+        await wait_until(app, pilot, lambda: not app.tool_rounds_active, tries=100)
 
         assert calls["n"] == 2
 
@@ -517,7 +517,7 @@ async def test_clear_during_tool_followup_does_not_crash(tmp_path, monkeypatch):
         await wait_until(app, pilot, lambda: app.session.messages == [], tries=50)
         gate.set()
 
-        await wait_until(app, pilot, lambda: not app._tool_rounds_active, tries=100)
+        await wait_until(app, pilot, lambda: not app.tool_rounds_active, tries=100)
         await pilot.pause()
 
         assert app._exception is None
@@ -628,7 +628,7 @@ async def test_failed_command_result_continues_the_loop(tmp_path, monkeypatch):
         inp.value = "go"
         await pilot.press("enter")
         await wait_until(app, pilot, lambda: calls["n"] >= 3, tries=150)
-        await wait_until(app, pilot, lambda: not app._tool_rounds_active, tries=100)
+        await wait_until(app, pilot, lambda: not app.tool_rounds_active, tries=100)
         for _ in range(10):
             await pilot.pause()
 
@@ -663,7 +663,7 @@ async def test_a_running_command_is_shown_then_replaced_by_its_result(tmp_path, 
         inp.value = "go"
         await pilot.press("enter")
         await wait_until(
-            app, pilot, lambda: app._primary_runtime.state.running_proc is not None
+            app, pilot, lambda: app.primary_runtime.state.running_proc is not None
         )
 
         # Visible while the process is still alive, not after it exits.
@@ -674,7 +674,7 @@ async def test_a_running_command_is_shown_then_replaced_by_its_result(tmp_path, 
         # The existing stop path, exactly as a user reaches it.
         await pilot.press("escape")
         await wait_until(app, pilot, lambda: calls["n"] >= 2, tries=100)
-        await wait_until(app, pilot, lambda: not app._tool_rounds_active, tries=100)
+        await wait_until(app, pilot, lambda: not app.tool_rounds_active, tries=100)
         await pilot.pause()
 
         # One presentation for the whole lifecycle: the running entry became the
@@ -725,7 +725,7 @@ async def test_queue_drains_after_esc_stop(tmp_path, monkeypatch):
 
         inp.value = "two"
         await pilot.press("enter")
-        await wait_until(app, pilot, lambda: bool(app._queue), tries=10, pause=0.05)
+        await wait_until(app, pilot, lambda: bool(app.composer.queue), tries=10, pause=0.05)
         assert entered == ["one"]  # the queued turn has not started
 
         await pilot.press("escape")

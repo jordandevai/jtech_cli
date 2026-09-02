@@ -256,8 +256,8 @@ async def test_switching_profiles_clears_stale_endpoint_state(tmp_path, monkeypa
     monkeypatch.setenv("CLOUD_API_KEY", "sk-secret")
     app = make_app(tmp_path, settings=two_profile_settings())
     async with app.run_test() as pilot:
-        app._prompt_tokens = 1234
-        app._render_status()
+        app.status.prompt_tokens = 1234
+        app.status.render()
         assert "ctx" in app.query_one("#status", Static).content
 
         app.query_one("#input", Input).value = "/profile cloud"
@@ -268,7 +268,7 @@ async def test_switching_profiles_clears_stale_endpoint_state(tmp_path, monkeypa
         assert app.server.models == []
         assert app.server.context_length is None
         assert app.server.error is None
-        assert app._prompt_tokens == 0
+        assert app.status.prompt_tokens == 0
         assert app.ctx.server is app.server  # cleared in place, not rebound
         status = app.query_one("#status", Static).content
         assert "profile: cloud" in status
@@ -281,13 +281,13 @@ async def test_a_stale_discovery_result_is_discarded(tmp_path, monkeypatch):
     monkeypatch.setenv("CLOUD_API_KEY", "sk-secret")
     app = make_app(tmp_path, settings=two_profile_settings())
     async with app.run_test() as pilot:
-        await app._switch_profile("cloud")
+        await app.profile_manager.switch("cloud")
         await settle(pilot)
 
-        app._fetch_server_info_fn = lambda profile: ServerInfo(
+        app.fetch_server_info_fn = lambda profile: ServerInfo(
             models=["stale"], context_length=999
         )
-        await app._discover_server(LOCAL)  # a probe started before the switch
+        await app.profile_manager.discover(LOCAL)  # a probe started before the switch
 
         assert app.server.models == []
         assert app.server.context_length is None
@@ -318,7 +318,7 @@ async def test_switching_clears_a_cli_override_once_stored(tmp_path, monkeypatch
     async with app.run_test() as pilot:
         assert "(override)" in app.query_one("#status", Static).content
 
-        await app._switch_profile("cloud")
+        await app.profile_manager.switch("cloud")
         await settle(pilot)
 
         assert app.settings.profile_override is None
@@ -334,7 +334,7 @@ async def test_a_failed_switch_keeps_the_override_and_the_catalog(tmp_path):
     app = make_app(tmp_path, settings=settings)
     async with app.run_test() as pilot:
         before = app.settings.profiles
-        await app._switch_profile("cloud")
+        await app.profile_manager.switch("cloud")
         await settle(pilot)
 
         assert app.settings.profiles is before
@@ -357,7 +357,7 @@ async def test_a_profile_switch_is_refused_while_streaming(tmp_path, monkeypatch
     async with app.run_test() as pilot:
         await send_and_drain(app, pilot, "go")
         await wait_until(app, pilot, lambda: any("partial" in b for b in bubbles(app)))
-        assert app._generating
+        assert app.generating
 
         app.query_one("#input", Input).value = "/profile cloud"
         await pilot.press("enter")
@@ -365,12 +365,12 @@ async def test_a_profile_switch_is_refused_while_streaming(tmp_path, monkeypatch
         assert app.settings.profiles.active_name == "local"
         assert any("Esc to stop it" in bubble for bubble in bubbles(app))
 
-        app._open_profiles()
+        app.profile_manager.open_modal()
         await pilot.pause()
         assert not isinstance(app.screen, ProfilesScreen)
 
         gate.set()
-        await wait_until(app, pilot, lambda: not app._generating)
+        await wait_until(app, pilot, lambda: not app.generating)
 
 
 def park_in_tool_round(app: ChatApp) -> None:
@@ -385,12 +385,12 @@ def park_in_tool_round(app: ChatApp) -> None:
         )
     )
     state.tool_rounds_active = True
-    app._primary_runtime = AutonomousRuntime(
+    app.primary_runtime = AutonomousRuntime(
         state,
         host=app,
-        stream_reply_fn=app._stream_reply_fn,
+        stream_reply_fn=app.stream_reply_fn,
         cmd_policy=app.cmd,
-        project_root=app._project_root,
+        project_root=app.project_root,
     )
 
 
@@ -400,20 +400,20 @@ async def test_a_profile_change_is_refused_during_a_tool_round(tmp_path):
         before = app.settings.profiles
         park_in_tool_round(app)
         try:
-            await app._switch_profile("cloud")
+            await app.profile_manager.switch("cloud")
             await pilot.pause()
             assert app.settings.profiles is before
 
-            app._open_profiles()
+            app.profile_manager.open_modal()
             await pilot.pause()
             assert not isinstance(app.screen, ProfilesScreen)
 
             with pytest.raises(ProfileError):
-                await app._commit_profiles(before.activate("cloud"))
+                await app.profile_manager.commit(before.activate("cloud"))
             assert app.settings.profiles is before
             assert any("tool round" in bubble for bubble in bubbles(app))
         finally:
-            app._primary_runtime = None
+            app.primary_runtime = None
 
 
 async def test_one_autonomous_turn_uses_one_resolved_profile(tmp_path, monkeypatch):
@@ -438,7 +438,7 @@ async def test_one_autonomous_turn_uses_one_resolved_profile(tmp_path, monkeypat
     async with app.run_test() as pilot:
         await send_and_drain(app, pilot, "go")
         await wait_until(app, pilot, lambda: calls["n"] >= 3, tries=150)
-        await wait_until(app, pilot, lambda: not app._tool_rounds_active, tries=100)
+        await wait_until(app, pilot, lambda: not app.tool_rounds_active, tries=100)
 
     assert calls["n"] == 3
     used = [profile for profile, _ in seen]
@@ -502,7 +502,7 @@ async def test_a_missing_credential_stops_before_the_provider_thread(tmp_path, m
         assert any("CLOUD_API_KEY" in bubble for bubble in bubbles(app))
         assert any("unset or empty" in bubble for bubble in bubbles(app))
         assert app.session.messages == [{"role": "user", "content": "go"}]
-        assert not app._generating
+        assert not app.generating
 
 
 async def test_a_missing_model_stops_before_the_provider_thread(tmp_path, monkeypatch):
@@ -524,7 +524,7 @@ async def test_a_missing_model_stops_before_the_provider_thread(tmp_path, monkey
 
         assert started == []
         assert any("no model configured" in bubble for bubble in bubbles(app))
-        assert not app._generating
+        assert not app.generating
 
 
 async def test_a_turn_without_a_profile_reports_instead_of_streaming(tmp_path, monkeypatch):
@@ -541,7 +541,7 @@ async def test_a_turn_without_a_profile_reports_instead_of_streaming(tmp_path, m
 
         assert started == []
         assert any("No API profile is configured" in b for b in bubbles(app))
-        assert not app._generating
+        assert not app.generating
 
 
 async def test_modal_activation_retires_a_cli_override(tmp_path):
@@ -639,21 +639,21 @@ async def test_a_stale_token_count_is_discarded(tmp_path, monkeypatch):
         return 42
 
     async with app.run_test() as pilot:
-        await wait_until(app, pilot, lambda: app._prompt_tokens == 7)
+        await wait_until(app, pilot, lambda: app.status.prompt_tokens == 7)
 
-        app._fetch_token_count_fn = slow_count
-        counting = asyncio.ensure_future(app._init_token_count(LOCAL))
+        app.fetch_token_count_fn = slow_count
+        counting = asyncio.ensure_future(app.profile_manager.count_tokens(LOCAL))
         await wait_until(app, pilot, entered.is_set, tries=100)
 
-        await app._switch_profile("cloud")
+        await app.profile_manager.switch("cloud")
         await settle(pilot)
-        assert app._prompt_tokens == 0  # the switch cleared the old count
+        assert app.status.prompt_tokens == 0  # the switch cleared the old count
 
         released.set()
         await counting
         await settle(pilot)
 
-        assert app._prompt_tokens == 0  # the old endpoint's 42 never landed
+        assert app.status.prompt_tokens == 0  # the old endpoint's 42 never landed
         assert "ctx" not in app.query_one("#status", Static).content
 
 
@@ -670,12 +670,12 @@ async def test_a_stale_credential_error_is_not_reported(tmp_path, monkeypatch):
         raise ProfileError("stale credential complaint")
 
     async with app.run_test() as pilot:
-        await wait_until(app, pilot, lambda: app._prompt_tokens == 7)
+        await wait_until(app, pilot, lambda: app.status.prompt_tokens == 7)
 
-        app._fetch_token_count_fn = boom
-        await app._switch_profile("cloud")
+        app.fetch_token_count_fn = boom
+        await app.profile_manager.switch("cloud")
         await settle(pilot)
-        await app._init_token_count(LOCAL)  # a probe from before the switch
+        await app.profile_manager.count_tokens(LOCAL)  # a probe from before the switch
         await settle(pilot)
 
         assert not any("stale credential" in bubble for bubble in bubbles(app))
@@ -689,7 +689,7 @@ async def test_a_current_credential_error_is_still_reported(tmp_path):
     def boom(profile, text):
         raise ProfileError("live credential complaint")
 
-    app._fetch_token_count_fn = boom
+    app.fetch_token_count_fn = boom
     async with app.run_test() as pilot:
         await settle(pilot)
         assert any("live credential complaint" in b for b in bubbles(app))
@@ -704,7 +704,7 @@ async def test_a_live_token_count_still_reaches_the_footer(tmp_path):
     )
     app.session.add("user", "hello world")
     async with app.run_test() as pilot:
-        await wait_until(app, pilot, lambda: app._prompt_tokens == 128)
+        await wait_until(app, pilot, lambda: app.status.prompt_tokens == 128)
         assert "ctx" in app.query_one("#status", Static).content
 
 

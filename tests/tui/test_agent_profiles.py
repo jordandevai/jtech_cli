@@ -73,7 +73,7 @@ async def test_an_explicit_model_skips_discovery(tmp_path, monkeypatch):
         raise AssertionError("discovery must not run for a configured model")
 
     app = make_app(tmp_path)
-    app._fetch_server_info_fn = discover
+    app.fetch_server_info_fn = discover
     async with app.run_test() as pilot:
         await run_primary(app, pilot)
     assert probed == []
@@ -91,7 +91,7 @@ async def test_an_empty_model_on_the_active_profile_uses_the_discovered_one(
         active_name="local",
     )
     app = make_app(tmp_path, settings=settings)
-    app._fetch_server_info_fn = lambda profile: pytest.fail("no probe expected")
+    app.fetch_server_info_fn = lambda profile: pytest.fail("no probe expected")
     async with app.run_test() as pilot:
         await run_primary(app, pilot)
     worker_profile = next(
@@ -121,7 +121,7 @@ async def test_an_empty_model_elsewhere_is_discovered_without_touching_primary(
         return ServerInfo(models=["discovered-cloud"], context_length=999)
 
     app = make_app(tmp_path, settings=settings)
-    app._fetch_server_info_fn = discover
+    app.fetch_server_info_fn = discover
     async with app.run_test() as pilot:
         await run_primary(app, pilot)
         worker_profile = next(
@@ -192,7 +192,7 @@ async def test_an_unreachable_discovery_endpoint_fails_only_its_task(
     )
     settings = Settings(profiles=Profiles(items=(LOCAL, cloud), active_name="local"))
     app = make_app(tmp_path, settings=settings)
-    app._fetch_server_info_fn = lambda profile: ServerInfo(
+    app.fetch_server_info_fn = lambda profile: ServerInfo(
         error="URLError: connection refused"
     )
     async with app.run_test() as pilot:
@@ -270,6 +270,6 @@ async def test_each_continuation_re_resolves_the_named_profile(tmp_path, monkeyp
         app.server.models = ["qwen4"]
         release.set()
         await wait_until(app, pilot, lambda: app._primary_turn_depth == 0)
-        assert app._agents["coder"].profile_name == "local"
+        assert app.agents["coder"].profile_name == "local"
 
     assert models == ["qwen3", "qwen4"]

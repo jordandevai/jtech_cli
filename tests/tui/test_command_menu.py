@@ -212,7 +212,7 @@ async def test_enter_while_streaming_queues_then_drains(tmp_path, monkeypatch):
         inp.value = "one"
         await pilot.press("enter")
         await wait_until(app, pilot, lambda: any("r1" in b for b in bubbles(app)))
-        assert app._generating
+        assert app.generating
 
         # Second message while generating: queued, not sent
         inp.value = "two"
@@ -239,7 +239,7 @@ async def test_enter_while_streaming_queues_then_drains(tmp_path, monkeypatch):
         {"role": "user", "content": "two"},
         {"role": "assistant", "content": "r2"},
     ]
-    assert app._queue == []
+    assert app.composer.queue == []
 
 
 async def test_up_recalls_queued_message_for_editing(tmp_path, monkeypatch):
@@ -271,13 +271,13 @@ async def test_up_recalls_queued_message_for_editing(tmp_path, monkeypatch):
         await pilot.press("enter")
         inp.value = "three"
         await pilot.press("enter")
-        await wait_until(app, pilot, lambda: len(app._queue) == 2, tries=10, pause=0.05)
+        await wait_until(app, pilot, lambda: len(app.composer.queue) == 2, tries=10, pause=0.05)
 
         # Up recalls the NEXT queued message ("two"), not the last
         await pilot.press("up")
         await pilot.pause()
         assert inp.value == "two"
-        assert [m for m in app._queue] == ["three"]
+        assert [m for m in app.composer.queue] == ["three"]
         assert "queue: 1" in app.query_one("#status", Static).content
         # the recalled message's "Queued" line is cleared; only "three" remains
         assert [b for b in bubbles(app) if "Queued" in b] == ["Queued: three"]
@@ -288,20 +288,20 @@ async def test_up_recalls_queued_message_for_editing(tmp_path, monkeypatch):
         await pilot.press("up")
         await pilot.pause()
         assert inp.value == "two"
-        assert [m for m in app._queue] == ["three"]
+        assert [m for m in app.composer.queue] == ["three"]
 
         # clear it (cancel "two"), then recall the rest
         inp.value = ""
         await pilot.press("up")
         await pilot.pause()
         assert inp.value == "three"
-        assert app._queue == []
+        assert app.composer.queue == []
         assert not any("Queued" in b for b in bubbles(app))  # no stale lines
 
         # edit it, let the first reply finish, then submit
         inp.value = "three (edited)"
         gate.set()
-        await wait_until(app, pilot, lambda: not app._generating)
+        await wait_until(app, pilot, lambda: not app.generating)
 
         await pilot.press("enter")
         await wait_until(app, pilot, lambda: calls["n"] >= 2)
@@ -333,7 +333,7 @@ async def test_up_with_suggestions_open_prefers_suggestions(tmp_path, monkeypatc
 
         inp.value = "two"
         await pilot.press("enter")
-        await wait_until(app, pilot, lambda: bool(app._queue), tries=10, pause=0.05)
+        await wait_until(app, pilot, lambda: bool(app.composer.queue), tries=10, pause=0.05)
 
         inp.value = "/"
         await pilot.pause()
@@ -341,9 +341,9 @@ async def test_up_with_suggestions_open_prefers_suggestions(tmp_path, monkeypatc
         await pilot.press("up")
         await pilot.pause()
         assert inp.value == "/"  # suggestion cycled, input untouched
-        assert len(app._queue) == 1  # queue untouched
+        assert len(app.composer.queue) == 1  # queue untouched
         gate.set()
-        await wait_until(app, pilot, lambda: not app._generating)
+        await wait_until(app, pilot, lambda: not app.generating)
         assert not any("Queued" in b for b in bubbles(app))  # line cleared on drain
 
 
@@ -383,7 +383,7 @@ async def test_queue_drains_in_order(tmp_path, monkeypatch):
         for msg in ("two", "three"):
             inp.value = msg
             await pilot.press("enter")
-        await wait_until(app, pilot, lambda: len(app._queue) == 2, tries=10, pause=0.05)
+        await wait_until(app, pilot, lambda: len(app.composer.queue) == 2, tries=10, pause=0.05)
 
         gate.set()
         await wait_until(app, pilot, lambda: calls["n"] >= 3)
@@ -395,4 +395,4 @@ async def test_queue_drains_in_order(tmp_path, monkeypatch):
     assert [m["content"] for m in app.session.messages if m["role"] == "user"] == [
         "one", "two", "three",
     ]
-    assert app._queue == []
+    assert app.composer.queue == []

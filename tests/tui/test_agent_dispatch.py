@@ -48,7 +48,7 @@ async def test_a_first_dispatch_creates_one_agent_view_session_and_task(
         assert summary.status == "completed"
         assert [(t.label, t.status) for t in summary.tasks] == [("Task", "completed")]
         # The task is the agent's first message, recorded once and shown once.
-        managed = app._agents["coder"]
+        managed = app.agents["coder"]
         assert [m["content"] for m in managed.session.messages] == [
             "do the work",
             "worker answer",
@@ -89,13 +89,13 @@ async def test_a_repeated_key_continues_one_conversation(tmp_path, monkeypatch):
         await run_primary(app, pilot)
 
         # One agent, two tasks, one transcript, one session.
-        assert list(app._agents) == ["coder"]
+        assert list(app.agents) == ["coder"]
         summary = agent_summary(app, "coder")
         assert [(t.label, t.status) for t in summary.tasks] == [
             ("First", "completed"),
             ("Second", "completed"),
         ]
-        assert [m["content"] for m in app._agents["coder"].session.messages] == [
+        assert [m["content"] for m in app.agents["coder"].session.messages] == [
             "first task",
             "first answer",
             "second task",
@@ -112,7 +112,7 @@ async def test_a_repeated_key_continues_one_conversation(tmp_path, monkeypatch):
         # The seeded first task and the appended second one share one policy.
         tasks = [
             record
-            for record in app._agents["coder"].transcript.history.records
+            for record in app.agents["coder"].transcript.history.records
             if record.role == "user"
         ]
         assert [record.content for record in tasks] == ["first task", "second task"]
@@ -166,8 +166,8 @@ async def test_two_agents_never_share_a_session_or_a_transcript(
     async with app.run_test() as pilot:
         await run_primary(app, pilot)
 
-        first = app._agents["a"]
-        second = app._agents["b"]
+        first = app.agents["a"]
+        second = app.agents["b"]
         assert first.session is not second.session
         assert first.transcript is not second.transcript
         one = " ".join(m["content"] for m in first.session.messages)
@@ -188,7 +188,7 @@ async def test_subagent_sessions_never_touch_the_filesystem(tmp_path, monkeypatc
     app = make_app(tmp_path)
     async with app.run_test() as pilot:
         await run_primary(app, pilot)
-        managed = app._agents["coder"]
+        managed = app.agents["coder"]
         assert managed.session.persist is False
         assert len(managed.session.messages) == 2
         assert not worker_history.exists()
@@ -252,7 +252,7 @@ async def test_a_relaunch_restores_primary_history_only(tmp_path, monkeypatch):
         await settle(pilot)
         # The result survives in Primary's context; the worker does not come back.
         assert agent_results(relaunched)[0]["content"] == "worker answer"
-        assert relaunched._agents == {}
+        assert relaunched.agents == {}
         assert len(workspace_of(relaunched).query(_AgentListItem)) == 1
 
 
@@ -277,19 +277,19 @@ async def test_dispatch_never_disturbs_the_composer_selection_or_queue(
         inp = app.query_one("#input", Input)
         inp.value = "go"
         await pilot.press("enter")
-        await wait_until(app, pilot, lambda: "coder" in app._agents)
+        await wait_until(app, pilot, lambda: "coder" in app.agents)
 
         assert app.viewing_primary
         assert visible_activity(app) is chat_of(app)
         inp.value = "a draft"
         inp.value = "queued while busy"
         await pilot.press("enter")
-        await wait_until(app, pilot, lambda: app._queue == ["queued while busy"])
+        await wait_until(app, pilot, lambda: app.composer.queue == ["queued while busy"])
         assert primary_summary(app).status == "waiting"
 
         gate.set()
         await wait_until(app, pilot, lambda: app._primary_turn_depth == 0)
-        assert app._queue == []
+        assert app.composer.queue == []
         assert primary_summary(app).status == "idle"
 
 

@@ -270,7 +270,7 @@ async def test_one_live_answer_leaves_no_body_widget_behind(tmp_path, monkeypatc
         assert len(chat.query(Markdown)) == 1  # exactly the live answer
 
         gate.set()
-        await wait_until(app, pilot, lambda: not app._generating, tries=100)
+        await wait_until(app, pilot, lambda: not app.generating, tries=100)
         await pilot.pause()
 
         assert list(chat.children) == [chat.history]
@@ -341,7 +341,7 @@ async def test_a_queue_notice_holds_finished_messages_in_order(tmp_path, monkeyp
         for queued in ("two", "three"):
             inp.value = queued
             await pilot.press("enter")
-        await wait_until(app, pilot, lambda: len(app._queue) == 2, tries=20, pause=0.05)
+        await wait_until(app, pilot, lambda: len(app.composer.queue) == 2, tries=20, pause=0.05)
 
         # The blocked window opens and closes inside one drain, so it is
         # sampled where it happens: as each answer finalizes.
@@ -364,7 +364,7 @@ async def test_a_queue_notice_holds_finished_messages_in_order(tmp_path, monkeyp
 
         gate.set()
         await wait_until(app, pilot, lambda: calls["n"] >= 3, tries=100)
-        await wait_until(app, pilot, lambda: not app._generating, tries=100)
+        await wait_until(app, pilot, lambda: not app.generating, tries=100)
         await pilot.pause()
 
         # the first answer is before both notices, so it compacts straight away
@@ -402,7 +402,7 @@ async def test_a_visible_error_compacts_without_entering_session_context(
     async with app.run_test() as pilot:
         app.query_one("#input", Input).value = "go"
         await pilot.press("enter")
-        await wait_until(app, pilot, lambda: not app._generating, tries=100)
+        await wait_until(app, pilot, lambda: not app.generating, tries=100)
         await pilot.pause()
 
         chat = chat_of(app)
@@ -439,7 +439,7 @@ async def test_clear_during_a_gated_stream_stays_empty_after_it_finishes(
         await wait_until(app, pilot, lambda: app.session.messages == [], tries=50)
 
         gate.set()
-        await wait_until(app, pilot, lambda: not app._generating, tries=100)
+        await wait_until(app, pilot, lambda: not app.generating, tries=100)
         for _ in range(5):
             await pilot.pause()
 
@@ -539,7 +539,7 @@ async def test_a_theme_switch_reflows_completed_history_once(tmp_path, monkeypat
         assert len(reflows) == 1
 
         gate.set()
-        await wait_until(app, pilot, lambda: not app._generating, tries=100)
+        await wait_until(app, pilot, lambda: not app.generating, tries=100)
 
 
 async def test_scrolling_to_the_top_survives_later_chunks_and_compaction(
@@ -565,7 +565,7 @@ async def test_scrolling_to_the_top_survives_later_chunks_and_compaction(
         assert chat.scroll_offset.y == 0
 
         gate.set()
-        await wait_until(app, pilot, lambda: not app._generating, tries=100)
+        await wait_until(app, pilot, lambda: not app.generating, tries=100)
         for _ in range(5):
             await pilot.pause()
 
@@ -597,13 +597,13 @@ async def test_a_failing_markdown_write_ends_the_turn_instead_of_wedging_it(
     async with app.run_test() as pilot:
         app.query_one("#input", Input).value = "go"
         await pilot.press("enter")
-        await wait_until(app, pilot, lambda: not app._generating, tries=100)
+        await wait_until(app, pilot, lambda: not app.generating, tries=100)
 
         assert calls["n"] == 1
         assert app._exception is None
-        assert not app._generating
-        assert not app._tool_rounds_active
-        assert app._queue == []
+        assert not app.generating
+        assert not app.tool_rounds_active
+        assert app.composer.queue == []
         assert any(RENDER_ERROR in b and "renderer failed" in b for b in bubbles(app))
         # a partially rendered reply is not passed off as the model's turn
         assert app.session.messages == [{"role": "user", "content": "go"}]
@@ -666,7 +666,7 @@ async def test_a_render_failure_closes_its_response_before_the_next_turn(
         await wait_until(
             app, pilot, lambda: any(RENDER_ERROR in b for b in bubbles(app)), tries=100
         )
-        await wait_until(app, pilot, lambda: not app._generating, tries=100)
+        await wait_until(app, pilot, lambda: not app.generating, tries=100)
 
         assert blocked.closed == 1  # the response was closed, not just dropped
         assert entries == ["turn-1"]
@@ -677,14 +677,14 @@ async def test_a_render_failure_closes_its_response_before_the_next_turn(
         await wait_until(
             app,
             pilot,
-            lambda: any("ok" in b for b in bubbles(app)) and not app._generating,
+            lambda: any("ok" in b for b in bubbles(app)) and not app.generating,
             tries=100,
         )
 
         assert entries == ["turn-1", "turn-2"]  # the requests never overlapped
         assert closed_at_second_entry == [True]
-        assert not app._generating
-        assert app._queue == []
+        assert not app.generating
+        assert app.composer.queue == []
         assert app.session.messages == [
             {"role": "user", "content": "go"},
             {"role": "user", "content": "second"},

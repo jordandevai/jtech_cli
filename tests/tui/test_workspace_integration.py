@@ -197,7 +197,7 @@ async def test_subagent_view_preserves_active_multiline_editor(tmp_path):
         editor.text = "first line\nsecond line"
         editor.selection = AreaSelection((0, 0), (0, 5))
         await settle(pilot)
-        future = app._multiline_future
+        future = app.composer.multiline_future
         assert future is not None and not future.done()
 
         await select_agent(app, pilot, "a")
@@ -208,14 +208,14 @@ async def test_subagent_view_preserves_active_multiline_editor(tmp_path):
         await select_agent(app, pilot, PRIMARY_AGENT_ID)
 
         assert app.query_one("#multiline-input", TextArea) is editor
-        assert app._multiline_textarea is editor
+        assert app.composer.multiline is editor
         assert editor.display
         assert editor.text == "first line\nsecond line"
         assert editor.selection == AreaSelection((0, 0), (0, 5))
         # Multi-line mode was hidden, never left.
         assert not inp.display
         assert not readonly_notice(app).display
-        assert app._multiline_future is future and not future.done()
+        assert app.composer.multiline_future is future and not future.done()
 
 
 async def test_ctrl_c_in_subagent_view_copies_selection_before_quit(
@@ -327,11 +327,11 @@ async def test_escape_in_subagent_view_does_not_stop_hidden_primary_work(
         await pilot.press("escape")
         await settle(pilot)
 
-        assert not app._primary_runtime.state.stop_event.is_set()
-        assert app._generating
+        assert not app.primary_runtime.state.stop_event.is_set()
+        assert app.generating
 
         gate.set()
-        await wait_until(app, pilot, lambda: not app._generating)
+        await wait_until(app, pilot, lambda: not app.generating)
 
     assert app.session.messages == [
         {"role": "user", "content": "hello"},
@@ -436,7 +436,7 @@ async def test_primary_status_stays_running_across_queued_turn_drain(
         for message in ("two", "three"):
             inp.value = message
             await pilot.press("enter")
-        await wait_until(app, pilot, lambda: len(app._queue) == 2, tries=10, pause=0.05)
+        await wait_until(app, pilot, lambda: len(app.composer.queue) == 2, tries=10, pause=0.05)
         # Queued turns are nested inside the accepted one; none of them may
         # report the agent idle while the drain is still running.
         assert statuses == ["running"]
@@ -447,4 +447,4 @@ async def test_primary_status_stays_running_across_queued_turn_drain(
 
         assert statuses == ["running", "idle"]
         assert primary_summary(app).status == "idle"
-        assert app._queue == []
+        assert app.composer.queue == []
