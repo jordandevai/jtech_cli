@@ -153,17 +153,36 @@ def scripted_stream(*replies):
     return fake, calls
 
 
+def _protocol_block(name: str, body: str) -> str:
+    """Frame one raw body in the production block delimiters."""
+    return f"[[[{name}]]]\n{body}\n[[[/{name}]]]"
+
+
 def command_call(command: str) -> str:
-    return f"jtech_cmd({command!r})"
+    """Format a test command using the production command-only protocol.
+
+    The command is wrapped, never quoted: the point of the block protocol is
+    that a payload needs no escaping, so a helper that escaped one would test a
+    wire format the model is never asked to produce.
+    """
+    return _protocol_block("jtech_cmd", command)
 
 
 def result_call(status: str, content: str) -> str:
     """Format one subagent terminal result using the production protocol."""
-    return f"jtech_result({status!r}, {content!r})"
+    return _protocol_block("jtech_result", f"status: {status}\n\n{content}")
 
 
 def dispatch_call(key="coder", label="Coder", profile="local", task_label="t", task="x"):
-    return f"jtech_agent({key!r}, {label!r}, {profile!r}, {task_label!r}, {task!r})"
+    """Format one dispatch using the production protocol."""
+    return _protocol_block(
+        "jtech_agent",
+        f"agent_key: {key}\n"
+        f"agent_label: {label}\n"
+        f"profile_name: {profile}\n"
+        f"task_label: {task_label}\n"
+        f"\n{task}",
+    )
 
 
 def make_state(

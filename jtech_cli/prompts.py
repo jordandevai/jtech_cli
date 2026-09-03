@@ -77,7 +77,8 @@ def _profile_availability(
         return (
             "### Available profiles\n\n"
             "No API profile is available in this session, so agent dispatch is "
-            "unavailable. Do not call jtech_agent; continue the work yourself."
+            "unavailable. Do not emit a [[[jtech_agent]]] block; continue the "
+            "work yourself."
         )
     lines = ["### Available profiles", ""]
     for name in profile_names:

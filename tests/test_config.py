@@ -154,7 +154,7 @@ def test_coordinator_prompt_keeps_the_base_contract_and_adds_dispatch():
     assert prompt.startswith(base)
     assert "my custom prompt" in prompt
     assert DEFAULT_SYSTEM_PROMPT in prompt
-    assert "jtech_agent(" in prompt
+    assert "[[[jtech_agent]]]" in prompt
     # The shell/coding contract is composed, never restated by the fragment.
     assert prompt.count(DEFAULT_SYSTEM_PROMPT) == 1
 
@@ -174,7 +174,7 @@ def test_coordinator_prompt_without_profiles_forbids_dispatch():
         "BASE", profile_names=(), active_profile_name=None
     )
     assert "dispatch is unavailable" in prompt
-    assert "Do not call jtech_agent" in prompt
+    assert "Do not emit a [[[jtech_agent]]] block" in prompt
 
 
 def test_coordinator_prompt_states_the_batch_and_continuation_rules():
@@ -184,9 +184,9 @@ def test_coordinator_prompt_states_the_batch_and_continuation_rules():
     assert "Reuse a key to continue that agent" in prompt
     assert "genuinely independent" in prompt
     assert "may not dispatch the same key twice" in prompt
-    assert "shell calls or agent calls, never both" in prompt
+    assert "shell blocks or agent blocks, never both" in prompt
     assert "[JTECH agent result]" in prompt
-    assert "no tool call at all" in prompt
+    assert "no tool block at all" in prompt
 
 
 def test_worker_prompt_keeps_the_base_contract_and_restricts_the_worker():

@@ -1,4 +1,4 @@
-"""The tool-call protocol: what parses, what is refused, and what is recorded."""
+"""The block protocol: what parses, what is refused, and what is recorded."""
 
 import json
 
@@ -20,12 +20,61 @@ from .support import (
     model_messages,
     result_call,
     scripted_stream,
+    transcript_text,
 )
+
+
+def decorate(text: str, prefix: str = "", suffix: str = "") -> str:
+    """Wrap every line of a block, the way a model wraps one by accident."""
+    return "\n".join(f"{prefix}{line}{suffix}" for line in text.split("\n"))
+
+
+#: Python source whose own quoting would have destroyed the retired envelope.
+TRIPLE_QUOTED_COMMAND = (
+    "python - <<'PY'\n"
+    'source = """def greet(name):\n'
+    '    return f"hello {name}"\n'
+    '"""\n'
+    "print(source)\n"
+    "PY"
+)
+
+
+async def test_a_multiline_command_reaches_the_host_exactly_as_written():
+    """The migration's whole point, proved at the runtime boundary.
+
+    Triple quotes, nested quotes, and a heredoc inside the payload are ordinary
+    command characters: nothing between the delimiters is unquoted, unescaped,
+    re-wrapped, or trimmed on its way to the shell.
+    """
+    stream, _ = scripted_stream(command_call(TRIPLE_QUOTED_COMMAND), "done")
+    host = FakeHost()
+    async with Harness().run_test() as pilot:
+        runtime, _ = make_runtime(pilot.app, stream, host=host)
+        outcome = await runtime.run()
+    assert outcome.final_text == "done"
+    assert host.authorized == [TRIPLE_QUOTED_COMMAND]
+
+
+async def test_the_transcript_keeps_the_reply_including_its_delimiters():
+    """Presentation cleanup is out of scope: the reply is recorded verbatim.
+
+    The bubble is the record of what the model actually sent, so the raw
+    delimiter lines stay visible rather than being stripped for looks.
+    """
+    stream, _ = scripted_stream(command_call("echo x"), "done")
+    async with Harness().run_test() as pilot:
+        runtime, _ = make_runtime(pilot.app, stream)
+        await runtime.run()
+        rendered = transcript_text(pilot.app)
+    assert "[[[jtech_cmd]]]" in rendered
+    assert "[[[/jtech_cmd]]]" in rendered
 
 
 async def test_a_malformed_reply_executes_nothing_and_asks_again():
     stream, _ = scripted_stream(
-        f'{command_call("echo safe")}\njtech_agent("a", "A", "local", "t")',
+        f"{command_call('echo safe')}\n"
+        "[[[jtech_agent]]]\nagent_key: a\n[[[/jtech_agent]]]",
         "recovered",
     )
     session = Session(persist=False)
@@ -36,38 +85,37 @@ async def test_a_malformed_reply_executes_nothing_and_asks_again():
     assert host.authorized == []
     observation = model_messages(session)[-2]["content"]
     assert "Tool protocol error" in observation
-    assert "line 2" in observation
+    assert "line 4" in observation
 
 
 BT3, BT4 = "`" * 3, "`" * 4
+COMMAND_BLOCK = command_call("echo x")
+MULTILINE_BLOCK = command_call("pwd\nls")
 
 
 @pytest.mark.parametrize(
     ("name", "wrapped"),
     [
-        ("fenced call", f'Sure!\n\n{BT3}\n{command_call("echo x")}\n{BT3}'),
-        ("fenced multiline call", f'{BT3}\njtech_cmd("""pwd\nls""")\n{BT3}'),
-        ("four-space indented call", f'Sure!\n\n    {command_call("echo x")}'),
+        ("fenced block", f"Sure!\n\n{BT3}\n{COMMAND_BLOCK}\n{BT3}"),
+        ("fenced multiline command", f"{BT3}\n{MULTILINE_BLOCK}\n{BT3}"),
+        ("four-space indented block", f"Sure!\n\n{decorate(COMMAND_BLOCK, '    ')}"),
         (
             "longer fence quoting a shorter one",
-            f'{BT4}\n{BT3}\n{command_call("echo x")}\n{BT3}\n{BT4}',
+            f"{BT4}\n{BT3}\n{COMMAND_BLOCK}\n{BT3}\n{BT4}",
         ),
-        (
-            "two wrapped calls sharing a line",
-            f'{BT3}\n{command_call("echo x")} {command_call("echo y")}\n{BT3}',
-        ),
-        ("unchecked task-list item", f'- [ ] {command_call("echo x")}'),
-        ("checked task-list item", f'- [x] {command_call("echo x")}'),
-        ("checked ordered task item", f'1. [x] {command_call("echo x")}'),
-        ("checked ordered task item, paren", f'1) [X] {command_call("echo x")}'),
-        ("strikethrough", f'~~{command_call("echo x")}~~'),
-        ("table cell", f'| {command_call("echo x")} |'),
+        ("html code block", f"Here:\n<code>\n{COMMAND_BLOCK}\n</code>"),
+        ("unchecked task-list item", decorate(COMMAND_BLOCK, "- [ ] ")),
+        ("checked task-list item", decorate(COMMAND_BLOCK, "- [x] ")),
+        ("checked ordered task item", decorate(COMMAND_BLOCK, "1. [x] ")),
+        ("checked ordered task item, paren", decorate(COMMAND_BLOCK, "1) [X] ")),
+        ("strikethrough", decorate(COMMAND_BLOCK, "~~", "~~")),
+        ("table cell", decorate(COMMAND_BLOCK, "| ", " |")),
     ],
 )
-async def test_a_wrapped_call_continues_the_turn_instead_of_ending_it(name, wrapped):
-    """The failure this path exists for: a wrapped call read as a final answer.
+async def test_a_wrapped_block_continues_the_turn_instead_of_ending_it(name, wrapped):
+    """The failure this path exists for: a wrapped block read as a final answer.
 
-    The reply carries no executable call, so without a diagnostic the loop
+    The reply carries no executable block, so without a diagnostic the loop
     takes it for prose and the turn stops with the model's work unstarted.
     Each shape here must instead cost a round and come back corrected.
     """

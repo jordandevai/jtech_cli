@@ -8,10 +8,10 @@ profile lookup, the agent catalog, result ordering) stays behind
 :class:`RuntimeHost`.
 
 The stop rule is the whole contract: a run continues after every recognized
-tool call and after every empty response, and ends normally only on the one
+tool block and after every empty response, and ends normally only on the one
 reply its kind accepts as terminal — a non-whitespace response with no
-recognized tool call for Primary, an explicit ``jtech_result(...)`` call for a
-subagent. There is no command, round, repetition, retry, concurrency, or
+recognized tool block for Primary, an explicit ``[[[jtech_result]]]`` block for
+a subagent. There is no command, round, repetition, retry, concurrency, or
 elapsed-time budget here.
 """
 
@@ -70,19 +70,19 @@ PROMPT_ERROR = "The system prompt could not be composed — check /system and /p
 SPINNER_FRAMES = "-\\|/"
 #: The one thing a stopped completion says to the next request. The visible
 #: partial answer stays in history for the reader; the model gets this instead,
-#: so incomplete prose, half a tool call, or an answer the user rejected can
+#: so incomplete prose, half a tool block, or an answer the user rejected can
 #: never anchor the next completion.
 INTERRUPTED_RESPONSE = "[Response interrupted by user.]"
 STOPPED_LABEL = "AI · stopped"
 STREAM_CANCEL_ERROR = "Could not close the provider stream"
 
 MIXED_TOOLS_ERROR = (
-    "Tool protocol error: one response cannot mix jtech_cmd and jtech_agent "
-    "calls. No call from the response was executed. Emit one tool kind in the "
-    "corrected response."
+    "Tool protocol error: one response cannot mix [[[jtech_cmd]]] and "
+    "[[[jtech_agent]]] blocks. No block from the response was executed. Emit "
+    "one tool kind in the corrected response."
 )
 SUBAGENT_DISPATCH_ERROR = (
-    "Tool protocol error: a subagent cannot dispatch agents, so no call from "
+    "Tool protocol error: a subagent cannot dispatch agents, so no block from "
     "the response was executed. Finish the assignment yourself with shell "
     "commands and report the result."
 )
@@ -90,13 +90,15 @@ SUBAGENT_DISPATCH_ERROR = (
 #: already ended its turn, and the coordinator owns what happens next.
 SUBAGENT_RESULT_REQUIRED = (
     "Subagent protocol error: a subagent must end with exactly one "
-    'jtech_result("completed", report) or jtech_result("failed", report) call.'
+    "[[[jtech_result]]] block whose status is completed or failed."
 )
 PRIMARY_RESULT_FORBIDDEN = (
-    "Tool protocol error: jtech_result is available only to dispatched subagents."
+    "Tool protocol error: [[[jtech_result]]] is available only to dispatched "
+    "subagents."
 )
 MIXED_RESULT_ERROR = (
-    "Tool protocol error: jtech_result must be the only protocol call in its response."
+    "Tool protocol error: a [[[jtech_result]]] block must be the only protocol "
+    "block in its response."
 )
 
 StreamReply = Callable[[ResolvedProfile, float, list[dict]], Awaitable[ReplyStream]]
@@ -126,15 +128,15 @@ _EXIT_PHASE: dict[RunExit, RunPhase] = {
 def parse_errors_message(errors: Sequence[ToolProtocolError]) -> str:
     """The model-facing diagnostic for a reply the runtime refuses to execute."""
     # The headline names neither a cause nor a remedy. A batch is either all
-    # syntax errors or all wrapped calls that are themselves well-formed, and
-    # the two need opposite corrections: re-emit the call, or stop trying to
+    # syntax errors or all wrapped blocks that are themselves well-formed, and
+    # the two need opposite corrections: re-emit the block, or stop trying to
     # emit it at all because it was only ever an example. Prescribing one here
-    # overrides the other — telling a model to "emit the calls again" is how a
+    # overrides the other — telling a model to "emit the blocks again" is how a
     # requested syntax example becomes a command that runs. Each error carries
     # its own reason and its own remedy; this only says nothing ran.
     lines = [
         (
-            "Tool protocol error: no call from this response was executed. "
+            "Tool protocol error: no block from this response was executed. "
             "Address each issue below:"
         )
     ]
@@ -147,7 +149,7 @@ def duplicate_keys_message(keys: Sequence[str]) -> str:
     return (
         "Tool protocol error: one response cannot dispatch the same agent key "
         f"twice ({', '.join(keys)}). One agent key is one conversation and "
-        "cannot have two concurrent writers. No call from the response was "
+        "cannot have two concurrent writers. No block from the response was "
         "executed. Dispatch each key once, and send a follow-up task only "
         "after its result arrives."
     )
@@ -533,8 +535,8 @@ class AutonomousRuntime:
 
         What ends the run depends on its kind. Primary ends on final prose, the
         answer it returns to the user. A subagent ends on an explicit
-        ``jtech_result(...)`` call and nothing else: its outcome is the status
-        that call declares, so prose alone can never report a dispatched task
+        ``[[[jtech_result]]]`` block and nothing else: its outcome is the status
+        that block declares, so prose alone can never report a dispatched task
         as completed.
 
         The caller has already recorded the user message or task that starts
@@ -597,12 +599,12 @@ class AutonomousRuntime:
         Tool output must reach the model before its next decision, so this loop
         owns every normal exit, and which reply is one depends on the run.
         Primary ends on a reply with non-whitespace text and no recognized tool
-        call. A subagent ends only on a ``jtech_result(...)`` call, whose typed
-        status becomes the outcome the coordinator receives; untyped final
+        block. A subagent ends only on a ``[[[jtech_result]]]`` block, whose
+        typed status becomes the outcome the coordinator receives; untyped final
         prose from a subagent is a failure, because nothing else in the reply
         distinguishes finished work from abandoned work.
 
-        Any call — however often it repeats, and whatever it produced — costs
+        Any block — however often it repeats, and whatever it produced — costs
         another round, and an empty reply is nudged rather than treated as an
         answer. There is no round, repetition, retry, or elapsed-time budget
         anywhere in this control flow.
@@ -619,7 +621,7 @@ class AutonomousRuntime:
                 parsed = parse_jtech_reply(reply)
                 if parsed.errors:
                     # Atomic: a reply with any diagnostic executes none of its
-                    # calls, so a malformed batch is never half-run.
+                    # blocks, so a malformed batch is never half-run.
                     self._record_protocol_error(parse_errors_message(parsed.errors))
                 elif parsed.result is not None and (
                     parsed.commands or parsed.dispatches
@@ -632,9 +634,9 @@ class AutonomousRuntime:
                         self._record_protocol_error(PRIMARY_RESULT_FORBIDDEN)
                     elif parsed.result.status == "completed":
                         # ``parsed.commentary`` is deliberately dropped: the
-                        # report argument is the whole of what the coordinator
+                        # report payload is the whole of what the coordinator
                         # receives, exactly as commentary around a command or a
-                        # dispatch call is not part of that call.
+                        # dispatch block is not part of that block.
                         return RunOutcome(
                             "completed", final_text=parsed.result.content
                         )

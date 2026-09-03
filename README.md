@@ -146,8 +146,9 @@ error rather than resolved by guessing which endpoint was meant.
   it never clears the Primary draft you cannot see.
 - **Automatic dispatch**: there is no `/agent` command and nothing to configure.
   When a request has separable work, the coordinator emits standalone
-  `jtech_agent("key", "Label", "profile", "Task label", "the task")` calls of
-  its own. It picks one of *your* configured API profiles per agent, so a local
+  `[[[jtech_agent]]]` blocks of its own — four `agent_key:`/`agent_label:`/
+  `profile_name:`/`task_label:` header lines, an empty line, then the task as
+  raw multiline text. It picks one of *your* configured API profiles per agent, so a local
   model can investigate while a cloud model reviews. Several agents in one
   reply start together and run concurrently; each one's final answer returns to
   the coordinator automatically, in the order it dispatched them, and it keeps
@@ -176,7 +177,12 @@ error rather than resolved by guessing which endpoint was meant.
   place. While streaming, the AI label shows a spinner, elapsed time, and a
   live character count — all ticked by a 1s timer, so they keep moving even
   when the stream is silent.
-- **Command entries**: an authorized command appears immediately as a dim
+- **Command entries**: the AI asks for a shell command with a standalone
+  `[[[jtech_cmd]]]` block — that delimiter line, the command, then
+  `[[[/jtech_cmd]]]` — and the text between the delimiters is the command
+  verbatim, unquoted and unescaped, so multiline scripts, heredocs, and quoted
+  code pass through untouched. You never type these blocks. An authorized
+  command appears immediately as a dim
   "SYSTEM" entry showing the command and `running…`, and that same entry
   becomes its captured output once the process exits. Shell commands have no
   elapsed-time deadline — a build, a test suite, or a migration runs as long
@@ -207,7 +213,7 @@ error rather than resolved by guessing which endpoint was meant.
   stays in the conversation under an `AI · stopped` label, followed by
   `[Response interrupted by user.]`; reasoning is discarded. Future requests
   send only that marker for the stopped turn, never the incomplete answer, so
-  half-finished prose or a truncated tool call cannot steer the next reply. It
+  half-finished prose or a truncated tool block cannot steer the next reply. It
   applies to Primary's own work, and only while Primary is selected; a selected
   agent's stream is read only and is never cancelled by it.
 - **Message queue**: pressing `Enter` while a reply is streaming queues the

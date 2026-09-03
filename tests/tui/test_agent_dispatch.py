@@ -71,7 +71,7 @@ async def test_the_coordinator_prompt_reaches_the_real_primary_request(
     async with app.run_test() as pilot:
         await run_primary(app, pilot)
     system = stream.sent_to("primary")[0][0]["content"]
-    assert "jtech_agent(" in system
+    assert "[[[jtech_agent]]]" in system
     assert "`local` — the profile this conversation runs on" in system
     assert "`cloud`" in system
 

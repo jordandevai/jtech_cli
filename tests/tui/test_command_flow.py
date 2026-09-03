@@ -461,15 +461,26 @@ async def test_interleaved_commentary_commands_start_one_tool_round(
     assert sum("exit 0" in message for message in sys_msgs) == 2
 
 
-async def test_html_wrapped_command_executes_once(tmp_path, monkeypatch):
-    """A whole-response HTML wrapper does not disable the command protocol."""
+async def test_an_html_wrapped_block_is_refused_and_the_turn_continues(
+    tmp_path, monkeypatch
+):
+    """An HTML code wrapper makes a block inert, like every other wrapper.
+
+    The whole-response ``<code>`` unwrap is gone: it turned a quoted example
+    into an executable block, which is the exact confusion between showing
+    syntax and running it that every other wrapper rule prevents. The reply
+    still must not end the turn in silence, so it costs a round and comes back
+    corrected.
+    """
     app = make_app_with_cmd(tmp_path, CmdPolicy(mode="auto", allow=["pwd:*"]))
     calls = {"n": 0}
 
     def fake(profile, temperature, messages):
         calls["n"] += 1
         if calls["n"] == 1:
-            yield '<code>\njtech_cmd("pwd")\n</code>'
+            yield f"<code>\n{command_call('pwd')}\n</code>"
+        elif calls["n"] == 2:
+            yield command_call("pwd")
         else:
             yield "done"
 
@@ -478,12 +489,13 @@ async def test_html_wrapped_command_executes_once(tmp_path, monkeypatch):
         inp = app.query_one("#input", Input)
         inp.value = "whats the cwd?"
         await pilot.press("enter")
-        await wait_until(app, pilot, lambda: calls["n"] >= 2, tries=100)
+        await wait_until(app, pilot, lambda: calls["n"] >= 3, tries=100)
         await wait_until(app, pilot, lambda: not app.tool_rounds_active, tries=100)
 
-        assert calls["n"] == 2
+        assert calls["n"] == 3
 
     sys_msgs = [m["content"] for m in app.session.messages if m["role"] == "system"]
+    assert any("did not run" in m for m in sys_msgs)
     assert len([m for m in sys_msgs if "pwd" in m and "exit 0" in m]) == 1
 
 
@@ -587,7 +599,8 @@ async def test_declined_command_ends_tool_turn(tmp_path, monkeypatch):
         "adapt and continue with a permitted approach" in content
         for content in contents
     )
-    assert any('jtech_result("failed"' in content for content in contents)
+    assert any("[[[jtech_result]]]" in content for content in contents)
+    assert any("status: failed" in content for content in contents)
     assert not any("ask the user" in content for content in contents)
 
 
@@ -652,8 +665,8 @@ async def test_failed_command_result_continues_the_loop(tmp_path, monkeypatch):
 async def test_a_running_command_is_shown_then_replaced_by_its_result(tmp_path, monkeypatch):
     """The reported defect, end to end: an executing command looked inert.
 
-    Nothing was drawn until the process exited, so a `jtech_cmd(...)` the app
-    had already parsed and started read as a call that never fired.
+    Nothing was drawn until the process exited, so a `[[[jtech_cmd]]]` block
+    the app had already parsed and started read as one that never fired.
     """
     app = make_app_with_cmd(tmp_path, CmdPolicy(mode="yolo"))
     command = "sleep 60"

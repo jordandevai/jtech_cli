@@ -256,9 +256,19 @@ def cmd_stream(first: str, second: str):
     return fake, calls
 
 
+def _protocol_block(name: str, body: str) -> str:
+    """Frame one raw body in the production block delimiters."""
+    return f"[[[{name}]]]\n{body}\n[[[/{name}]]]"
+
+
 def command_call(command: str) -> str:
-    """Format a test command using the production command-only protocol."""
-    return f"jtech_cmd({command!r})"
+    """Format a test command using the production command-only protocol.
+
+    The command is wrapped, never quoted: the point of the block protocol is
+    that a payload needs no escaping, so a helper that escaped one would test a
+    wire format the model is never asked to produce.
+    """
+    return _protocol_block("jtech_cmd", command)
 
 
 def result_call(status: str, content: str) -> str:
@@ -268,7 +278,7 @@ def result_call(status: str, content: str) -> str:
     agent to finish has to show where the status was emitted, because that is
     the thing under test.
     """
-    return f"jtech_result({status!r}, {content!r})"
+    return _protocol_block("jtech_result", f"status: {status}\n\n{content}")
 
 
 CLOUD = Profile(
@@ -361,7 +371,14 @@ def dispatch_call(
     task="do the work",
 ) -> str:
     """Format one dispatch using the production protocol."""
-    return f"jtech_agent({key!r}, {label!r}, {profile!r}, {task_label!r}, {task!r})"
+    return _protocol_block(
+        "jtech_agent",
+        f"agent_key: {key}\n"
+        f"agent_label: {label}\n"
+        f"profile_name: {profile}\n"
+        f"task_label: {task_label}\n"
+        f"\n{task}",
+    )
 
 
 class Conversation:

@@ -21,6 +21,7 @@ from jtech_cli.tui_widgets import Transcript
 from .support import (
     BlockingReplyStream,
     Harness,
+    command_call,
     make_runtime,
     model_messages,
     reply_stream_factory,
@@ -45,10 +46,10 @@ async def test_a_stopped_run_closes_provider_and_records_balanced_context():
     """Esc must close the response and leave both sides of the turn recorded.
 
     Nothing here releases the provider but the runtime's own cancellation, and
-    the partial answer deliberately contains a complete-looking tool call: a
-    stopped completion carries no text out, so nothing can parse or run it.
+    the partial answer deliberately contains a complete-looking protocol block:
+    a stopped completion carries no text out, so nothing can parse or run it.
     """
-    partial = 'partial jtech_cmd("echo forbidden")'
+    partial = f"partial\n{command_call('echo forbidden')}"
     stream = BlockingReplyStream(partial)
     session = Session(persist=False)
     session.add("user", "inspect it")
