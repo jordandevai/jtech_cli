@@ -1,8 +1,7 @@
 The user declined this command. Do not retry it. If the assignment can still be
 completed another way, adapt and continue with a permitted approach. If it
 cannot, end the turn the way this run ends: the primary conversation explains
-the blocker to the user; a subagent reports it as a failed result block, with
-the delimiters alone at the first column of their own lines:
+the blocker to the user; a subagent reports it as a failed result block:
 
 [[[jtech_result]]]
 status: failed

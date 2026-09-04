@@ -23,7 +23,7 @@ Available slash commands:
 
   Agents:
   The AI you talk to is the coordinator. When a request has separable work, it
-  dispatches subagents itself with standalone `[[[jtech_agent]]]` blocks — you
+  dispatches subagents itself with `[[[jtech_agent]]]` blocks — you
   never type a command for it, and there is no /agent or /agents. Each agent
   gets a name you see in the sidebar, an API profile the coordinator chose from
   your configured ones, and its own private conversation and context. Several
@@ -57,12 +57,13 @@ Available slash commands:
   they are part of its own history.
 
   AI shell:
-  The AI can request shell commands via standalone `[[[jtech_cmd]]]` blocks:
-  a `[[[jtech_cmd]]]` line, the raw command on the lines that follow, and a
-  `[[[/jtech_cmd]]]` line. Nothing in the command is quoted or escaped, so
-  multiline scripts, heredocs, and quotes pass through untouched. Blocks may be
-  interleaved with commentary, but each delimiter must sit alone at the first
-  column of its own line; wrapped in prose or a Markdown fence, nothing runs.
+  The AI can request shell commands via `[[[jtech_cmd]]]` blocks: the marker
+  `[[[jtech_cmd]]]`, the raw command, then the marker `[[[/jtech_cmd]]]`.
+  The markers wrap the command wherever they fall — both on one line
+  (`[[[jtech_cmd]]]pwd[[[/jtech_cmd]]]`), or framing a multiline script — and
+  only the whitespace touching them is dropped. Nothing in the command is
+  quoted or escaped, so multiline scripts, heredocs, and quotes pass through
+  untouched. Blocks may be interleaved with commentary.
   Each command is gated:
   a hard blacklist always blocks; then /set cmd_mode decides — ask (prompt
   for each command), auto (allowlisted commands run silently, the rest

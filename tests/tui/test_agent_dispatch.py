@@ -432,6 +432,50 @@ async def test_a_refused_command_and_a_failed_result_never_read_as_success(
         assert record["content"] == "Coder failed: Task"
 
 
+async def test_a_compact_block_from_a_worker_runs_and_completes_its_task(
+    tmp_path, monkeypatch
+):
+    """The screenshot failure, end to end through the real coordinator.
+
+    A worker that wrote its command and its terminal result compactly — both
+    markers hugging the payload — used to have every block refused for its
+    line placement. The run then looked like a subagent repeating itself with
+    no command result, and ended as a failure. Every block here is compact, so
+    a regression in marker placement fails this test rather than the sidebar.
+    """
+    stream = Conversation(
+        [dispatch_call(), "all done"],
+        [
+            "Checking the directory: [[[jtech_cmd]]]pwd[[[/jtech_cmd]]]",
+            "[[[jtech_result]]]status: completed\n\nThe directory is confirmed."
+            "[[[/jtech_result]]]",
+        ],
+    )
+    monkeypatch.setattr("jtech_cli.tui.stream_reply", sync_stream(stream))
+    app = make_app_with_cmd(tmp_path, CmdPolicy(mode="auto", allow=["pwd:*"]))
+    async with app.run_test() as pilot:
+        await run_primary(app, pilot)
+
+        activity = agent_activity(app, "coder")
+        assert any("exit 0" in line for line in activity)
+        assert any(str(app.project_root) in line for line in activity)
+
+        summary = agent_summary(app, "coder")
+        assert summary.status == "completed"
+        assert [(t.label, t.status) for t in summary.tasks] == [("Task", "completed")]
+
+        results = agent_results(app)
+        assert [r["status"] for r in results] == ["completed"]
+        assert results[0]["content"] == "The directory is confirmed."
+
+        second_request = stream.sent_to("worker")[1]
+        assert any(
+            "[JTECH runtime event]" in message["content"]
+            and str(app.project_root) in message["content"]
+            for message in second_request
+        )
+
+
 async def test_a_retried_assignment_produces_two_distinct_failed_results(
     tmp_path, monkeypatch
 ):

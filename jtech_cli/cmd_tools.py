@@ -3,15 +3,25 @@
 The AI requests work with ``[[[jtech_cmd]]]`` and ``[[[jtech_agent]]]`` blocks,
 and a dispatched subagent ends its turn with a ``[[[jtech_result]]]`` block.
 That third block executes nothing: it is terminal, carrying the status and the
-report the coordinator receives. One scanner owns all three, because they
-differ only in name and body shape, so fence handling, HTML-wrapper handling,
-delimiter detection, span masking, and diagnostics are written once.
+report the coordinator receives. One regex owns all three, because they differ
+only in name and payload shape, so matching, span masking, and diagnostics are
+written once.
 
-Protocol structure is expressed only by exact, standalone delimiter lines, and
-the payload between them is never quoted, unescaped, or evaluated. That is the
-whole point of the format: a command containing quotes, triple quotes,
-backslashes, or heredocs cannot damage the envelope carrying it, because the
-envelope does not share a lexer with its contents.
+Protocol structure is expressed only by exact marker substrings. An opening
+marker starts a payload wherever it appears, its matching closing marker ends
+that payload, and everything about how the response is laid out around them —
+line position, indentation, prose on the same line, Markdown, HTML — is
+presentation the parser never reads. Framing depends on protocol tokens alone,
+so a model that spells a complete, unambiguous block on one line gets the tool
+it asked for.
+
+The payload is never quoted, unescaped, or evaluated. Only the whitespace
+framing it comes off, and even that is envelope rather than content: the
+leading run for every tool, and the trailing run only for a command, whose
+payload has no field of its own to normalize it. That is the whole point of the
+format: a command containing quotes, triple quotes, backslashes, or heredocs
+cannot damage the envelope carrying it, because the envelope does not share a
+lexer with its contents.
 
 Shell blocks are then decided in order: absolute blacklist (immutable, all
 modes) -> mode (off/yolo) -> allowlist -> prompt. Pure logic lives here so it
@@ -88,10 +98,10 @@ _AGENT_KEY_PATTERN = re.compile(r"[a-z0-9][a-z0-9_-]*")
 RESERVED_AGENT_KEY = "primary"
 
 ToolName = Literal["jtech_cmd", "jtech_agent", "jtech_result"]
-#: Who a diagnostic is about. A recognized tool keeps its own name; a line that
-#: claims the reserved ``[[[jtech_...]]]`` namespace without spelling any
-#: delimiter belongs to no tool, and inventing one for it would name a tool the
-#: model never asked for.
+#: Who a diagnostic is about. A complete block that failed conversion keeps its
+#: own tool name; a marker nested inside another block's payload belongs to no
+#: complete block of its own, and inventing a tool for it would name one the
+#: model never successfully asked for.
 ProtocolErrorSource = Literal[
     "jtech_cmd", "jtech_agent", "jtech_result", "jtech_protocol"
 ]
@@ -213,8 +223,9 @@ class ToolProtocolError:
 
     Args:
         tool_name: The tool whose block failed, or ``jtech_protocol`` for a
-            line that claims the reserved namespace without naming a tool.
-        line: One-based line of the offending line in the model's own reply.
+            marker nested inside another block's payload.
+        line: One-based line the offending marker or line falls on in the
+            model's own reply.
         message: What the model must correct.
     """
 
@@ -343,29 +354,52 @@ _JTECH_CMD = "jtech_cmd"
 _JTECH_AGENT = "jtech_agent"
 _JTECH_RESULT = "jtech_result"
 _JTECH_PROTOCOL = "jtech_protocol"
-#: The complete tool vocabulary. Membership here is what makes a delimiter
-#: executable at all, so the terminal result block gets the same near-miss
-#: diagnostics as the executable ones.
+#: The complete tool vocabulary. Membership here is what makes a marker part of
+#: the protocol at all, so the terminal result block is framed, matched, and
+#: diagnosed exactly like the executable ones.
 _TOOL_NAMES: tuple[ToolName, ...] = (_JTECH_CMD, _JTECH_AGENT, _JTECH_RESULT)
 
 _OPEN_PREFIX = "[[["
 _CLOSE_PREFIX = "[[[/"
-_DELIMITER_SUFFIX = "]]]"
-#: Every executable delimiter line, mapped to the tool it frames. Exact strings
-#: rather than a pattern: the whole line is the token, so there is nothing to
-#: match loosely and no way for a payload's own punctuation to be read as one.
-_OPEN_DELIMITERS: dict[str, ToolName] = {
-    f"{_OPEN_PREFIX}{name}{_DELIMITER_SUFFIX}": name for name in _TOOL_NAMES
-}
-_CLOSE_DELIMITERS: dict[str, ToolName] = {
-    f"{_CLOSE_PREFIX}{name}{_DELIMITER_SUFFIX}": name for name in _TOOL_NAMES
-}
-#: The namespace a delimiter line claims. A column-zero line that opens with one
-#: of these without spelling a delimiter exactly is a malformed protocol line,
-#: never prose: the model was reaching for a tool, and demoting the attempt to
-#: final prose is the silence every diagnostic here exists to prevent.
-_RESERVED_PREFIXES = (f"{_OPEN_PREFIX}jtech_", f"{_CLOSE_PREFIX}jtech_")
-_DELIMITER_VOCABULARY = ", ".join(_OPEN_DELIMITERS)
+_MARKER_SUFFIX = "]]]"
+
+
+def _opener(tool_name: str) -> str:
+    """The exact opening marker for one tool."""
+    return f"{_OPEN_PREFIX}{tool_name}{_MARKER_SUFFIX}"
+
+
+def _closer(tool_name: str) -> str:
+    """The exact closing marker for one tool."""
+    return f"{_CLOSE_PREFIX}{tool_name}{_MARKER_SUFFIX}"
+
+
+_MARKER_VOCABULARY = ", ".join(_opener(name) for name in _TOOL_NAMES)
+
+#: One complete block: an exact opening marker, its payload, and its exact
+#: matching closing marker. Non-greedy so the first matching closer ends the
+#: block, DOTALL so a payload spans lines, and back-referenced so an opener for
+#: one tool can never be closed by another tool's marker. Position is not part
+#: of it: a marker is a substring, so indentation, prose on the same line, a
+#: fence, or a list marker around it are presentation, not protocol.
+_BLOCK_RE = re.compile(
+    r"\[\[\[(" + "|".join(re.escape(name) for name in _TOOL_NAMES) + r")\]\]\]"
+    r"(.*?)"
+    r"\[\[\[/\1\]\]\]",
+    re.DOTALL,
+)
+#: Any token claiming the reserved JTECH namespace, whether or not it names a
+#: real tool. The underscore group repeats so a multi-word name claims the
+#: namespace too: ``[[[jtech_bad_tool]]]`` is as much a tool the model reached
+#: for as ``[[[jtech_bad]]]``, and reading one as ordinary text inside a
+#: payload is the concealment this token exists to prevent.
+_MARKER_RE = re.compile(r"\[\[\[/?jtech(?:_[A-Za-z0-9]+)*\]\]\]")
+#: The characters normalization removes from a payload's edges: the leading run
+#: for every tool, and the trailing run only for a command, whose payload has
+#: no field of its own to normalize it. Everything between those edges —
+#: indentation, blank lines, line endings — is the command, task, or report
+#: exactly as the model wrote it.
+_PAYLOAD_PADDING = " \t\r\n"
 
 #: The ordered header lines each structured block carries, and what its payload
 #: is called in a diagnostic. A command block has neither: its body is the
@@ -376,36 +410,26 @@ _BLOCK_HEADERS: dict[ToolName, tuple[str, ...]] = {
 }
 _PAYLOAD_NAMES: dict[ToolName, str] = {_JTECH_AGENT: "task", _JTECH_RESULT: "report"}
 
-DelimiterKind = Literal["open", "close"]
-
-
-@dataclass(frozen=True, slots=True)
-class _ProtocolDelimiter:
-    """One exact delimiter line: which side of a block it is, and whose."""
-
-    kind: DelimiterKind
-    tool_name: ToolName
-
 
 @dataclass(frozen=True, slots=True)
 class _ProtocolBlock:
-    """One complete block and the span it occupies in the reply.
+    """One complete block, built from one regex match.
 
     Args:
-        tool_name: The tool the delimiters name.
-        body: The raw payload between the framing newlines, byte for byte.
-        start: Offset of the opening delimiter line's first character.
-        end: Offset just past the closing delimiter line's last character.
-            The span covers the delimiters too, so masking it leaves the
-            commentary around the block lossless.
-        line: One-based line of the opening delimiter in the reply.
+        tool_name: The tool both markers name.
+        body: The payload with its framing whitespace removed: the leading
+            run always, and the trailing run only for a command.
+        line: One-based line of the opening marker in the reply.
+        body_line: One-based line of ``body``'s first character in the reply.
+            Tracked separately because a compact block puts the payload's first
+            line on the opening marker's own line, so a header diagnostic
+            cannot be counted from the marker.
     """
 
     tool_name: ToolName
     body: str
-    start: int
-    end: int
     line: int
+    body_line: int
 
 
 class _BlockSyntaxError(ValueError):
@@ -419,326 +443,156 @@ class _BlockSyntaxError(ValueError):
         self.line = line
 
 
-#: A leading GFM task-list marker, up to and including the checkbox, on either
-#: list kind: a bullet or an ordered ``1.``/``1)``. Removed as a whole token
-#: because a checked box carries a letter, and the rule below — decoration is
-#: anything that is not a letter — has to stay letter-free to keep prose out.
-#: Enumerating decoration instead was the earlier approach and it leaked: every
-#: Markdown flavour spells a wrapper with different punctuation (task boxes,
-#: strikethrough, table cells), so the set was never finished. Naming what
-#: decoration is *not* has one edge, and the checkbox is all of it.
-_TASK_LIST_MARKER = re.compile(r"^[\s>]*(?:[-*+]|\d{1,9}[.)])\s+\[[ xX]\]")
-_HTML_CODE_TAG = re.compile(r"</?code\b[^>]*>", re.IGNORECASE)
-#: An opening code fence: three or more backticks or tildes. Both the marker
-#: character and its length are state, because a longer fence quotes a shorter
-#: one — a three-backtick line inside a four-backtick block is content, and
-#: closing on it hands the rest of the block to the scanner as executable text.
-_FENCE_OPEN = re.compile(r"^(`{3,}|~{3,})")
-#: Why a recognized block did not run, as the model is told it.
-_FENCE_CONTEXT = "was written inside a code fence"
-_HTML_CODE_CONTEXT = "was written inside an HTML code block"
-_DECORATION_CONTEXT = "was indented or wrapped in Markdown formatting"
+def _line_at(reply: str, offset: int) -> int:
+    """The one-based line ``offset`` falls on in ``reply``."""
+    return reply.count("\n", 0, offset) + 1
 
 
-def _exact_delimiter(line: str) -> _ProtocolDelimiter | None:
-    """Return an exact column-zero delimiter, otherwise ``None``.
+def _shown(line: str) -> str:
+    """One offending line, quoted for a diagnostic and capped in length."""
+    return repr(line if len(line) <= 80 else line[:79] + "…")
 
-    A lone trailing ``\\r`` is a line ending, not content, so a CRLF reply
-    spells its delimiters the same way an LF one does. Nothing else is
-    forgiven: any other character on the line makes it payload or prose.
+
+def _block_from_match(reply: str, match: re.Match[str]) -> _ProtocolBlock:
+    """Convert one complete match to the block value the converters read.
+
+    Leading padding is envelope for every tool. It is what a model writes to
+    put a readable body on its own line, or the space it leaves after the
+    opening marker, and removing it is what makes the compact, spaced, and
+    multiline spellings of one block the same block.
+
+    Trailing padding is envelope only for a command, whose payload is the whole
+    body and has nothing else to normalize it. A structured body ends in its
+    task or report, and that field is normalized and validated by its own
+    boundary type. Stripping the body's tail here would take the empty
+    separator line with it, so a whitespace-only report would be reported as a
+    block of the wrong shape — naming a defect the model did not commit, and
+    hiding the one it did.
     """
-    line = line.removesuffix("\r")
-    tool_name = _OPEN_DELIMITERS.get(line)
-    if tool_name is not None:
-        return _ProtocolDelimiter("open", tool_name)
-    tool_name = _CLOSE_DELIMITERS.get(line)
-    if tool_name is not None:
-        return _ProtocolDelimiter("close", tool_name)
-    return None
-
-
-def _reserved_delimiter_candidate(line: str) -> bool:
-    """Whether a column-zero line claims the reserved JTECH namespace.
-
-    Only asked of a line that is not already an exact delimiter, so a true
-    answer means the model spelled one wrong — a misspelled tool, an inline
-    body, or text appended to the marker — rather than writing prose.
-    """
-    return line.startswith(_RESERVED_PREFIXES)
-
-
-def _wrapped_block_name(line: str) -> ToolName | None:
-    """The tool this line opens a block for behind decoration, else ``None``.
-
-    Recognition is deliberately shallow: it looks at one line and asks only
-    whether an opening delimiter is sitting inside a wrapper. A wrapped block
-    may be malformed or may never be closed, and every one of those is still
-    the model asking for a tool it will not get. Requiring a complete block
-    here returns ``None`` for exactly those shapes and leaves them silent,
-    which is the failure this whole path exists to prevent.
-
-    What discriminates is the *prefix*: HTML code tags, a task-list marker, and
-    Markdown underscore escaping are removed, and then no letter may stand
-    between the start of the line and the tool name. Punctuation is how every
-    wrapper is spelled — bullets, quote markers, emphasis, strikethrough, code
-    spans, table cells — so it is all decoration by construction, while a
-    mention inside a sentence (``The marker is [[[jtech_cmd]]].``) keeps its
-    letters and stays commentary.
-
-    A closing delimiter is never reported: its own opener already carries the
-    diagnostic, and a wrapped block would otherwise be refused twice.
-    """
-    text = _HTML_CODE_TAG.sub("", line.replace("\\_", "_"))
-    text = _TASK_LIST_MARKER.sub("", text, count=1)
-    for start, char in enumerate(text):
-        if not char.isalpha():
-            continue
-        if start < len(_OPEN_PREFIX) or not text.startswith(
-            _OPEN_PREFIX, start - len(_OPEN_PREFIX)
-        ):
-            # The name is not sitting in a marker at all, so this is prose that
-            # happens to begin with a word — or a closing delimiter, whose
-            # slash keeps it out of the marker prefix.
-            return None
-        for name in _TOOL_NAMES:
-            if text.startswith(name, start) and text.startswith(
-                _DELIMITER_SUFFIX, start + len(name)
-            ):
-                return name
-        return None
-    return None
-
-
-def _near_miss_message(tool_name: ToolName, context: str) -> str:
-    """What the model must change to turn a wrapped block into a running one."""
-    return (
-        f"{_OPEN_PREFIX}{tool_name}{_DELIMITER_SUFFIX} {context}, so it did not "
-        "run. A block executes only as raw text: its opening and closing "
-        "delimiter lines must each start at the very first column of their own "
-        "line and carry nothing else, with no indent, fence, code span, list "
-        "marker, quote marker, or emphasis around them. If you meant to show "
-        "the syntax rather than run it, describe it in a sentence instead."
+    payload = match.group(2)
+    tool_name: ToolName = match.group(1)
+    lead = len(payload) - len(payload.lstrip(_PAYLOAD_PADDING))
+    body = payload[lead:]
+    if tool_name == _JTECH_CMD:
+        body = body.rstrip(_PAYLOAD_PADDING)
+    return _ProtocolBlock(
+        tool_name=tool_name,
+        body=body,
+        line=_line_at(reply, match.start()),
+        body_line=_line_at(reply, match.start(2) + lead),
     )
 
 
-def _near_miss_errors(
-    text: str, skipped: Sequence[tuple[int, str]]
-) -> list[ToolProtocolError]:
-    """Diagnostics for blocks that were skipped because something wrapped them.
+def _opens_its_line(reply: str, start: int) -> bool:
+    """Whether only whitespace precedes the marker at ``start`` on its line.
 
-    Only for a reply that ran nothing: silence is the failure being prevented,
-    and a reply that executed a block is never silent.
+    The one position that carries meaning, and it is not a layout rule: a model
+    that begins a line with an opening marker is starting a block, so a stream
+    cut off before the closer leaves exactly this shape. Prose naming a marker
+    reaches it through a sentence, and the words before it are what tell the
+    two apart.
+    """
+    return not reply[reply.rfind("\n", 0, start) + 1 : start].strip()
+
+
+def _residual_marker_message(marker: str, *, with_block: bool) -> str:
+    """Why one marker left outside every complete block is not a block."""
+    tool_name = marker.strip("[]/")
+    if tool_name not in _TOOL_NAMES:
+        return (
+            f"{marker} names no JTECH tool, so nothing from this response ran. "
+            f"The tools are {_MARKER_VOCABULARY}, each written as an exact "
+            "opening marker, the payload, then its exact matching closing "
+            "marker."
+        )
+    if with_block:
+        return (
+            f"{marker} belongs to no complete block, and this response carries "
+            "a block, so none of it ran. A marker left over is usually a "
+            "payload that was cut short at an earlier closing marker: check "
+            "that each block ends where you meant it to, and remove any marker "
+            "that was not opening or closing one."
+        )
+    return (
+        f"{marker} was never closed by {_closer(tool_name)}, so nothing from "
+        "this response ran. Write the payload between the two markers; they "
+        "may sit anywhere in the response, including together on one line."
+    )
+
+
+def _residual_marker_errors(
+    reply: str,
+    matched_spans: Sequence[tuple[int, int]],
+) -> list[ToolProtocolError]:
+    """Report markers no complete block consumed, where one is a tool attempt.
+
+    A marker on its own is not enough to refuse a response: prose is how the
+    protocol gets discussed at all, and a sentence naming a marker must not
+    cost a corrective round. Two residues are not prose, though.
+
+    The first is a marker left over in a response that also carries a complete
+    block. That is what a truncated payload looks like — the block ended at an
+    earlier closing marker and the rest of the intended command became
+    commentary — so the leftover marker is the only evidence the command that
+    survived is a fragment. Refusing the whole response keeps it out of the
+    shell.
+
+    The second is an opening marker that begins its own line with no closer
+    anywhere after it, which is what a stream cut off mid-block leaves. Read as
+    prose it would end a primary turn as the final answer, with the work
+    unstarted and nothing said about it.
     """
     errors: list[ToolProtocolError] = []
-    for position, context in skipped:
-        line_end = text.find("\n", position)
-        line = text[position:] if line_end < 0 else text[position:line_end]
-        tool_name = _wrapped_block_name(line)
-        if tool_name is None:
+    with_block = bool(matched_spans)
+    for match in _MARKER_RE.finditer(reply):
+        start = match.start()
+        if any(span[0] <= start < span[1] for span in matched_spans):
+            continue
+        marker = match.group()
+        truncated_opener = not marker.startswith(_CLOSE_PREFIX) and _opens_its_line(
+            reply, start
+        )
+        if not with_block and not truncated_opener:
             continue
         errors.append(
             ToolProtocolError(
-                tool_name,
-                text.count("\n", 0, position) + 1,
-                _near_miss_message(tool_name, context),
+                _JTECH_PROTOCOL,
+                _line_at(reply, start),
+                _residual_marker_message(marker, with_block=with_block),
             )
         )
     return errors
 
 
-def _shown(line: str) -> str:
-    """One offending line, quoted for a diagnostic and capped in length.
-
-    Quoted rather than stripped: the whitespace around a delimiter is usually
-    the whole defect, and a trimmed echo of ``[[[jtech_cmd]]] `` reads as the
-    valid delimiter the model thought it wrote.
-    """
-    return repr(line if len(line) <= 80 else line[:79] + "…")
-
-
-def _read_block(
-    reply: str, start: int, body_start: int, open_line: int, tool_name: ToolName
-) -> tuple[_ProtocolBlock | None, _BlockSyntaxError | None, int, int]:
-    """Read one opened block through its closing delimiter.
-
-    The body is taken verbatim: only exact delimiter lines are looked for
-    inside it, so fences, indentation, quotes, and Markdown in the payload mean
-    nothing here. That is the invariant the whole format exists for.
-
-    Returns the block (or ``None`` when it failed), the failure (or ``None``),
-    and the position and one-based line the outer scan resumes at. A nested
-    opener resumes *on* that opener, so the block the model actually started is
-    still read; every other outcome resumes past the line that ended this one.
-    """
-    length = len(reply)
-    position = body_start
-    line_number = open_line + 1
-    body_lines = 0
-    while position < length:
-        line_end = reply.find("\n", position)
-        if line_end < 0:
-            line_end = length
-        after = line_end + (line_end < length)
-        delimiter = _exact_delimiter(reply[position:line_end])
-        if delimiter is None:
-            body_lines += 1
-            position = after
-            line_number += 1
-            continue
-        opener = f"{_OPEN_PREFIX}{tool_name}{_DELIMITER_SUFFIX}"
-        closer = f"{_CLOSE_PREFIX}{tool_name}{_DELIMITER_SUFFIX}"
-        if delimiter.kind == "open":
-            return (
-                None,
-                _BlockSyntaxError(
-                    tool_name,
-                    line_number,
-                    f"{opener} must be closed by {closer} before another block "
-                    "opens; protocol blocks cannot nest",
-                ),
-                position,
-                line_number,
-            )
-        if delimiter.tool_name != tool_name:
-            wrong = f"{_CLOSE_PREFIX}{delimiter.tool_name}{_DELIMITER_SUFFIX}"
-            return (
-                None,
-                _BlockSyntaxError(
-                    tool_name,
-                    line_number,
-                    f"{opener} must be closed by {closer}, not {wrong}",
-                ),
-                after,
-                line_number + 1,
-            )
-        if body_lines == 0:
-            return (
-                None,
-                _BlockSyntaxError(
-                    tool_name,
-                    open_line,
-                    f"{opener} must be followed by a body line before {closer}; "
-                    "an empty body is written as one empty line",
-                ),
-                after,
-                line_number + 1,
-            )
-        # The newline introducing the closing line is framing, not payload, and
-        # so is the carriage return that belongs to it. Nothing else about the
-        # body's line endings is touched.
-        body_end = position - 1
-        if body_end > body_start and reply[body_end - 1] == "\r":
-            body_end -= 1
-        return (
-            _ProtocolBlock(
-                tool_name, reply[body_start:body_end], start, line_end, open_line
-            ),
-            None,
-            after,
-            line_number + 1,
-        )
-    return (
-        None,
-        _BlockSyntaxError(
-            tool_name,
-            open_line,
-            f"{_OPEN_PREFIX}{tool_name}{_DELIMITER_SUFFIX} was never closed: the "
-            f"block must end with a line containing exactly "
-            f"{_CLOSE_PREFIX}{tool_name}{_DELIMITER_SUFFIX} and nothing else, at "
-            "the first column",
-        ),
-        length,
-        line_number,
-    )
-
-
-def _scan_protocol_blocks(
+def _nested_marker_errors(
     reply: str,
-) -> tuple[list[_ProtocolBlock], list[_BlockSyntaxError], list[tuple[int, str]]]:
-    """Scan blocks, syntax errors, and skipped decorated candidates once.
+    matches: Sequence[re.Match[str]],
+) -> list[ToolProtocolError]:
+    """Reject marker tokens captured inside another block's payload.
 
-    One pass owns the fence and HTML-code state, so the near-miss diagnostics
-    read it rather than rebuilding it: a second scan would have to duplicate
-    that state machine and could only disagree with this one.
-
-    A block's body is consumed whole, so a fence, an HTML tag, or an indented
-    line inside a payload never enters that state machine at all.
+    The one marker that is not ordinary text, because a lazy match hides what
+    it swallowed. Outside a block an unpaired marker is prose the model can see
+    for itself and nothing acts on it; inside one it would be handed to the
+    shell as payload, so a nested tool attempt would run as command text rather
+    than be refused. The block's own closing marker is the only reserved
+    substring in a payload; any other marker there is a tool the model tried to
+    call from within one.
     """
-    blocks: list[_ProtocolBlock] = []
-    errors: list[_BlockSyntaxError] = []
-    # Position and wrapper kind of every line the scan passes over. Recorded
-    # unconditionally because the scan owns the state a second pass would have
-    # to duplicate; nothing is examined unless the reply ran nothing.
-    skipped: list[tuple[int, str]] = []
-    length = len(reply)
-    position = 0
-    line_number = 1
-    # The open fence's marker character and length, or None outside a fence.
-    fence: tuple[str, int] | None = None
-    in_html_code = False
-    while position < length:
-        line_end = reply.find("\n", position)
-        if line_end < 0:
-            line_end = length
-        after = line_end + (line_end < length)
-        line = reply[position:line_end]
-        stripped = line.strip()
-        lower = stripped.lower()
-
-        if fence is not None:
-            marker, size = fence
-            # A closing fence is the same character, at least as long as the
-            # opening one, and carries nothing else on its line.
-            if len(stripped) >= size and set(stripped) == {marker}:
-                fence = None
-            skipped.append((position, _FENCE_CONTEXT))
-        elif in_html_code:
-            if "</code>" in lower:
-                in_html_code = False
-            skipped.append((position, _HTML_CODE_CONTEXT))
-        elif (opening := _FENCE_OPEN.match(stripped)) is not None:
-            fence = (stripped[0], len(opening.group()))
-            skipped.append((position, _FENCE_CONTEXT))
-        elif "<code" in lower:
-            in_html_code = "</code>" not in lower
-            skipped.append((position, _HTML_CODE_CONTEXT))
-        else:
-            delimiter = _exact_delimiter(line)
-            if delimiter is None:
-                if _reserved_delimiter_candidate(line):
-                    errors.append(
-                        _BlockSyntaxError(
-                            _JTECH_PROTOCOL,
-                            line_number,
-                            f"{_shown(line)} is not a JTECH protocol delimiter. A "
-                            f"delimiter line carries exactly one of "
-                            f"{_DELIMITER_VOCABULARY} or its matching closing "
-                            "form, alone on its own line at the first column",
-                        )
-                    )
-                else:
-                    skipped.append((position, _DECORATION_CONTEXT))
-            elif delimiter.kind == "close":
-                closer = f"{_CLOSE_PREFIX}{delimiter.tool_name}{_DELIMITER_SUFFIX}"
-                errors.append(
-                    _BlockSyntaxError(
-                        delimiter.tool_name,
-                        line_number,
-                        f"{closer} closes a block that was never opened",
-                    )
+    errors: list[ToolProtocolError] = []
+    for match in matches:
+        opener = _opener(match.group(1))
+        for nested in _MARKER_RE.finditer(match.group(2)):
+            errors.append(
+                ToolProtocolError(
+                    _JTECH_PROTOCOL,
+                    _line_at(reply, match.start(2) + nested.start()),
+                    f"{nested.group()} appears inside a {opener} block's "
+                    "payload, so nothing from this response ran. "
+                    "Protocol blocks cannot nest, and the only reserved "
+                    f"substring inside a payload is {_closer(match.group(1))}.",
                 )
-            else:
-                block, error, position, line_number = _read_block(
-                    reply, position, after, line_number, delimiter.tool_name
-                )
-                if block is not None:
-                    blocks.append(block)
-                if error is not None:
-                    errors.append(error)
-                continue
-        position = after
-        line_number += 1
-    return blocks, errors, skipped
+            )
+    return errors
 
 
 def _split_ordered_headers(
@@ -752,11 +606,15 @@ def _split_ordered_headers(
     lookup keyed by name would accept any order and then need four more rules
     to reject the shapes it just admitted.
 
+    Diagnostics count from ``body_line`` rather than from the opening marker,
+    because a compact block puts the first header on the marker's own line and
+    a multiline one puts it on the next.
+
     Raises:
         _BlockSyntaxError: on any deviation from that shape.
     """
     payload_name = _PAYLOAD_NAMES[block.tool_name]
-    opener = f"{_OPEN_PREFIX}{block.tool_name}{_DELIMITER_SUFFIX}"
+    opener = _opener(block.tool_name)
     # Split on the line feed alone: a carriage return belongs to the line
     # ending of a header, and to the payload everywhere else.
     lines = block.body.split("\n")
@@ -775,7 +633,7 @@ def _split_ordered_headers(
         if not separator or key != name:
             raise _BlockSyntaxError(
                 block.tool_name,
-                block.line + 1 + index,
+                block.body_line + index,
                 f"line {index + 1} of a {opener} block must be the header "
                 f"'{name}:', not {_shown(line)}",
             )
@@ -786,7 +644,7 @@ def _split_ordered_headers(
     if separator_line:
         raise _BlockSyntaxError(
             block.tool_name,
-            block.line + 1 + len(expected),
+            block.body_line + len(expected),
             f"exactly one empty line must separate a {opener} block's headers "
             f"from its {payload_name}, not {_shown(separator_line)}",
         )
@@ -827,7 +685,7 @@ def _block_error(block: _ProtocolBlock, error: ValueError) -> ToolProtocolError:
 
     A header failure knows exactly which line it is about; a boundary-type
     failure knows only that the block's values were wrong, so it lands on the
-    delimiter that names the block.
+    opening marker that names the block.
     """
     if isinstance(error, _BlockSyntaxError):
         return ToolProtocolError(error.tool_name, error.line, str(error))
@@ -835,53 +693,46 @@ def _block_error(block: _ProtocolBlock, error: ValueError) -> ToolProtocolError:
 
 
 def parse_jtech_reply(reply: str) -> ParsedReply:
-    """Parse standalone JTECH protocol blocks anywhere in a reply.
+    """Parse JTECH protocol blocks wherever their markers appear in a reply.
 
-    A block is an exact opening delimiter line, a body, and the matching exact
-    closing delimiter line, each delimiter starting at column zero and carrying
-    nothing else. The body between them is raw: it is never trimmed, unquoted,
-    unescaped, or evaluated, so a command holding quotes, triple quotes,
-    backslashes, or a heredoc reaches the shell exactly as written. This
-    permits commentary before, between, and after blocks without executing
-    examples. Code blocks are inert in every form Markdown gives them —
-    backtick and tilde fences of any marker length, and indentation, which
-    needs no fence at all — as are HTML ``<code>`` blocks.
+    A block is an exact opening marker, a payload, and the exact matching
+    closing marker. Nothing about where the markers sit is protocol: they may
+    share a line with each other and with prose, or frame a payload across as
+    many lines as it needs, and indentation, list markers, quote markers, code
+    fences, code spans, and HTML around them are presentation the parser never
+    reads. Framing depends only on the two uncommon tokens, so how a model
+    lays out Markdown cannot decide whether its tool call runs.
 
-    A ``[[[jtech_result]]]`` block is recognized by the same scan but executes
+    The payload's leading spaces, tabs, and line endings are removed, and a
+    command's trailing ones too — a structured body's tail belongs to the task
+    or report its own boundary type normalizes. What is left is raw: never
+    trimmed further, unquoted, unescaped, dedented, or evaluated, so a command
+    holding quotes, triple quotes, backslashes, or a heredoc reaches the shell
+    exactly as written. Commentary before, between, and after blocks is
+    preserved by masking their spans.
+
+    A ``[[[jtech_result]]]`` block is matched by the same regex but executes
     nothing: it lands in ``result`` as the subagent's terminal status, and only
     one may appear in a reply, because two would leave the status ambiguous.
 
-    A line in the reserved ``[[[jtech_...]]]`` namespace that spells no
-    delimiter, a block that never closes, a nested or mismatched delimiter, and
-    a stray closer all become a :class:`ToolProtocolError` rather than silently
-    reverting to commentary — the model asked for a tool and is told exactly
-    why it did not run.
+    A complete pair is the whole of what makes a block, so a marker that is not
+    part of one is ordinary text by default: a sentence naming a marker costs
+    no corrective round, and neither does a stray closer in prose.
 
-    A reply that runs nothing gets the same treatment for a block some wrapper
-    hid: an indented, fenced, bulleted, quoted, or emphasized opening delimiter
-    is still refused, but it is reported rather than dropped, because a reply
-    with no block and no diagnostic reads as a final answer and ends the turn
-    in silence.
+    Three residues are not prose, and each becomes a
+    :class:`ToolProtocolError` that keeps the whole response out of the
+    runtime. A marker left over beside a complete block is what a payload cut
+    short at an earlier closer leaves behind, so the block that survived is a
+    fragment. An opening marker that begins its own line and is never closed is
+    what a truncated stream leaves, and read as prose it would end a primary
+    turn as the final answer with the work unstarted. A marker captured
+    *inside* another block's payload is a nested tool call a lazy match would
+    otherwise hand to the shell as payload text.
     """
-    blocks, syntax_errors, skipped = _scan_protocol_blocks(reply)
-    errors: list[ToolProtocolError] = [
-        ToolProtocolError(error.tool_name, error.line, str(error))
-        for error in syntax_errors
-    ]
-    if not blocks:
-        # Nothing parsed, so nothing executed and nothing keeps the turn alive,
-        # and the whole reply is commentary because no span was consumed.
-        #
-        # Both kinds of diagnostic are reported, never one instead of the other.
-        # A block spans lines, so a single wrapped construct can raise a syntax
-        # error on one delimiter and a near miss on its decorated partner: an
-        # indented opener with a bare closer reports only that the closer opened
-        # nothing, which names the wrong line and hides the indent that actually
-        # caused it. The two cannot collide, because a line that raised a syntax
-        # error was never skipped and a skipped line never raised one.
-        errors.extend(_near_miss_errors(reply, skipped))
-        errors.sort(key=lambda error: error.line)
-        return ParsedReply(commands=[], commentary=reply.strip(), errors=errors)
+    matches = list(_BLOCK_RE.finditer(reply))
+    spans = [match.span() for match in matches]
+    errors = _residual_marker_errors(reply, spans)
+    errors.extend(_nested_marker_errors(reply, matches))
 
     commands: list[str] = []
     dispatches: list[AgentDispatch] = []
@@ -890,10 +741,12 @@ def parse_jtech_reply(reply: str) -> ParsedReply:
     # and a third must not be allowed to fill it back in.
     result_blocks = 0
 
-    for block in blocks:
+    for match in matches:
+        block = _block_from_match(reply, match)
         if block.tool_name == _JTECH_CMD:
-            # Whitespace-only bodies stay parseable and reach the runtime's
-            # existing empty-command path; the parser owns syntax, not policy.
+            # An empty or whitespace-only payload stays parseable and reaches
+            # the runtime's existing empty-command path; the parser owns
+            # syntax, not policy.
             commands.append(block.body)
             continue
         if block.tool_name == _JTECH_RESULT:
@@ -907,9 +760,8 @@ def parse_jtech_reply(reply: str) -> ParsedReply:
                     ToolProtocolError(
                         _JTECH_RESULT,
                         block.line,
-                        f"{_OPEN_PREFIX}{_JTECH_RESULT}{_DELIMITER_SUFFIX} may "
-                        "appear only once in a response, so no terminal result "
-                        "was recorded",
+                        f"{_opener(_JTECH_RESULT)} may appear only once in a "
+                        "response, so no terminal result was recorded",
                     )
                 )
                 continue
@@ -923,14 +775,14 @@ def parse_jtech_reply(reply: str) -> ParsedReply:
         except ValueError as error:
             errors.append(_block_error(block, error))
 
-    # Scan errors and block errors are each already in source order, but they
-    # arrive in two passes; merging by line keeps one reply's diagnostics
-    # readable top to bottom.
+    # Nested-marker errors and block errors are each already in source order,
+    # but they arrive in two passes; merging by line keeps one reply's
+    # diagnostics readable top to bottom.
     errors.sort(key=lambda error: error.line)
 
     masked = list(reply)
-    for block in blocks:
-        for index in range(block.start, block.end):
+    for start, end in spans:
+        for index in range(start, end):
             if masked[index] != "\n":
                 masked[index] = " "
     return ParsedReply(

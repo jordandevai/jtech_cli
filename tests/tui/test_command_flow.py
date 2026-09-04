@@ -461,16 +461,12 @@ async def test_interleaved_commentary_commands_start_one_tool_round(
     assert sum("exit 0" in message for message in sys_msgs) == 2
 
 
-async def test_an_html_wrapped_block_is_refused_and_the_turn_continues(
-    tmp_path, monkeypatch
-):
-    """An HTML code wrapper makes a block inert, like every other wrapper.
+async def test_an_html_wrapped_block_still_runs_its_command(tmp_path, monkeypatch):
+    """A wrapper is presentation, and presentation is not protocol.
 
-    The whole-response ``<code>`` unwrap is gone: it turned a quoted example
-    into an executable block, which is the exact confusion between showing
-    syntax and running it that every other wrapper rule prevents. The reply
-    still must not end the turn in silence, so it costs a round and comes back
-    corrected.
+    An HTML ``<code>`` wrapper — like a fence, an indent, or a list marker —
+    changes nothing about the two markers inside it, so the command runs on the
+    first round instead of costing one to a refusal the model cannot act on.
     """
     app = make_app_with_cmd(tmp_path, CmdPolicy(mode="auto", allow=["pwd:*"]))
     calls = {"n": 0}
@@ -479,8 +475,6 @@ async def test_an_html_wrapped_block_is_refused_and_the_turn_continues(
         calls["n"] += 1
         if calls["n"] == 1:
             yield f"<code>\n{command_call('pwd')}\n</code>"
-        elif calls["n"] == 2:
-            yield command_call("pwd")
         else:
             yield "done"
 
@@ -489,13 +483,13 @@ async def test_an_html_wrapped_block_is_refused_and_the_turn_continues(
         inp = app.query_one("#input", Input)
         inp.value = "whats the cwd?"
         await pilot.press("enter")
-        await wait_until(app, pilot, lambda: calls["n"] >= 3, tries=100)
+        await wait_until(app, pilot, lambda: calls["n"] >= 2, tries=100)
         await wait_until(app, pilot, lambda: not app.tool_rounds_active, tries=100)
 
-        assert calls["n"] == 3
+        assert calls["n"] == 2
 
     sys_msgs = [m["content"] for m in app.session.messages if m["role"] == "system"]
-    assert any("did not run" in m for m in sys_msgs)
+    assert not any("Tool protocol error" in m for m in sys_msgs)
     assert len([m for m in sys_msgs if "pwd" in m and "exit 0" in m]) == 1
 
 

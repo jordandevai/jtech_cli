@@ -36,8 +36,13 @@ TAB = "\t"
 
 
 def block(name: str, body: str) -> str:
-    """One protocol block, framed exactly as the model must emit it."""
+    """One protocol block in the readable multiline spelling."""
     return f"[[[{name}]]]\n{body}\n[[[/{name}]]]"
+
+
+def compact(name: str, body: str) -> str:
+    """The same block with both markers hugging the payload on one line."""
+    return f"[[[{name}]]]{body}[[[/{name}]]]"
 
 
 def command(body: str) -> str:
@@ -45,19 +50,19 @@ def command(body: str) -> str:
 
 
 def decorate(text: str, prefix: str = "", suffix: str = "") -> str:
-    """Wrap every line of a block, the way a model wraps one by accident."""
+    """Wrap every line of a block, the way a model wraps one in Markdown."""
     return "\n".join(f"{prefix}{line}{suffix}" for line in text.split("\n"))
 
 
-DISPATCH = block(
-    "jtech_agent",
+DISPATCH_BODY = (
     "agent_key: coder\n"
     "agent_label: Coder\n"
     "profile_name: local\n"
     "task_label: Implement parser\n"
     "\n"
-    "Inspect the current parser and implement the change.",
+    "Inspect the current parser and implement the change."
 )
+DISPATCH = block("jtech_agent", DISPATCH_BODY)
 DISPATCH_MULTILINE = block(
     "jtech_agent",
     "agent_key: auditor\n"
@@ -67,13 +72,39 @@ DISPATCH_MULTILINE = block(
     "\n"
     "Review it.\nRun the tests.\nReport findings.",
 )
-RESULT = block("jtech_result", "status: completed\n\nThe parser change is in place.")
+RESULT_BODY = "status: completed\n\nThe parser change is in place."
+RESULT = block("jtech_result", RESULT_BODY)
 
 
 def test_parse_single_command_block():
     parsed = parse_jtech_reply(command("git status"))
     assert parsed.commands == ["git status"]
     assert parsed.commentary == ""
+
+
+@pytest.mark.parametrize(
+    ("name", "reply"),
+    [
+        ("compact", "[[[jtech_cmd]]]pwd[[[/jtech_cmd]]]"),
+        ("spaced", "[[[jtech_cmd]]] pwd [[[/jtech_cmd]]]"),
+        ("opener shares the payload's first line", "[[[jtech_cmd]]] pwd\n[[[/jtech_cmd]]]"),
+        ("closer shares the payload's last line", "[[[jtech_cmd]]]\npwd [[[/jtech_cmd]]]"),
+        ("multiline", "[[[jtech_cmd]]]\npwd\n[[[/jtech_cmd]]]"),
+        ("tab padded", f"[[[jtech_cmd]]]{TAB}pwd{TAB}[[[/jtech_cmd]]]"),
+        ("blank framing lines", "[[[jtech_cmd]]]\n\n  pwd  \n\n[[[/jtech_cmd]]]"),
+    ],
+)
+def test_every_spelling_of_one_block_runs_the_same_command(name, reply):
+    """Marker placement is presentation, not protocol.
+
+    An exact opening marker starts a payload wherever it appears and its exact
+    matching closer ends it, so the compact, spaced, half-wrapped, and fully
+    multiline spellings are one block. Only the spaces, tabs, and line endings
+    touching the two markers are envelope; nothing else is normalized.
+    """
+    parsed = parse_jtech_reply(reply)
+    assert parsed.commands == ["pwd"], name
+    assert parsed.errors == [], name
 
 
 def test_a_command_body_is_raw_text_that_needs_no_escaping():
@@ -91,12 +122,23 @@ def test_a_command_body_is_raw_text_that_needs_no_escaping():
         "PY"
     )
     assert parse_jtech_reply(command(body)).commands == [body]
+    assert parse_jtech_reply(compact("jtech_cmd", body)).commands == [body]
 
 
-def test_a_command_body_keeps_its_own_blank_lines_and_indentation():
-    """The payload is delivered byte for byte: no trim, no reflow, no repair."""
+def test_only_the_outer_padding_of_a_payload_is_removed():
+    """Internal whitespace and line endings are the command, byte for byte.
+
+    The strip is ``" \\t\\r\\n"`` at the two edges and nothing more: no dedent,
+    no reflow, no collapsing of the payload's own blank lines, and no rewriting
+    of its line endings.
+    """
     body = "  leading spaces\n\n\tif true; then\n\n  fi  "
-    assert parse_jtech_reply(command(body)).commands == [body]
+    assert parse_jtech_reply(command(body)).commands == [
+        "leading spaces\n\n\tif true; then\n\n  fi"
+    ]
+    assert parse_jtech_reply(compact("jtech_cmd", body)).commands == [
+        "leading spaces\n\n\tif true; then\n\n  fi"
+    ]
 
 
 def test_both_structural_line_endings_are_accepted():
@@ -106,17 +148,29 @@ def test_both_structural_line_endings_are_accepted():
     assert parse_jtech_reply("[[[jtech_cmd]]]\r\n\r\n[[[/jtech_cmd]]]").commands == [""]
 
 
-def test_an_empty_body_line_is_a_parseable_empty_command():
-    """Empty is a runtime decision, not a syntax error: the block is well-formed."""
-    parsed = parse_jtech_reply("[[[jtech_cmd]]]\n\n[[[/jtech_cmd]]]")
-    assert parsed.commands == [""]
-    assert parsed.errors == []
-    assert parse_jtech_reply(command("   ")).commands == ["   "]
+@pytest.mark.parametrize(
+    ("name", "reply"),
+    [
+        ("nothing between the markers", "[[[jtech_cmd]]][[[/jtech_cmd]]]"),
+        ("spaces only", "[[[jtech_cmd]]]   [[[/jtech_cmd]]]"),
+        ("one empty line", "[[[jtech_cmd]]]\n\n[[[/jtech_cmd]]]"),
+        ("tabs and newlines", f"[[[jtech_cmd]]]\n{TAB}\n[[[/jtech_cmd]]]"),
+    ],
+)
+def test_an_empty_payload_is_a_parseable_empty_command(name, reply):
+    """Empty is a runtime decision, not a syntax error: the block is well-formed.
+
+    Whitespace-only normalizes to empty rather than being silently discarded,
+    so it reaches the runtime's own explicit empty-command error.
+    """
+    parsed = parse_jtech_reply(reply)
+    assert parsed.commands == [""], name
+    assert parsed.errors == [], name
 
 
 def test_parse_multiple_blocks_in_order():
     reply = (
-        f"{command('ls')}\n\n{command('cat x.txt')}\n"
+        f"{command('ls')}\n\n{compact('jtech_cmd', 'cat x.txt')}\n"
         f"{command('echo hi')}\n\nI will review the results next."
     )
     parsed = parse_jtech_reply(reply)
@@ -124,119 +178,54 @@ def test_parse_multiple_blocks_in_order():
     assert parsed.commentary == "I will review the results next."
 
 
-def test_prose_and_markdown_examples_are_not_executable():
-    reply = f"Run this next: {command('ls')}\n\nThen continue."
-    assert parse_jtech_reply(reply).commands == []
-    assert parse_jtech_reply("Run this:\n\n```cmd\npwd\n```").commands == []
-    assert parse_jtech_reply(f"<code>pwd\n{command('ls')}</code>").commands == []
-
-
-def test_a_fenced_block_is_reported_rather_than_silently_dropped():
-    """The shape that ended a turn in silence: a wrapped, well-formed block.
-
-    It still must not execute — being told why it did not is what was missing,
-    because a reply with no block and no diagnostic is a final answer.
-    """
-    reply = f"Sure! Let me look.\n\n```\n{command('ls -la')}\n```\n"
+def test_several_compact_blocks_share_one_line_in_source_order():
+    reply = "First [[[jtech_cmd]]]ls[[[/jtech_cmd]]] then [[[jtech_cmd]]]pwd[[[/jtech_cmd]]]."
     parsed = parse_jtech_reply(reply)
-    assert parsed.commands == []
-    assert [error.tool_name for error in parsed.errors] == ["jtech_cmd"]
-    assert parsed.errors[0].line == 4
-    assert "did not run" in parsed.errors[0].message
+    assert parsed.commands == ["ls", "pwd"]
+    assert parsed.errors == []
 
 
 @pytest.mark.parametrize(
     ("name", "reply"),
     [
-        ("indented opener", "  [[[jtech_cmd]]]\necho safe\n[[[/jtech_cmd]]]"),
-        ("bulleted opener", "- [[[jtech_cmd]]]\necho safe\n[[[/jtech_cmd]]]"),
-        ("fenced opener", "```\n[[[jtech_cmd]]]\necho safe\n```\n[[[/jtech_cmd]]]"),
+        ("indented", "    [[[jtech_cmd]]]ls[[[/jtech_cmd]]]"),
+        ("tab indented", f"{TAB}[[[jtech_cmd]]]ls[[[/jtech_cmd]]]"),
+        ("bulleted", "- [[[jtech_cmd]]]ls[[[/jtech_cmd]]]"),
+        ("ordered list item", "1. [[[jtech_cmd]]]ls[[[/jtech_cmd]]]"),
+        ("task list item", "- [x] [[[jtech_cmd]]]ls[[[/jtech_cmd]]]"),
+        ("blockquote", "> [[[jtech_cmd]]]ls[[[/jtech_cmd]]]"),
+        ("bold", "**[[[jtech_cmd]]]ls[[[/jtech_cmd]]]**"),
+        ("inline code span", "`[[[jtech_cmd]]]ls[[[/jtech_cmd]]]`"),
+        ("table cell", "| [[[jtech_cmd]]]ls[[[/jtech_cmd]]] |"),
+        ("backtick fence", f"```\n{command('ls')}\n```"),
+        ("longer fence quoting a shorter one", f"````\n```\n{command('ls')}\n```\n````"),
+        ("tilde fence", f"~~~\n{command('ls')}\n~~~"),
+        ("fence with an info string", f"```bash\n{command('ls')}\n```"),
+        ("html code block", f"<code>\n{command('ls')}\n</code>"),
+        ("indented whole block", decorate(command("ls"), "  ")),
     ],
 )
-def test_a_wrapper_on_one_delimiter_still_names_the_wrapper(name, reply):
-    """A block spans lines, so its two delimiters can fail in different ways.
+def test_markdown_around_a_block_is_presentation_not_protocol(name, reply):
+    """Framing depends on protocol tokens alone, never on how they are laid out.
 
-    Decorating only the opener leaves the closer bare, which reports that it
-    closed nothing — true, but it names the wrong line and says nothing about
-    the indent, bullet, or fence that actually stopped the block. Reporting one
-    kind of diagnostic *instead of* the other leaves the model correcting a line
-    that was never the problem, and protocol correction has no round budget to
-    absorb that.
+    A fence, an indent, a list marker, a quote marker, emphasis, a code span,
+    and an HTML wrapper are all how a model presents text; none of them is part
+    of this format, so none of them can decide whether a complete pair of
+    markers is a block.
     """
     parsed = parse_jtech_reply(reply)
-    assert parsed.commands == [], name
-    messages = [error.message for error in parsed.errors]
-    assert any("did not run" in message for message in messages), name
-    assert any("never opened" in message for message in messages), name
-    assert [error.line for error in parsed.errors] == sorted(
-        error.line for error in parsed.errors
-    ), name
+    assert parsed.commands == ["ls"], name
+    assert parsed.errors == [], name
 
 
-@pytest.mark.parametrize(
-    "reply",
-    [
-        decorate(command("ls"), "- "),
-        decorate(command("ls"), "* "),
-        decorate(command("ls"), "1. "),
-        decorate(command("ls"), "> "),
-        decorate(command("ls"), "**", "**"),
-        decorate(command("ls"), "`", "`"),
-        decorate(command("ls"), "### "),
-        # GFM: a task box carries a letter, strikethrough and table cells
-        # carry punctuation no allowlist of decoration ever finished naming.
-        decorate(command("ls"), "- [ ] "),
-        decorate(command("ls"), "- [x] "),
-        decorate(command("ls"), "* [X] "),
-        decorate(command("ls"), "  - [ ] "),
-        decorate(command("ls"), "> - [x] "),
-        # A task box rides an ordered list too, and only the checked box
-        # carries the letter the prefix rule stops on.
-        decorate(command("ls"), "1. [ ] "),
-        decorate(command("ls"), "1. [x] "),
-        decorate(command("ls"), "1) [X] "),
-        decorate(command("ls"), "10. [x] "),
-        decorate(command("ls"), "  3. [x] "),
-        decorate(command("ls"), "> 2) [x] "),
-        decorate(command("ls"), "~~", "~~"),
-        decorate(command("ls"), "| ", " |"),
-        decorate(command("ls"), "    "),
-        decorate(command("ls"), TAB),
-        "[[[jtech\\_cmd]]]\nls\n[[[/jtech\\_cmd]]]",
-        f"Here:\n<code>{command('ls')}</code>",
-        f"```{command('ls')}",
-    ],
-)
-def test_a_lone_decorated_block_is_reported_not_executed(reply):
+def test_a_block_shares_its_line_with_the_prose_around_it():
+    reply = "Checking now: [[[jtech_cmd]]]pwd[[[/jtech_cmd]]] then I will inspect the result."
     parsed = parse_jtech_reply(reply)
-    assert parsed.commands == []
-    assert [error.tool_name for error in parsed.errors] == ["jtech_cmd"]
-
-
-@pytest.mark.parametrize(
-    "reply",
-    [
-        "Run this next: [[[jtech_cmd]]] with the command inside it.",
-        "The tool is opened with [[[jtech_cmd]]] in this CLI.",
-        "- To run a command, open with `[[[jtech_cmd]]]` on its own line.",
-        "- [ ] Then open a [[[jtech_cmd]]] block yourself.",
-        "1. [x] Then open a [[[jtech_cmd]]] block yourself.",
-        "Run this:\n\n```cmd\npwd\n```",
-        '```\n_JTECH_CMD = "jtech_cmd"\n```',
-        "```\n    self.result = run([[[jtech_cmd]]])\n```",
-        "Nothing to run here.",
-    ],
-)
-def test_a_mention_inside_prose_stays_ordinary_commentary(reply):
-    """A letter between the line's start and the delimiter means prose.
-
-    Prose is how the protocol gets discussed at all, so a sentence that merely
-    names a delimiter must never become a diagnostic — including a sentence
-    that happens to sit in a list item or a fenced block of source.
-    """
-    parsed = parse_jtech_reply(reply)
-    assert parsed.commands == []
+    assert parsed.commands == ["pwd"]
     assert parsed.errors == []
+    assert "Checking now:" in parsed.commentary
+    assert "then I will inspect the result." in parsed.commentary
+    assert "jtech_cmd" not in parsed.commentary
 
 
 @pytest.mark.parametrize(
@@ -247,95 +236,21 @@ def test_a_mention_inside_prose_stays_ordinary_commentary(reply):
         'jtech_agent("coder", "Coder", "local", "t", "do it")',
         'jtech_result("completed", "done")',
         'jtech_cmd("ls") jtech_cmd("pwd")',
+        '```\n_JTECH_CMD = "jtech_cmd"\n```',
+        "Nothing to run here.",
     ],
 )
-def test_the_retired_call_syntax_is_inert_ordinary_prose(reply):
+def test_text_carrying_no_marker_is_ordinary_prose(reply):
     """The migration is hard: an old call never executes and never diagnoses.
 
     Nothing translates it, because a silent conversion would resurrect the
-    quoting rules the block format exists to delete. It is text like any other.
+    quoting rules the block format exists to delete. Only the bracketed marker
+    tokens are protocol; a bare tool name is text like any other.
     """
     parsed = parse_jtech_reply(reply)
     assert parsed.commands == []
     assert parsed.dispatches == []
     assert parsed.result is None
-    assert parsed.errors == []
-
-
-BT3, BT4, TL3, TL4 = "`" * 3, "`" * 4, "~" * 3, "~" * 4
-MULTILINE_COMMAND = command("pwd\nls -la")
-
-
-@pytest.mark.parametrize(
-    ("name", "reply"),
-    [
-        ("longer backtick fence quotes a shorter one",
-         f"{BT4}\n{BT3}\n{command('echo x')}\n{BT3}\n{BT4}"),
-        ("longer tilde fence quotes a shorter one",
-         f"{TL4}\n{TL3}\n{command('echo x')}\n{TL3}\n{TL4}"),
-        ("tilde fence", f"{TL3}\n{command('echo x')}\n{TL3}"),
-        ("fence carrying an info string",
-         f"{BT3}python\n{command('echo x')}\n{BT3}"),
-        ("fence indented inside a list item",
-         f"- Example:\n\n  {BT3}\n{decorate(command('echo x'), '  ')}\n  {BT3}\n"),
-        ("four-space indented code block",
-         f"Example:\n\n{decorate(command('echo x'), '    ')}\n"),
-        ("tab indented code block",
-         f"Example:\n\n{decorate(command('echo x'), TAB)}\n"),
-    ],
-)
-def test_every_markdown_code_block_form_is_inert_and_reported(name, reply):
-    """A code block is a code block however Markdown spells it.
-
-    Closing a four-backtick fence on a three-backtick line, or missing tildes
-    and indentation entirely, hands the block's contents to the scanner as
-    executable text — the model can then be made to run a command by quoting
-    one.
-    """
-    parsed = parse_jtech_reply(reply)
-    assert parsed.commands == [], name
-    assert [error.tool_name for error in parsed.errors] == ["jtech_cmd"], name
-
-
-@pytest.mark.parametrize(
-    ("name", "reply", "tool"),
-    [
-        ("multiline command", f"{BT3}\n{MULTILINE_COMMAND}\n{BT3}", "jtech_cmd"),
-        ("multiline task", f"{BT3}\n{DISPATCH_MULTILINE}\n{BT3}", "jtech_agent"),
-        ("unterminated block", f"{BT3}\n[[[jtech_cmd]]]\nls\n{BT3}", "jtech_cmd"),
-    ],
-)
-def test_a_wrapped_block_is_reported_whatever_shape_it_takes(name, reply, tool):
-    """Recognition must not depend on the wrapped block being well-formed.
-
-    A wrapped block is the model asking for a tool it will not get, however it
-    is spelled. Failing to recognize one leaves the reply with no block and no
-    diagnostic, which ends the turn in silence.
-    """
-    parsed = parse_jtech_reply(reply)
-    assert parsed.commands == [], name
-    assert parsed.dispatches == [], name
-    assert [error.tool_name for error in parsed.errors] == [tool], name
-
-
-def test_a_block_must_start_at_column_zero_to_run():
-    """Indentation is a code block, so it cannot also be permitted whitespace."""
-    assert parse_jtech_reply(command("ls")).commands == ["ls"]
-    assert parse_jtech_reply(MULTILINE_COMMAND).commands == ["pwd\nls -la"]
-    indented = parse_jtech_reply(decorate(command("ls"), "  "))
-    assert indented.commands == []
-    assert [error.tool_name for error in indented.errors] == ["jtech_cmd"]
-
-
-def test_a_wrapped_example_never_blocks_a_real_block_in_the_same_reply():
-    """A near miss is reported only when the reply ran nothing.
-
-    Something executed means the turn continues and the model sees output, so
-    a diagnostic would cost a round without preventing any silence.
-    """
-    reply = f"Like this:\n\n```\n{command('ls')}\n```\n\n{command('pwd')}"
-    parsed = parse_jtech_reply(reply)
-    assert parsed.commands == ["pwd"]
     assert parsed.errors == []
 
 
@@ -349,7 +264,7 @@ def test_command_prefix_can_include_commentary_after_blank_line():
 def test_command_suffix_can_follow_a_prose_preamble():
     reply = (
         "I will inspect the project structure first.\n\n"
-        f"{command('ls -la')}\n{command('git status')}"
+        f"{compact('jtech_cmd', 'ls -la')}\n{compact('jtech_cmd', 'git status')}"
     )
     parsed = parse_jtech_reply(reply)
     assert parsed.commands == ["ls -la", "git status"]
@@ -358,7 +273,7 @@ def test_command_suffix_can_follow_a_prose_preamble():
 
 def test_commands_can_be_interleaved_with_commentary():
     reply = (
-        f"{command('cat prompts.py')}\n"
+        f"{compact('jtech_cmd', 'cat prompts.py')}\n"
         "Let me read the prompt loader.\n"
         f"{command('cat commands.py')}\n"
         "Let me read the commands module."
@@ -368,14 +283,6 @@ def test_commands_can_be_interleaved_with_commentary():
     assert "Let me read the prompt loader." in parsed.commentary
     assert "Let me read the commands module." in parsed.commentary
     assert "jtech_cmd" not in parsed.commentary
-
-
-def test_inline_block_like_text_is_not_executable():
-    reply = (
-        f"{command('pwd')}\n\nI will explain this.\n\n"
-        "Here is [[[jtech_cmd]]] in prose."
-    )
-    assert parse_jtech_reply(reply).commands == ["pwd"]
 
 
 def test_prose_after_single_newline_invalidates_command_prefix():
@@ -390,78 +297,164 @@ def test_an_empty_reply_parses_to_nothing_at_all():
     assert parsed.errors == []
 
 
-NESTED_BLOCK = (
-    "[[[jtech_cmd]]]\nls\n"
-    + block(
-        "jtech_agent",
-        "agent_key: a\nagent_label: A\nprofile_name: local\ntask_label: t\n\nx",
-    )
+@pytest.mark.parametrize(
+    ("name", "reply"),
+    [
+        ("marker named in prose", "Open a [[[jtech_agent]]] block when you delegate."),
+        ("marker in a code span", "- Finish by writing `[[[jtech_result]]]`."),
+        ("marker mid-sentence", "The tool is opened with [[[jtech_cmd]]] in this CLI."),
+        ("stray closer after prose", "I am done.\n[[[/jtech_cmd]]]"),
+        ("closer alone", "[[[/jtech_result]]]"),
+    ],
 )
+def test_a_marker_reached_through_prose_is_ordinary_text(name, reply):
+    """Prose is how the protocol gets discussed at all.
+
+    A response carrying no block can name a marker in a sentence without
+    costing a corrective round: the words before it are what say it was never
+    a tool call. A closing marker is prose too, because nothing was cut short
+    when nothing was opened.
+    """
+    parsed = parse_jtech_reply(reply)
+    assert parsed.commands == [], name
+    assert parsed.dispatches == [], name
+    assert parsed.result is None, name
+    assert parsed.errors == [], name
 
 
 @pytest.mark.parametrize(
-    ("name", "reply", "tool", "line", "fragment"),
+    ("name", "reply", "line", "fragment"),
     [
         (
-            "inline block",
-            "[[[jtech_cmd]]]pwd[[[/jtech_cmd]]]",
-            "jtech_protocol",
+            "unterminated opener",
+            "[[[jtech_cmd]]]\nls",
             1,
-            "is not a JTECH protocol delimiter",
+            "was never closed by [[[/jtech_cmd]]]",
         ),
         (
-            "trailing space on an opener",
-            "[[[jtech_cmd]]] \nls\n[[[/jtech_cmd]]]",
-            "jtech_protocol",
-            1,
-            "'[[[jtech_cmd]]] '",
-        ),
-        (
-            "trailing text on an opener",
-            "[[[jtech_cmd]]] now\nls\n[[[/jtech_cmd]]]",
-            "jtech_protocol",
-            1,
-            "is not a JTECH protocol delimiter",
-        ),
-        (
-            "misspelled tool name",
-            "[[[jtech_command]]]\nls\n[[[/jtech_command]]]",
-            "jtech_protocol",
-            1,
-            "is not a JTECH protocol delimiter",
-        ),
-        (
-            "stray closing delimiter",
-            "I am done.\n[[[/jtech_cmd]]]",
-            "jtech_cmd",
+            "unterminated opener after a preamble",
+            "I will inspect this.\n[[[jtech_cmd]]] ls -la",
             2,
-            "closes a block that was never opened",
+            "was never closed by [[[/jtech_cmd]]]",
         ),
         (
-            "mismatched closing delimiter",
+            "unterminated opener behind an indent",
+            "Sure.\n    [[[jtech_cmd]]] ls -la",
+            2,
+            "was never closed by [[[/jtech_cmd]]]",
+        ),
+        (
+            "mismatched names",
             "[[[jtech_cmd]]]\nls\n[[[/jtech_agent]]]",
-            "jtech_cmd",
-            3,
-            "must be closed by [[[/jtech_cmd]]], not [[[/jtech_agent]]]",
-        ),
-        ("nested block", NESTED_BLOCK, "jtech_cmd", 3, "cannot nest"),
-        ("unterminated block", "[[[jtech_cmd]]]\nls", "jtech_cmd", 1, "never closed"),
-        (
-            "no body line",
-            "[[[jtech_cmd]]]\n[[[/jtech_cmd]]]",
-            "jtech_cmd",
             1,
-            "must be followed by a body line",
+            "was never closed by [[[/jtech_cmd]]]",
+        ),
+        (
+            "unterminated result",
+            "[[[jtech_result]]]\nstatus: completed",
+            1,
+            "was never closed by [[[/jtech_result]]]",
+        ),
+        (
+            "unknown tool name",
+            "[[[jtech_command]]]ls[[[/jtech_command]]]",
+            1,
+            "names no JTECH tool",
+        ),
+        (
+            "unknown multi-word name",
+            "[[[jtech_bad_tool]]]ls[[[/jtech_bad_tool]]]",
+            1,
+            "names no JTECH tool",
+        ),
+        ("bare namespace token", "[[[jtech]]]ls[[[/jtech]]]", 1, "names no JTECH tool"),
+    ],
+)
+def test_a_truncated_tool_attempt_is_refused_rather_than_answered(
+    name, reply, line, fragment
+):
+    """An opening marker that begins its own line is a block being started.
+
+    That is the shape a stream cut off mid-block leaves, and it is the one
+    position that separates a tool attempt from prose. Read as commentary it
+    would end a primary turn as the final answer, with the work unstarted and
+    nothing said about why.
+    """
+    parsed = parse_jtech_reply(reply)
+    assert parsed.commands == [], name
+    assert parsed.dispatches == [], name
+    assert parsed.result is None, name
+    assert parsed.errors, name
+    error = parsed.errors[0]
+    assert error.tool_name == "jtech_protocol", name
+    assert error.line == line, name
+    assert fragment in error.message, name
+
+
+def test_a_marker_left_over_beside_a_block_refuses_the_whole_response():
+    """Atomicity where a leftover marker means the block may be a fragment."""
+    parsed = parse_jtech_reply(f"{compact('jtech_cmd', 'ls')}\n[[[/jtech_agent]]]")
+    assert parsed.commands == ["ls"]
+    assert [(error.tool_name, error.line) for error in parsed.errors] == [
+        ("jtech_protocol", 2)
+    ]
+    assert "belongs to no complete block" in parsed.errors[0].message
+
+
+def test_prose_naming_a_marker_costs_a_round_once_a_block_is_present():
+    """The price of that atomicity, and where it is paid.
+
+    A response with no block may say ``[[[jtech_agent]]]`` freely. Once it
+    carries one, a leftover marker cannot be told apart from a payload cut
+    short at an earlier closer, and the fragment that survived must not reach
+    the shell — so the mention is refused along with everything else. The round
+    is spent on a response that was already working, never on one that would
+    otherwise have ended the turn.
+    """
+    alone = parse_jtech_reply("A [[[jtech_agent]]] block delegates work.")
+    assert alone.errors == []
+
+    beside = parse_jtech_reply(
+        f"{compact('jtech_cmd', 'ls')} — a [[[jtech_agent]]] block delegates instead."
+    )
+    assert beside.commands == ["ls"]
+    assert [error.line for error in beside.errors] == [1]
+
+
+@pytest.mark.parametrize(
+    ("name", "reply", "line", "fragment"),
+    [
+        (
+            "opener nested in a command payload",
+            "[[[jtech_cmd]]]ls\n[[[jtech_agent]]]\nx[[[/jtech_cmd]]]",
+            2,
+            "appears inside a [[[jtech_cmd]]] block's payload",
+        ),
+        (
+            "closer for another tool nested in a payload",
+            "[[[jtech_cmd]]]ls[[[/jtech_agent]]]x[[[/jtech_cmd]]]",
+            1,
+            "cannot nest",
+        ),
+        (
+            "unknown multi-word name nested in a payload",
+            "[[[jtech_cmd]]]ls\n[[[jtech_bad_tool]]]\nx[[[/jtech_cmd]]]",
+            2,
+            "cannot nest",
         ),
     ],
 )
-def test_a_malformed_block_is_a_line_numbered_error(name, reply, tool, line, fragment):
-    """A delimiter the model got wrong is refused out loud, never demoted to prose."""
+def test_a_nested_marker_is_a_line_numbered_error(name, reply, line, fragment):
+    """A lazy match must not conceal a tool call written inside a payload.
+
+    This is the one marker that is not ordinary text. Outside a block a stray
+    marker is prose the model can see for itself; inside one it would be handed
+    to the shell as payload, which is the concealment worth a round to refuse.
+    """
     parsed = parse_jtech_reply(reply)
-    assert parsed.commands == [], name
     assert parsed.errors, name
     error = parsed.errors[0]
-    assert error.tool_name == tool, name
+    assert error.tool_name == "jtech_protocol", name
     assert error.line == line, name
     assert fragment in error.message, name
 
@@ -469,10 +462,12 @@ def test_a_malformed_block_is_a_line_numbered_error(name, reply, tool, line, fra
 def test_a_payload_carrying_its_own_closer_ends_the_reply_atomically():
     """The documented collision boundary, and the one shape it can take.
 
-    The first standalone closer closes the block, so the rest of the intended
-    payload becomes stray text. Nothing repairs it — an escape hatch would be a
-    second payload language — but the leftover closer is an error, so the
-    runtime executes none of the reply.
+    The first matching closer ends the block, so the rest of the intended
+    payload becomes commentary and the command that survived is a fragment —
+    here a heredoc with no terminator. Nothing repairs it; an escape hatch
+    would be a second payload language. What the leftover marker does is prove
+    the fragment is one, so the whole reply is refused and the truncated
+    command never reaches the shell.
     """
     reply = (
         "[[[jtech_cmd]]]\n"
@@ -482,27 +477,32 @@ def test_a_payload_carrying_its_own_closer_ends_the_reply_atomically():
         "[[[/jtech_cmd]]]"
     )
     parsed = parse_jtech_reply(reply)
+    # Parsed for diagnosis, never executed: the error is what the runtime reads.
     assert parsed.commands == ["cat <<'EOF' > note.md"]
     assert [(error.tool_name, error.line) for error in parsed.errors] == [
-        ("jtech_cmd", 5)
+        ("jtech_protocol", 5)
     ]
-    assert "never opened" in parsed.errors[0].message
+    assert "belongs to no complete block" in parsed.errors[0].message
 
 
 def test_error_lines_are_one_based_in_the_original_reply():
-    reply = "\n\nfirst line of prose\n\n[[[jtech_cmd]]]\nls"
-    assert parse_jtech_reply(reply).errors[0].line == 5
+    reply = "\n\nfirst line of prose\n\n" + block("jtech_cmd", "ls\n[[[jtech_agent]]]")
+    assert parse_jtech_reply(reply).errors[0].line == 7
 
 
 def test_diagnostics_are_reported_in_line_order():
     """One reply's errors read top to bottom, whichever stage produced them.
 
-    The status is rejected by the boundary type after the scan finished, so
-    without a merge the reply's own order would not survive into the report.
+    The status is rejected by the boundary type after every nested marker was
+    collected, so without a merge the reply's own order would not survive into
+    the report.
     """
     bad_status = block("jtech_result", "status: nonsense\n\nx")
-    reply = f"{bad_status}\n[[[/jtech_cmd]]]"
-    assert [error.line for error in parse_jtech_reply(reply).errors] == [1, 6]
+    nested = block("jtech_cmd", "ls\n[[[jtech_agent]]]")
+    assert [error.line for error in parse_jtech_reply(f"{bad_status}\n{nested}").errors] == [
+        1,
+        8,
+    ]
 
 
 # ---------------------------------------------------------- agent dispatch
@@ -526,6 +526,14 @@ def test_parse_one_dispatch_keeps_every_field_and_the_commentary():
     assert "jtech_agent" not in parsed.commentary
 
 
+def test_a_compact_dispatch_carries_the_same_headers_and_task():
+    """The opening marker may share the first header's line, and the closing
+    marker the task's last line: the body between them is identical."""
+    parsed = parse_jtech_reply(compact("jtech_agent", DISPATCH_BODY))
+    assert parsed.errors == []
+    assert parsed.dispatches == parse_jtech_reply(DISPATCH).dispatches
+
+
 def test_parse_multiline_task_as_raw_text():
     parsed = parse_jtech_reply(DISPATCH_MULTILINE)
     assert parsed.errors == []
@@ -534,7 +542,7 @@ def test_parse_multiline_task_as_raw_text():
 
 def test_a_colon_inside_a_header_value_is_ordinary_data():
     """Only the first colon frames a header; the value owns every later one."""
-    reply = block(
+    reply = compact(
         "jtech_agent",
         "agent_key: coder\n"
         "agent_label: Coder: the implementer\n"
@@ -549,12 +557,8 @@ def test_a_colon_inside_a_header_value_is_ordinary_data():
     assert dispatch.task == "Fix it: carefully."
 
 
-def test_a_delimiter_line_inside_a_task_belongs_to_that_task():
-    """Only an exact JTECH delimiter is structure.
-
-    An indented delimiter and the retired call syntax are both look-alike
-    text, so both stay inside the task rather than becoming protocol.
-    """
+def test_the_retired_call_syntax_inside_a_task_belongs_to_that_task():
+    """Only a bracketed marker is structure, so a bare tool name stays payload."""
     reply = block(
         "jtech_agent",
         "agent_key: a\n"
@@ -563,18 +567,33 @@ def test_a_delimiter_line_inside_a_task_belongs_to_that_task():
         "task_label: t\n"
         "\n"
         "Do this:\n"
-        "  [[[jtech_cmd]]]\n"
         'and never jtech_cmd("rm -rf /").',
     )
     parsed = parse_jtech_reply(reply)
     assert parsed.commands == []
     assert parsed.errors == []
-    assert "[[[jtech_cmd]]]" in parsed.dispatches[0].task
+    assert 'jtech_cmd("rm -rf /")' in parsed.dispatches[0].task
+
+
+def test_a_marker_inside_a_task_is_a_nested_tool_attempt():
+    """A lazy match must not conceal a tool call written inside a payload."""
+    reply = block(
+        "jtech_agent",
+        "agent_key: a\nagent_label: A\nprofile_name: local\ntask_label: t\n"
+        "\nRun [[[jtech_cmd]]]ls[[[/jtech_cmd]]] first.",
+    )
+    parsed = parse_jtech_reply(reply)
+    assert parsed.commands == []
+    assert [error.tool_name for error in parsed.errors] == [
+        "jtech_protocol",
+        "jtech_protocol",
+    ]
+    assert all("cannot nest" in error.message for error in parsed.errors)
 
 
 def test_several_dispatches_parse_in_source_order():
     reply = (
-        block(
+        compact(
             "jtech_agent",
             "agent_key: b\nagent_label: B\nprofile_name: local\n"
             "task_label: t2\n\nsecond",
@@ -606,34 +625,12 @@ def test_dispatch_fields_are_stripped_not_truncated():
     assert dispatch == AgentDispatch("coder", "Coder", "local", "Task", "do it")
 
 
-def test_dispatch_examples_inside_code_blocks_stay_inert():
-    """Inert means not executed — for a fenced block it does not mean unreported.
-
-    A fence around a whole, well-formed block is the model asking for a tool it
-    will not get, so it is refused out loud. An inline mention inside a
-    sentence is ordinary prose and stays silent.
-    """
-    fenced = f"Example:\n\n```\n{DISPATCH}\n```\n"
-    assert parse_jtech_reply(fenced).dispatches == []
-    assert [error.tool_name for error in parse_jtech_reply(fenced).errors] == [
-        "jtech_agent"
-    ]
-    inline = "Open a [[[jtech_agent]]] block when you delegate."
-    assert parse_jtech_reply(inline).dispatches == []
-    assert parse_jtech_reply(inline).errors == []
-
-
-def test_a_whole_response_html_wrapper_no_longer_carries_a_dispatch():
-    """The wrapper unwrap is gone: an HTML-wrapped block is inert and reported.
-
-    Unwrapping it turned a quoted example into an executable block, which is
-    the exact confusion between showing syntax and running it that every other
-    wrapper rule prevents.
-    """
-    parsed = parse_jtech_reply(f"<code>\n{DISPATCH}\n</code>")
-    assert parsed.dispatches == []
-    assert [error.tool_name for error in parsed.errors] == ["jtech_agent"]
-    assert "did not run" in parsed.errors[0].message
+def test_a_fenced_dispatch_is_a_dispatch():
+    """A fence is presentation. A model that wants to show the syntax without
+    calling the tool describes it in a sentence instead of writing markers."""
+    parsed = parse_jtech_reply(f"Example:\n\n```\n{DISPATCH}\n```\n")
+    assert parsed.errors == []
+    assert [d.agent_key for d in parsed.dispatches] == ["coder"]
 
 
 @pytest.mark.parametrize(
@@ -738,16 +735,16 @@ def test_a_whole_response_html_wrapper_no_longer_carries_a_dispatch():
             5,
             "exactly one empty line must separate",
         ),
-        (
-            "headers only",
-            "agent_key: a\nagent_label: C\nprofile_name: local\ntask_label: t",
-            0,
-            "then one empty line, then the task",
-        ),
     ],
 )
 def test_invalid_dispatches_become_line_numbered_errors(name, body, offset, fragment):
-    """``offset`` is the reported line's distance from the opening delimiter."""
+    """``offset`` is the reported line's distance from the opening marker.
+
+    The multiline spelling puts the first header one line below the marker and
+    the compact spelling puts it on the marker's own line, so the same defect
+    is reported one line apart. Both are checked: a diagnostic that counted
+    from the marker alone would name the wrong line in a compact block.
+    """
     parsed = parse_jtech_reply(block("jtech_agent", body))
     assert parsed.dispatches == [], name
     assert len(parsed.errors) == 1, name
@@ -756,18 +753,77 @@ def test_invalid_dispatches_become_line_numbered_errors(name, body, offset, frag
     assert error.line == 1 + offset, name
     assert fragment in error.message, name
 
+    compact_parsed = parse_jtech_reply(compact("jtech_agent", body))
+    assert compact_parsed.dispatches == [], name
+    assert len(compact_parsed.errors) == 1, name
+    assert compact_parsed.errors[0].line == 1 + max(offset - 1, 0), name
+    assert fragment in compact_parsed.errors[0].message, name
+
+
+def test_a_structured_body_keeps_its_tail_so_an_empty_field_is_named():
+    """Only the leading padding is envelope for a block that carries headers.
+
+    A structured body ends in its task or report, and that field has a boundary
+    type to normalize and reject it. Stripping the body's tail here would take
+    the empty separator line with it, so a model that wrote the shape correctly
+    and left the report blank was told its block was the wrong shape — the one
+    defect it had not committed.
+    """
+    for body, fragment in (
+        ("status: completed\n\n   ", "content must not be empty"),
+        ("status: completed\n\n\n\n", "content must not be empty"),
+    ):
+        parsed = parse_jtech_reply(block("jtech_result", body))
+        assert parsed.result is None, body
+        assert [error.line for error in parsed.errors] == [1], body
+        assert fragment in parsed.errors[0].message, body
+
+    dispatch_body = (
+        "agent_key: a\nagent_label: C\nprofile_name: local\ntask_label: t\n\n \t"
+    )
+    parsed = parse_jtech_reply(block("jtech_agent", dispatch_body))
+    assert parsed.dispatches == []
+    assert "task must not be empty" in parsed.errors[0].message
+
+
+def test_a_payload_field_still_keeps_its_own_trailing_text():
+    """Leaving the tail to the boundary type costs the payload nothing.
+
+    The report's own trailing spaces come off in :class:`AgentResult`, exactly
+    as they did when the parser took them, so both spellings still deliver the
+    same report.
+    """
+    report = "status: completed\n\n  Ran the tests.\n\n  12 passed.  "
+    for reply in (block("jtech_result", report), compact("jtech_result", report)):
+        parsed = parse_jtech_reply(reply)
+        assert parsed.errors == []
+        assert parsed.result.content == "Ran the tests.\n\n  12 passed."
+
+
+def test_headers_with_nothing_after_them_are_told_what_is_missing():
+    """The two spellings of "headers and nothing else" are different bodies.
+
+    The newline before a multiline closer is the empty separator line the
+    format requires, so that body has a separator and an empty task. The
+    compact body has neither, so it is short of the shape itself. Each is told
+    what it actually lacks rather than one message being made to cover both.
+    """
+    headers = "agent_key: a\nagent_label: C\nprofile_name: local\ntask_label: t"
+    multiline = parse_jtech_reply(block("jtech_agent", headers))
+    assert [error.line for error in multiline.errors] == [1]
+    assert "task must not be empty" in multiline.errors[0].message
+
+    compacted = parse_jtech_reply(compact("jtech_agent", headers))
+    assert [error.line for error in compacted.errors] == [1]
+    assert "then one empty line, then the task" in compacted.errors[0].message
+
+    status = parse_jtech_reply(compact("jtech_result", "status: completed"))
+    assert [error.line for error in status.errors] == [1]
+    assert "then one empty line, then the report" in status.errors[0].message
 
 def test_a_multiline_label_is_rejected_by_the_boundary_type():
     with pytest.raises(ValueError, match="agent_label must be a single line"):
         AgentDispatch("a", "one\ntwo", "local", "t", "x")
-
-
-def test_one_parse_error_keeps_every_other_block_out_of_the_result():
-    """The runtime executes nothing from a reply with any error, so the
-    caller must be able to see both the error and that nothing is missing."""
-    parsed = parse_jtech_reply(f"{command('ls')}\n[[[/jtech_agent]]]")
-    assert parsed.commands == ["ls"]
-    assert len(parsed.errors) == 1
 
 
 def test_a_reply_can_carry_both_tool_kinds_for_the_runtime_to_refuse():
@@ -779,7 +835,7 @@ def test_a_reply_can_carry_both_tool_kinds_for_the_runtime_to_refuse():
 
 def test_duplicate_agent_keys_are_reported_for_the_whole_batch():
     reply = "\n".join(
-        block(
+        compact(
             "jtech_agent",
             f"agent_key: {key}\nagent_label: {key.upper()}\n"
             f"profile_name: local\ntask_label: {label}\n\n{task}",
@@ -806,8 +862,14 @@ def test_a_completed_result_parses_into_the_boundary_value():
     assert parsed.errors == []
 
 
+def test_a_compact_result_ends_a_turn_exactly_like_a_multiline_one():
+    parsed = parse_jtech_reply(compact("jtech_result", RESULT_BODY))
+    assert parsed.errors == []
+    assert parsed.result == AgentResult("completed", "The parser change is in place.")
+
+
 def test_a_failed_result_keeps_its_own_status():
-    reply = block("jtech_result", "status: failed\n\nThe toolchain is missing.")
+    reply = compact("jtech_result", "status: failed\n\nThe toolchain is missing.")
     assert parse_jtech_reply(reply).result == AgentResult(
         "failed", "The toolchain is missing."
     )
@@ -848,7 +910,6 @@ def test_a_report_loses_its_padding_and_keeps_its_own_newlines():
             3,
             "exactly one empty line must separate",
         ),
-        ("header only", "status: completed", 1, "then one empty line, then the report"),
     ],
 )
 def test_an_invalid_result_is_reported_and_carries_no_status(
@@ -866,15 +927,15 @@ def test_an_invalid_result_is_reported_and_carries_no_status(
 @pytest.mark.parametrize(
     "reply",
     [
-        "[[[jtech_result]]]\nstatus: completed",
+        "[[[jtech_result]]][[[/jtech_result]]]",
         "[[[jtech_result]]]\n[[[/jtech_result]]]",
-        "[[[/jtech_result]]]",
+        "[[[jtech_result]]]   [[[/jtech_result]]]",
     ],
 )
-def test_a_broken_result_block_is_a_failed_block_not_prose(reply):
-    """The same rule as the executable tools: a delimiter line is a request.
+def test_an_empty_result_block_is_a_failed_block_not_a_status(reply):
+    """A complete pair is a request, so an empty one is refused, not ignored.
 
-    Reverting a malformed one to commentary would end a subagent's turn in the
+    Letting it fall through as commentary would end a subagent's turn in the
     silence the diagnostics exist to prevent.
     """
     parsed = parse_jtech_reply(reply)
@@ -885,14 +946,14 @@ def test_a_broken_result_block_is_a_failed_block_not_prose(reply):
 def test_two_results_in_one_reply_leave_no_result_at_all():
     """A boundary carrying both an error and a usable status contradicts itself."""
     reply = (
-        block("jtech_result", "status: completed\n\na")
+        compact("jtech_result", "status: completed\n\na")
         + "\n"
-        + block("jtech_result", "status: failed\n\nb")
+        + compact("jtech_result", "status: failed\n\nb")
     )
     parsed = parse_jtech_reply(reply)
     assert parsed.result is None
     assert [(error.tool_name, error.line) for error in parsed.errors] == [
-        ("jtech_result", 6)
+        ("jtech_result", 4)
     ]
     assert "only once" in parsed.errors[0].message
 
@@ -920,18 +981,35 @@ def test_a_result_parses_alongside_other_blocks_for_the_runtime_to_refuse():
 @pytest.mark.parametrize(
     ("name", "reply"),
     [
-        ("fenced", f"{BT3}\n{RESULT}\n{BT3}"),
-        ("four-space indented", f"Example:\n\n{decorate(RESULT, '    ')}\n"),
-        ("bulleted", decorate(RESULT, "- ")),
-        ("quoted", decorate(RESULT, "> ")),
+        ("fenced", f"```\n{RESULT}\n```"),
+        ("indented compact", f"    {compact('jtech_result', RESULT_BODY)}"),
+        ("bulleted, compact", f"- {compact('jtech_result', RESULT_BODY)}"),
+        ("quoted, compact", f"> {compact('jtech_result', RESULT_BODY)}"),
         ("html code block", f"Here:\n<code>\n{RESULT}\n</code>"),
     ],
 )
-def test_a_wrapped_result_is_reported_rather_than_ending_the_turn(name, reply):
+def test_a_wrapped_result_still_ends_the_turn(name, reply):
+    """Presentation cannot swallow a terminal status any more than it can
+    swallow a command: the markers are the whole of the protocol."""
     parsed = parse_jtech_reply(reply)
-    assert parsed.result is None, name
-    assert [error.tool_name for error in parsed.errors] == ["jtech_result"], name
-    assert "did not run" in parsed.errors[0].message, name
+    assert parsed.errors == [], name
+    assert parsed.result == AgentResult(
+        "completed", "The parser change is in place."
+    ), name
+
+
+def test_decorating_every_line_of_a_structured_block_breaks_its_headers():
+    """The envelope survives decoration; a structured body does not.
+
+    A command block carries its wrapper into the command harmlessly, but a
+    prefix repeated down an agent or result body lands inside the header lines
+    and fills the empty separator line. The markers still pair — the refusal
+    comes from the header shape, which is unchanged and still explicit.
+    """
+    parsed = parse_jtech_reply(decorate(RESULT, "    "))
+    assert parsed.result is None
+    assert [error.tool_name for error in parsed.errors] == ["jtech_result"]
+    assert "exactly one empty line must separate" in parsed.errors[0].message
 
 
 def test_the_result_block_leaves_the_commentary_around_it_intact():
@@ -941,20 +1019,6 @@ def test_the_result_block_leaves_the_commentary_around_it_intact():
     assert "jtech_result" not in parsed.commentary
     assert "I finished the work." in parsed.commentary
     assert "Nothing else was touched." in parsed.commentary
-
-
-@pytest.mark.parametrize(
-    "reply",
-    [
-        "End your turn with a [[[jtech_result]]] block when the work is done.",
-        "- Finish by opening `[[[jtech_result]]]` on its own line.",
-        "The status header of [[[jtech_result]]] is completed or failed.",
-    ],
-)
-def test_a_result_mentioned_after_other_words_stays_ordinary_prose(reply):
-    parsed = parse_jtech_reply(reply)
-    assert parsed.result is None
-    assert parsed.errors == []
 
 
 def test_split_segments():

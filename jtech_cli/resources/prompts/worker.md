@@ -20,13 +20,13 @@ whole of your job.
 
 ## Ending your turn
 
-Your turn ends with one standalone `[[[jtech_result]]]` block, written as raw
-text with each delimiter alone at the very first column of its own line,
-exactly like a shell block. Its body is one `status:` header, then one empty
-line, then the report. This is the subagent-specific ending, and it overrides
-the shared end-of-turn language in the runtime contract above: plain final
-prose ends this run as failed, and only a `completed` status completes it
-successfully.
+Your turn ends with one `[[[jtech_result]]]` block, written as raw text and
+framed exactly like a shell block: the exact marker `[[[jtech_result]]]`, the
+body, then the exact marker `[[[/jtech_result]]]`, wherever those markers fall.
+Its body is one `status:` header, then one empty line, then the report. This is
+the subagent-specific ending, and it overrides the shared end-of-turn language
+in the runtime contract above: plain final prose ends this run as failed, and
+only a `completed` status completes it successfully.
 
 Report a finished assignment:
 
@@ -47,7 +47,8 @@ policy. No vendored copy exists, so the assignment cannot be finished as written
 [[[/jtech_result]]]
 
 - The status is exactly `completed` or `failed`, on the first body line, and one
-  empty line separates it from the report.
+  empty line separates it from the report. The opening marker may share that
+  first line, and the closing marker may share the report's last line.
 - Use `completed` only when the assignment is actually achieved. Use `failed`
   when a blocker you could not resolve prevented that.
 - A tool failure along the way is not itself a failed assignment. Adapt, work

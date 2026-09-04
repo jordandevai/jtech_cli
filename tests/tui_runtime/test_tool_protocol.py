@@ -24,11 +24,6 @@ from .support import (
 )
 
 
-def decorate(text: str, prefix: str = "", suffix: str = "") -> str:
-    """Wrap every line of a block, the way a model wraps one by accident."""
-    return "\n".join(f"{prefix}{line}{suffix}" for line in text.split("\n"))
-
-
 #: Python source whose own quoting would have destroyed the retired envelope.
 TRIPLE_QUOTED_COMMAND = (
     "python - <<'PY'\n"
@@ -85,50 +80,118 @@ async def test_a_malformed_reply_executes_nothing_and_asks_again():
     assert host.authorized == []
     observation = model_messages(session)[-2]["content"]
     assert "Tool protocol error" in observation
-    assert "line 4" in observation
+    assert "line 2" in observation
+
+
+async def test_a_marker_left_over_beside_a_block_executes_nothing():
+    """Atomicity at the runtime boundary: the block may be a fragment.
+
+    The reply carries a complete, runnable block and a marker that belongs to
+    no block. That is what a payload cut short at an earlier closer looks like,
+    so the command that survived never reaches the host.
+    """
+    stream, _ = scripted_stream(
+        f"{command_call('echo safe')}\nand then [[[jtech_cmd]]] more work",
+        "recovered",
+    )
+    session = Session(persist=False)
+    async with Harness().run_test() as pilot:
+        runtime, host = make_runtime(pilot.app, stream, session=session)
+        outcome = await runtime.run()
+    assert outcome.final_text == "recovered"
+    assert host.authorized == []
+    observation = model_messages(session)[-2]["content"]
+    assert "belongs to no complete block" in observation
+    assert "line 2" in observation
+
+
+async def test_a_truncated_block_asks_again_instead_of_ending_the_turn():
+    """The silence this rule exists to prevent, at the boundary that shows it.
+
+    A stream cut off after the opening marker leaves a reply with no complete
+    block. Read as prose it would come back from ``_tool_rounds`` as Primary's
+    final answer — a half-written block on screen and the work unstarted — so
+    the opener that begins its own line costs a round instead.
+    """
+    stream, calls = scripted_stream(
+        "I will inspect this.\n[[[jtech_cmd]]] ls -la",
+        command_call("ls -la"),
+        "done",
+    )
+    session = Session(persist=False)
+    async with Harness().run_test() as pilot:
+        runtime, host = make_runtime(pilot.app, stream, session=session)
+        outcome = await runtime.run()
+    assert outcome.final_text == "done"
+    assert host.authorized == ["ls -la"]
+    assert calls["n"] == 3
+    observation = model_messages(session)[-4]["content"]
+    assert "was never closed by [[[/jtech_cmd]]]" in observation
+
+
+async def test_prose_naming_a_marker_still_ends_a_primary_turn():
+    """The other half of the rule: a sentence is not a tool attempt.
+
+    A reply with no block whose marker is reached through prose is a final
+    answer, and answering it costs exactly one completion. Refusing it would
+    spend corrective rounds on a turn that was already over.
+    """
+    answer = "Done. A [[[jtech_cmd]]] block is how I would run a command."
+    stream, calls = scripted_stream(answer)
+    session = Session(persist=False)
+    async with Harness().run_test() as pilot:
+        runtime, host = make_runtime(pilot.app, stream, session=session)
+        outcome = await runtime.run()
+    assert outcome.final_text == answer
+    assert host.authorized == []
+    assert calls["n"] == 1
+    conversation = "\n".join(message["content"] for message in model_messages(session))
+    assert "Tool protocol error" not in conversation
 
 
 BT3, BT4 = "`" * 3, "`" * 4
 COMMAND_BLOCK = command_call("echo x")
-MULTILINE_BLOCK = command_call("pwd\nls")
+MULTILINE_BLOCK = "[[[jtech_cmd]]]\npwd\nls\n[[[/jtech_cmd]]]"
 
 
 @pytest.mark.parametrize(
-    ("name", "wrapped"),
+    ("name", "wrapped", "expected"),
     [
-        ("fenced block", f"Sure!\n\n{BT3}\n{COMMAND_BLOCK}\n{BT3}"),
-        ("fenced multiline command", f"{BT3}\n{MULTILINE_BLOCK}\n{BT3}"),
-        ("four-space indented block", f"Sure!\n\n{decorate(COMMAND_BLOCK, '    ')}"),
+        ("fenced block", f"Sure!\n\n{BT3}\n{COMMAND_BLOCK}\n{BT3}", "echo x"),
+        ("fenced multiline command", f"{BT3}\n{MULTILINE_BLOCK}\n{BT3}", "pwd\nls"),
+        ("four-space indented block", f"Sure!\n\n    {COMMAND_BLOCK}", "echo x"),
         (
             "longer fence quoting a shorter one",
             f"{BT4}\n{BT3}\n{COMMAND_BLOCK}\n{BT3}\n{BT4}",
+            "echo x",
         ),
-        ("html code block", f"Here:\n<code>\n{COMMAND_BLOCK}\n</code>"),
-        ("unchecked task-list item", decorate(COMMAND_BLOCK, "- [ ] ")),
-        ("checked task-list item", decorate(COMMAND_BLOCK, "- [x] ")),
-        ("checked ordered task item", decorate(COMMAND_BLOCK, "1. [x] ")),
-        ("checked ordered task item, paren", decorate(COMMAND_BLOCK, "1) [X] ")),
-        ("strikethrough", decorate(COMMAND_BLOCK, "~~", "~~")),
-        ("table cell", decorate(COMMAND_BLOCK, "| ", " |")),
+        ("html code block", f"Here:\n<code>\n{COMMAND_BLOCK}\n</code>", "echo x"),
+        ("unchecked task-list item", f"- [ ] {COMMAND_BLOCK}", "echo x"),
+        ("checked ordered task item", f"1. [x] {COMMAND_BLOCK}", "echo x"),
+        ("strikethrough", f"~~{COMMAND_BLOCK}~~", "echo x"),
+        ("table cell", f"| {COMMAND_BLOCK} |", "echo x"),
+        ("inline in a sentence", f"Running {COMMAND_BLOCK} now.", "echo x"),
     ],
 )
-async def test_a_wrapped_block_continues_the_turn_instead_of_ending_it(name, wrapped):
-    """The failure this path exists for: a wrapped block read as a final answer.
+async def test_markdown_around_a_block_never_stops_it_running(
+    name, wrapped, expected
+):
+    """The failure this path exists for, from the other side.
 
-    The reply carries no executable block, so without a diagnostic the loop
-    takes it for prose and the turn stops with the model's work unstarted.
-    Each shape here must instead cost a round and come back corrected.
+    Every shape here used to be refused for its wrapper, costing a round on a
+    block that was already complete and unambiguous. Framing depends on the
+    markers alone now, so each one reaches the host on the first round.
     """
-    stream, calls = scripted_stream(wrapped, command_call("echo x"), "done")
+    stream, calls = scripted_stream(wrapped, "done")
     session = Session(persist=False)
     async with Harness().run_test() as pilot:
         runtime, host = make_runtime(pilot.app, stream, session=session)
         outcome = await runtime.run()
     assert outcome.final_text == "done", name
-    assert host.authorized == ["echo x"], name
-    assert calls["n"] == 3, name
+    assert host.authorized == [expected], name
+    assert calls["n"] == 2, name
     conversation = "\n".join(message["content"] for message in model_messages(session))
-    assert "did not run" in conversation, name
+    assert "Tool protocol error" not in conversation, name
 
 
 async def test_a_mixed_reply_executes_neither_kind():

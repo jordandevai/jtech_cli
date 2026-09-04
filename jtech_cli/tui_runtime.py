@@ -127,12 +127,11 @@ _EXIT_PHASE: dict[RunExit, RunPhase] = {
 
 def parse_errors_message(errors: Sequence[ToolProtocolError]) -> str:
     """The model-facing diagnostic for a reply the runtime refuses to execute."""
-    # The headline names neither a cause nor a remedy. A batch is either all
-    # syntax errors or all wrapped blocks that are themselves well-formed, and
-    # the two need opposite corrections: re-emit the block, or stop trying to
-    # emit it at all because it was only ever an example. Prescribing one here
-    # overrides the other — telling a model to "emit the blocks again" is how a
-    # requested syntax example becomes a command that runs. Each error carries
+    # The headline names neither a cause nor a remedy. One batch can hold an
+    # unclosed opener, a stray closer, a misspelled tool name, a nested marker,
+    # and a well-formed block whose headers are wrong, and those need different
+    # corrections — re-pair the markers, fix the spelling, or fix the header
+    # shape. Prescribing one here would override the others. Each error carries
     # its own reason and its own remedy; this only says nothing ran.
     lines = [
         (

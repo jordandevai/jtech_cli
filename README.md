@@ -145,14 +145,15 @@ error rather than resolved by guessing which endpoint was meant.
   a selection if there is one and otherwise opens the quit confirmation —
   it never clears the Primary draft you cannot see.
 - **Automatic dispatch**: there is no `/agent` command and nothing to configure.
-  When a request has separable work, the coordinator emits standalone
-  `[[[jtech_agent]]]` blocks of its own — four `agent_key:`/`agent_label:`/
-  `profile_name:`/`task_label:` header lines, an empty line, then the task as
-  raw multiline text. It picks one of *your* configured API profiles per agent, so a local
-  model can investigate while a cloud model reviews. Several agents in one
-  reply start together and run concurrently; each one's final answer returns to
-  the coordinator automatically, in the order it dispatched them, and it keeps
-  working until your goal is done. Reusing a key sends a follow-up task into
+  When a request has separable work, the coordinator emits `[[[jtech_agent]]]`
+  blocks of its own — four `agent_key:`/`agent_label:`/`profile_name:`/
+  `task_label:` header lines, an empty line, then the task as raw multiline
+  text, all wrapped in the two markers wherever they fall. It picks one of
+  *your* configured API profiles per agent, so a local model can investigate
+  while a cloud model reviews. Several agents in one reply start together and
+  run concurrently; each one's final answer returns to the coordinator
+  automatically, in the order it dispatched them, and it keeps working until
+  your goal is done. Reusing a key sends a follow-up task into
   the same agent's conversation and adds a task row; a new key creates a new
   agent. A key's label and profile are fixed for the session.
   All agents share this one working directory: the coordinator is told to
@@ -177,14 +178,19 @@ error rather than resolved by guessing which endpoint was meant.
   place. While streaming, the AI label shows a spinner, elapsed time, and a
   live character count — all ticked by a 1s timer, so they keep moving even
   when the stream is silent.
-- **Command entries**: the AI asks for a shell command with a standalone
-  `[[[jtech_cmd]]]` block — that delimiter line, the command, then
-  `[[[/jtech_cmd]]]` — and the text between the delimiters is the command
-  verbatim, unquoted and unescaped, so multiline scripts, heredocs, and quoted
-  code pass through untouched. You never type these blocks. An authorized
-  command appears immediately as a dim
-  "SYSTEM" entry showing the command and `running…`, and that same entry
-  becomes its captured output once the process exits. Shell commands have no
+- **Command entries**: the AI asks for a shell command with a `[[[jtech_cmd]]]`
+  block — that marker, the command, then `[[[/jtech_cmd]]]` — and the text
+  between the markers is the command verbatim, unquoted and unescaped, so
+  multiline scripts, heredocs, and quoted code pass through untouched. The
+  markers are wrappers, not lines: `[[[jtech_cmd]]]pwd[[[/jtech_cmd]]]` on one
+  line, `[[[jtech_cmd]]] pwd [[[/jtech_cmd]]]` with spaces, and the same
+  command framed across three lines are one and the same block, because only
+  the whitespace touching the markers is dropped. Indentation, a list marker, a
+  blockquote, a Markdown fence, or an inline code span around a block changes
+  nothing — a complete pair of markers is always a block. You never type these
+  blocks. An authorized command appears immediately as a dim "SYSTEM" entry
+  showing the command and `running…`, and that same entry becomes its captured
+  output once the process exits. Shell commands have no
   elapsed-time deadline — a build, a test suite, or a migration runs as long
   as it needs. Stop Primary's command with `Esc`, or exit the app to stop
   every runtime's command at once.

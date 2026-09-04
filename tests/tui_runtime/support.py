@@ -154,8 +154,14 @@ def scripted_stream(*replies):
 
 
 def _protocol_block(name: str, body: str) -> str:
-    """Frame one raw body in the production block delimiters."""
-    return f"[[[{name}]]]\n{body}\n[[[/{name}]]]"
+    """Frame one raw body in the production block markers, compactly.
+
+    The compact envelope, not the multiline one: the markers wrap the payload
+    wherever they fall, and a helper that always framed a body in newlines
+    would leave every integration test exercising the one spelling that never
+    broke.
+    """
+    return f"[[[{name}]]]{body}[[[/{name}]]]"
 
 
 def command_call(command: str) -> str:
