@@ -5,7 +5,12 @@ description = "Full-screen terminal chat client for llama-server (OpenAI-compati
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "bashlex>=0.18",
+    # ``jtech_cli.bash_parser`` adapts ``bashlex.heredoc.makeheredoc``, whose
+    # missing quote-removal step makes every ``<<'EOF'`` heredoc look
+    # unterminated. That is a private function, so the version is pinned
+    # exactly: a ranged release could change those internals while the adapter
+    # kept applying compatibility behaviour written for the old ones.
+    "bashlex==0.18",
     # ``_TranscriptMarkdown`` re-derives the ``markup`` and ``parsed`` state of
     # Rich's Markdown renderer and feeds it markdown-it's ``gfm-like`` token
     # stream. That is an internal contract of these exact releases, so both are

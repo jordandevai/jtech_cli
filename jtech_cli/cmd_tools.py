@@ -41,6 +41,8 @@ from typing import Literal, get_args
 import bashlex
 from bashlex.errors import ParsingError
 
+from jtech_cli.bash_parser import BashParserCompatibilityError, parse_bash
+
 VALID_CMD_MODES = ("ask", "auto", "yolo", "off")
 DEFAULT_MAX_OUTPUT = 12000
 
@@ -333,8 +335,12 @@ def _analyze_shell(command: str) -> _ShellAnalysis:
     if not command.strip():
         return _ShellAnalysis((), ())
     try:
-        roots = bashlex.parse(command)
-    except (ParsingError, NotImplementedError) as error:
+        roots = parse_bash(command)
+    except (
+        ParsingError,
+        NotImplementedError,
+        BashParserCompatibilityError,
+    ) as error:
         raise ShellParseError(f"shell syntax could not be analyzed: {error}") from error
 
     collector = _ShellCollector(command)

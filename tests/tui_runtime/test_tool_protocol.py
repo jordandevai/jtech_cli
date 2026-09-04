@@ -1,9 +1,12 @@
 """The block protocol: what parses, what is refused, and what is recorded."""
 
 import json
+from pathlib import Path
 
 import pytest
 
+from jtech_cli.cmd_tools import CmdPolicy, decide, parse_jtech_reply, split_segments
+from jtech_cli.prompts import DEFAULT_SYSTEM_PROMPT
 from jtech_cli.session import Session
 from jtech_cli.tui_runtime import (
     MIXED_TOOLS_ERROR,
@@ -298,3 +301,29 @@ async def test_a_full_result_is_never_truncated_by_the_runtime():
         m for m in session.messages if m.get("_model_role") == "user"
     )
     assert long_answer in payload["_model_content"]
+
+
+def test_the_heredoc_the_prompt_teaches_survives_the_real_command_gate():
+    """The prompt's own example, taken from the prompt and run past the gate.
+
+    Asserting the prompt merely *contains* ``<<'PY'`` proves nothing: bashlex
+    could not match a quoted delimiter against its terminator, so this exact
+    example was blocked in every mode while the prompt kept teaching it. The
+    example is therefore extracted with the real protocol parser and pushed
+    through the real shell analyzer and policy, end to end.
+    """
+    parsed = parse_jtech_reply(DEFAULT_SYSTEM_PROMPT)
+    heredocs = [command for command in parsed.commands if "<<'PY'" in command]
+    assert len(heredocs) == 1, "system.md should teach exactly one quoted heredoc"
+    command = heredocs[0]
+    assert command.startswith("python - <<'PY'")
+    assert command.endswith("PY")
+
+    # The heredoc body is the program's stdin, not another shell segment.
+    assert split_segments(command) == ["python - <<'PY'"]
+
+    root = Path("/home/u/project")
+    for mode in ("ask", "auto", "yolo"):
+        policy = CmdPolicy(mode=mode, allow=["python:*"])
+        decision = decide(command, policy, root)
+        assert decision.action == "run", (mode, decision)

